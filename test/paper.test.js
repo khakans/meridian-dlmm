@@ -1,7 +1,23 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { config } from '../config.js';
-import { paperBins, paperInventory, startPaper } from '../standalone/paper.js';
+import { paperBins, paperCloseRule, paperInventory, startPaper } from '../standalone/paper.js';
+
+test('paper exits wait for initial range and buffer losing exits while honoring risk stops', () => {
+  const minute = 60_000;
+  const openedAt = 1_800_000_000_000;
+  const p = { id: 'fixture', lower: 65, upper: 99, openedAt };
+  const above = { binId: p.upper + config.management.outOfRangeBinsToClose + 1 };
+  assert.equal(paperCloseRule(p, above, -0.2, openedAt + minute), null);
+  const late = { id: 'late', lower: 65, upper: 99, openedAt };
+  assert.equal(paperCloseRule(late, above, -0.2, openedAt + config.research.paperInitialRangeWaitMinutes * minute), 'entry range not reached');
+  assert.equal(paperCloseRule(p, { binId: 90 }, -0.2, openedAt + 2 * minute), null);
+  const lossAt = openedAt + 3 * minute;
+  assert.equal(paperCloseRule(p, above, -0.2, lossAt), null);
+  assert.equal(paperCloseRule({ ...p }, above, 0.1, lossAt + minute), 'pumped far above range');
+  assert.equal(paperCloseRule({ ...p }, { binId: 60 }, config.management.stopLossPct - 1, lossAt + minute), 'stop loss');
+  assert.equal(paperCloseRule(p, above, -0.2, lossAt + config.research.paperLossGraceMinutes * minute), 'pumped far above range');
+});
 
 test('quote-only bins convert inventory as price crosses and support absolute Fib ranges', () => {
   const active = { binId: 100, price: 1 };
@@ -12,8 +28,8 @@ test('quote-only bins convert inventory as price crosses and support absolute Fi
   assert.ok(paperInventory(position, 80).sol < 1);
   assert.equal(paperInventory(position, 64).sol, 0);
   assert.ok(paperInventory(position, 64).tokens > 1);
-  assert.equal(paperBins({ range: 'dakukeru', lower: 0.5, upper: 1.2 }, active, 100), null);
-  assert.ok(paperBins({ range: 'dakukeru', lower: 0.5, upper: 0.8 }, active, 100).upper < 100);
+  assert.equal(paperBins({ range: 'fibonacci', lower: 0.5, upper: 1.2 }, active, 100), null);
+  assert.ok(paperBins({ range: 'fibonacci', lower: 0.5, upper: 0.8 }, active, 100).upper < 100);
 });
 
 test('paper entry checks exit quote and persists an exit awaiting settlement', async () => {

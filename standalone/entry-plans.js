@@ -43,7 +43,7 @@ export async function entryPlans(pool) {
   for (const shape of ['spot', 'bid_ask']) {
     const widthBins = Math.ceil(Math.log(fib.upper / fib.lower) / Math.log1p(step / 10_000));
     plans.push({
-      shape, range: 'dakukeru', ...fib, widthBins,
+      shape, range: 'fibonacci', ...fib, widthBins,
       entryZoneReached: fib.reference >= fib.upper,
       wideRange: widthBins > 69,
     });

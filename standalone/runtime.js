@@ -428,8 +428,8 @@ async function recordResearch(mint, screened, sources) {
   };
   store.save();
   log("research", `${mint} ${plans.length} shadow plans (${sources.join(", ")})`);
-  const fib = plans.find(plan => plan.range === "dakukeru");
-  return `Shadow research: ${plans.length} range/shape variants.${fib ? ` DAKUKERU ≈ ${fib.widthBins} bins${fib.wideRange ? " (wide range)" : ""}; ${fib.entryZoneReached ? "upper level reached" : "waiting for upper level"}.` : " DAKUKERU waiting for candle history."}`;
+  const fib = plans.find(plan => plan.range === "fibonacci");
+  return `Shadow research: ${plans.length} range/shape variants.${fib ? ` Fibonacci ≈ ${fib.widthBins} bins${fib.wideRange ? " (wide range)" : ""}; ${fib.entryZoneReached ? "upper level reached" : "waiting for upper level"}.` : " Fibonacci waiting for candle history."}`;
 }
 
 function startLifecycleReports() {

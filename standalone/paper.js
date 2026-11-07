@@ -9,7 +9,7 @@ const COST_SOL = 0.001; // Estimated round-trip network cost, excluding refundab
 
 export function paperBins(plan, active, step) {
   const ratio = 1 + step / 10_000;
-  const offsets = plan.range === 'dakukeru'
+  const offsets = plan.range === 'fibonacci'
     ? [Math.ceil(Math.log(plan.lower / active.price) / Math.log(ratio)), Math.floor(Math.log(plan.upper / active.price) / Math.log(ratio))]
     : [-plan.binsBelow, -1];
   const [lower, upper] = offsets;
@@ -52,8 +52,9 @@ export async function validateExitQuote({ mint, pool, decimals, binStep, binsBel
   if (quote < mark * config.research.paperMinExitRatio) throw Error('Exit quote below minimum');
 }
 
-function closeRule(p, active, pnlPct, now) {
+export function paperCloseRule(p, active, pnlPct, now) {
   const outside = active.binId < p.lower ? 'below' : active.binId > p.upper ? 'above' : null;
+  if (active.binId <= p.upper) p.rangeReached = true;
   if (outside !== p.outside) {
     p.outside = outside;
     p.outsideSince = outside ? now : null;
@@ -65,11 +66,21 @@ function closeRule(p, active, pnlPct, now) {
     active_bin: active.binId, lower_bin: p.lower, upper_bin: p.upper,
     minutes_out_of_range: p.outsideSince ? (now - p.outsideSince) / MINUTE : 0,
   }, m);
-  if (rule) return rule.reason;
-  if (Number.isFinite(pnlPct) && m.trailingTakeProfit && p.peakPct >= m.trailingTriggerPct &&
-      pnlPct <= p.peakPct - m.trailingDropPct) return 'trailing take profit';
+  if (rule?.rule === 1) return rule.reason;
   if (now - p.openedAt >= config.research.paperMaxHoldMinutes * MINUTE) return 'paper max hold';
-  return null;
+  if (!p.rangeReached && outside === 'above') {
+    return now - p.openedAt >= config.research.paperInitialRangeWaitMinutes * MINUTE
+      ? 'entry range not reached' : null;
+  }
+  const trailing = Number.isFinite(pnlPct) && m.trailingTakeProfit && p.peakPct >= m.trailingTriggerPct &&
+    pnlPct <= p.peakPct - m.trailingDropPct;
+  const reason = rule?.reason ?? (trailing ? 'trailing take profit' : null);
+  if (!reason || pnlPct > 0) {
+    p.lossExitSince = null;
+    return reason;
+  }
+  p.lossExitSince ??= now;
+  return now - p.lossExitSince >= config.research.paperLossGraceMinutes * MINUTE ? reason : null;
 }
 
 export function startPaper(store, notify, {
@@ -107,7 +118,7 @@ export function startPaper(store, notify, {
           const pnl = proceeds == null ? null : inventory.sol + proceeds - p.capital - COST_SOL;
           p.mark = pnl == null ? null : { at: Date.now(), pnl };
           if (!p.exit) {
-            const reason = closeRule(p, active, pnl == null ? null : pnl / p.capital * 100, now);
+            const reason = paperCloseRule(p, active, pnl == null ? null : pnl / p.capital * 100, now);
             p.exitTicks = reason && reason === p.exitSignal ? (p.exitTicks ?? 0) + 1 : Number(Boolean(reason));
             p.exitSignal = reason;
             if (reason && p.exitTicks >= Math.max(1, config.pnl.confirmTicks)) p.exit = { at: now, reason, inventory };
@@ -116,7 +127,7 @@ export function startPaper(store, notify, {
             paper.closed.push({ id: p.id, mint: p.mint, shape: p.shape, range: p.range, variant: p.variant, openedAt: p.openedAt,
               closedAt: Date.now(), pnl, reason: p.exit.reason, solInventory: inventory.sol, quotedSol: proceeds });
             delete paper.open[p.id];
-            closed.push(`${p.mint.slice(0, 8)} · ${p.range}/${p.shape} · ${pnl.toFixed(4)} SOL · ${p.exit.reason}`);
+            closed.push(`• ${p.mint.slice(0, 8)} · ${p.variant ?? `${p.range}/${p.shape}`} · ${pnl.toFixed(4)} SOL · ${p.exit.reason}`);
           }
         } catch { p.mark = null; }
       }
@@ -160,7 +171,12 @@ export function startPaper(store, notify, {
         } catch { log('paper_warn', `Paper admission unavailable for ${c.mint}`); }
       }
       store.save();
-      if (closed.length && !stopped) await notify(`🧪 Meridian paper close (estimasi, tanpa fee LP)\n${closed.join('\n')}`);
+      if (closed.length && !stopped) {
+        const limit = config.research.paperCloseListLimit;
+        const lines = [`🧪 Meridian paper close · ${closed.length} varian (estimasi, tanpa fee LP)`, '', ...closed.slice(0, limit)];
+        if (closed.length > limit) lines.push(`+${closed.length - limit} close lainnya tersimpan.`);
+        await notify(lines.join('\n'));
+      }
     } catch { log('paper_warn', 'Paper lifecycle pass unavailable'); }
     finally { busy = false; }
   }

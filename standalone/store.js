@@ -8,6 +8,16 @@ export class MonitorStore {
       version: 1, wallets: {}, pending: {}, seen: {}, events: [], signals: {}, attempts: {}, paused: false,
     };
     if (this.data.version !== 1 || !this.data.wallets || !this.data.attempts || !Array.isArray(this.data.events)) throw new Error('Invalid monitor state; refusing to discard recovery history');
+    // The paper ledger originally used a different label for its Fibonacci range.
+    for (const item of [
+      ...Object.values(this.data.research ?? {}).flatMap(record => record.plans ?? []),
+      ...Object.values(this.data.paper?.open ?? {}),
+      ...(this.data.paper?.closed ?? []),
+    ]) {
+      if (!item.range || item.range === 'volatility' || item.range === 'fibonacci') continue;
+      item.range = 'fibonacci';
+      if (item.variant) item.variant = `fibonacci/${item.shape}`;
+    }
   }
   save() {
     fs.writeFileSync(`${this.file}.tmp`, JSON.stringify(this.data, null, 2), { mode: 0o600 });

@@ -16,9 +16,13 @@ export function createSlackConsole({ client, channel, team, owner, appId, ...adm
   let queue = Promise.resolve();
   let closed = false;
   const received = new Map();
-  const sendMessage = text => client.chat.postMessage({
-    channel, text: plain(text).slice(0, 4000), mrkdwn: false, unfurl_links: false, unfurl_media: false,
-  });
+  const sendMessage = value => {
+    const text = plain(value).slice(0, 4000);
+    const blocks = text.includes("\n")
+      ? text.match(/[\s\S]{1,2800}/gu).map(part => ({ type: "section", text: plainText(part) }))
+      : undefined;
+    return client.chat.postMessage({ channel, text, blocks, mrkdwn: false, unfurl_links: false, unfurl_media: false });
+  };
 
   async function render(view, page, ts) {
     const nonce = randomUUID();
