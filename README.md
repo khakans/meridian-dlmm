@@ -42,6 +42,23 @@ Supported infrastructure overrides:
 
 Balances use standard RPC, including SPL Token and Token-2022. PnL defaults to Meteora portfolio and position APIs, with an on-chain fallback. Jupiter supplies prices, token data, and swaps. Both Telegram and Slack support the standalone admin console.
 
+### Optional discovery watchlist
+
+Set `GMGN_API_KEY` for Solana trending tokens or `HELIUS_API_KEY` for confirmed Pump.fun launch and migration logs, then restart. Both can run together. GMGN needs read access only. Helius discovery uses standard WebSockets with its own key independently of the wallet monitor.
+
+The watchlist screens up to four unique mints per minute through the existing Jupiter, on-chain, and Meteora filters. Matches go to the configured Slack owner DM and Telegram notifications. Check the `discovery` and `discovery_warn` logs for screening results and provider errors. Discovery is advisory in both modes. Entry still requires wallet convergence.
+
+Example mainnet RPC configuration. Replace the Helius placeholders with your endpoint key.
+
+```dotenv
+MONITOR_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY
+MONITOR_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY
+BALANCE_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY
+FALLBACK_RPC_URL=https://api.mainnet.solana.com
+```
+
+The public Solana HTTP endpoint is rate-limited. The HTTP fallback serves RPC reads. It does not replace the configured WebSocket subscription.
+
 To enable live trading, review your thresholds, wallet list, and shadow results, set `shadowMode` to `false`, remove any `DRY_RUN=true` override, and restart. Configuration edits take effect after restart.
 
 ### Slack DM console

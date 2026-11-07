@@ -13,6 +13,7 @@ import { sendNotification as notify, setNotificationMirror } from "../telegram.j
 import { MonitorStore, finishSignal } from "./store.js";
 import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
+import { startDiscovery } from "./discovery.js";
 import { exposureStillPresent } from "./events.js";
 import { getMyPositions } from "../tools/dlmm.js";
 import { executeTool } from "../tools/executor.js";
@@ -30,6 +31,7 @@ let store = null;
 let monitor = null;
 let lockPath = null;
 let stopAdmin = null;
+let stopDiscovery = null;
 let slackAdmin = null;
 let shuttingDown = false;
 let manageBusy = false;
@@ -396,6 +398,7 @@ async function shutdown(signalName, exitCode = 0) {
   log("runtime", `${signalName} received — shutting down`);
   stopChronosKeepalive();
   for (const timer of Object.values(timers)) clearInterval(timer);
+  await Promise.race([stopDiscovery?.(), sleep(3000)]);
   try { stopAdmin?.(); } catch { /* best-effort */ }
   try { await monitor?.stop(); } catch { /* best-effort */ }
   // Bound best-effort stop notices so either transport can be unavailable.
@@ -452,6 +455,11 @@ export async function startStandalone() {
     },
   });
   setNotificationMirror(slackAdmin?.sendMessage ?? null);
+  stopDiscovery = startDiscovery({
+    gmgnKey: process.env.GMGN_API_KEY?.trim(),
+    heliusKey: process.env.HELIUS_API_KEY?.trim(),
+    notify,
+  });
 
   const trackedWallets = Object.keys(store.data.wallets).length;
   void notify(`🤖 Meridian started — ${config.standalone.shadow ? "SHADOW (nothing submitted)" : "LIVE"}\n${trackedWallets} wallet(s) monitored | trigger: ${config.standalone.walletThreshold} within ${config.standalone.windowSec}s | exits: ${config.pnl.pollIntervalSec}s poller`);
