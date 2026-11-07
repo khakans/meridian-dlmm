@@ -59,6 +59,10 @@ FALLBACK_RPC_URL=https://api.mainnet.solana.com
 
 The public Solana HTTP endpoint is rate-limited. The HTTP fallback serves RPC reads. It does not replace the configured WebSocket subscription.
 
+Set `researchEnabled: true` in Shadow mode to screen discovery candidates using the separate `researchMin*` settings and compare volatility-based Spot, wider Spot, Bid-Ask and Curve with experimental DAKUKERU Spot and Bid-Ask. The Fibonacci variant uses the strongest upward swing in the last 96 closed 15-minute candles and assumed 0.236–0.618 levels. Tokens with insufficient candle history still get the volatility variants. Plans are recorded per mint for 24 hours. They do not simulate fills, fees, or PnL. Actual entry continues to use wallet convergence and the configured shape.
+
+Set `lifecycleReportMinutes` to a positive interval to send wallet balance, open positions and reported open-position PnL to the configured Slack DM and Telegram destination. A report also runs at startup. Edit the interval from the admin menu and restart. Zero disables reports.
+
 To enable live trading, review your thresholds, wallet list, and shadow results, set `shadowMode` to `false`, remove any `DRY_RUN=true` override, and restart. Configuration edits take effect after restart.
 
 ### Slack DM console

@@ -107,6 +107,7 @@ const SECTIONS = [
       { k: "pnlConfirmTicks", path: ["pnl", "confirmTicks"], type: "int", min: 1, max: 10, unit: "ticks" },
       { k: "pnlPollIntervalSec", path: ["pnl", "pollIntervalSec"], type: "int", min: 1, max: 60, unit: "s", restart: true },
       { k: "managementIntervalMin", path: ["schedule", "managementIntervalMin"], type: "int", min: 1, max: 1440, unit: "min", restart: true },
+      { k: "lifecycleReportMinutes", path: ["lifecycleReportMinutes"], type: "int", min: 0, max: 1440, unit: "min (0 = off)", restart: true },
       { k: "solMode", path: ["management", "solMode"], type: "bool" },
     ],
   },
@@ -258,7 +259,7 @@ function sectionMenu(section, slack = false) {
   const explainers = {
     strategy:
       "Range: bins below the active bin scale with pool volatility, clamped to min–max (bins above = 0). " +
-      "Shape: spot = flat, curve = bell, bid_ask = concentrated at the center. Applied per entry, no restart.",
+      "Shape: spot = flat, curve = centered, bid_ask = weighted toward the edges. Applied per entry, no restart.",
     rpc: "Endpoints live in .env — edit, then ♻️ Restart.",
   };
   return {

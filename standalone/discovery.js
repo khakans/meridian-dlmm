@@ -69,7 +69,7 @@ export async function gmgnTrending(key) {
   });
 }
 
-export function startDiscovery({ gmgnKey, heliusKey, notify }) {
+export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds, onMatch }) {
   if (!gmgnKey && !heliusKey) return null;
   const queue = new Map();
   const screened = new Map();
@@ -118,11 +118,13 @@ export function startDiscovery({ gmgnKey, heliusKey, notify }) {
         if (stopped) break;
         const { mint, sources, priority } = item;
         try {
-          const result = await screenMint(mint);
+          const result = await screenMint(mint, { thresholds });
+          if (stopped) break;
+          const research = result.pass ? await onMatch?.(mint, result, [...sources]) : null;
           if (stopped) break;
           screened.set(mint, { priority: item.priority, announced: result.pass, retryAt: Date.now() + (result.pass ? 60 : 5) * MINUTE });
           log('discovery', `${mint} [${[...sources].join(', ')}] ${result.pass ? 'passed' : result.reason}`);
-          if (result.pass) await notify(`🔎 Meridian watchlist\n${mint}\nPool ${result.pool.pool_address}\nSource ${[...sources].join(', ')}\nPassed token and DLMM pool screening.`);
+          if (result.pass) await notify(`🔎 Meridian watchlist\n${mint}\nPool ${result.pool.pool_address}\nSource ${[...sources].join(', ')}\nPassed token and DLMM pool screening.${research ? `\n${research}` : ''}`);
         } catch {
           screened.set(mint, { priority, retryAt: Date.now() + MINUTE });
           log('discovery_warn', `${mint} screening unavailable; will retry when rediscovered`);

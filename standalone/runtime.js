@@ -14,6 +14,7 @@ import { MonitorStore, finishSignal } from "./store.js";
 import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
+import { entryPlans } from "./entry-plans.js";
 import { exposureStillPresent } from "./events.js";
 import { getMyPositions } from "../tools/dlmm.js";
 import { executeTool } from "../tools/executor.js";
@@ -139,6 +140,9 @@ async function attemptEntry(signal) {
   }
 
   const pool = screened.pool;
+  if (config.standalone.shadow && config.research.enabled) {
+    await recordResearch(mint, screened, ["wallet convergence"]);
+  }
   const configuredBinsAbove = Number(config.strategy.defaultBinsAbove ?? 0);
   const whaleBinsAbove = Math.max(0, ...signal.events.map(e => Number(e.binsAbove || 0)));
   let binsAbove = configuredBinsAbove > 0
@@ -379,6 +383,80 @@ function startHeartbeat() {
   }, 60_000);
 }
 
+async function recordResearch(mint, screened, sources) {
+  if (!config.standalone.shadow || !config.research.enabled || shuttingDown) return;
+  const records = store.data.research ??= {};
+  const current = records[mint];
+  if (current && Date.now() - current.at < 300_000) {
+    current.sources = [...new Set([...current.sources, ...sources])];
+    store.save();
+    return `Shadow research: ${current.plans.length} range/shape variants.`;
+  }
+  const plans = await entryPlans(screened.pool);
+  if (shuttingDown || !config.standalone.shadow) return;
+  const latest = records[mint];
+  records[mint] = {
+    at: Date.now(), mint, pool: screened.pool.pool_address,
+    marketCap: screened.token.mcap,
+    sources: [...new Set([...(latest?.sources ?? []), ...sources])],
+    plans,
+  };
+  store.save();
+  log("research", `${mint} ${plans.length} shadow plans (${sources.join(", ")})`);
+  const fib = plans.find(plan => plan.range === "dakukeru");
+  return `Shadow research: ${plans.length} range/shape variants.${fib ? ` DAKUKERU ≈ ${fib.widthBins} bins${fib.wideRange ? " (wide range)" : ""}; ${fib.entryZoneReached ? "upper level reached" : "waiting for upper level"}.` : " DAKUKERU waiting for candle history."}`;
+}
+
+function startLifecycleReports() {
+  const minutes = config.lifecycleReportMinutes;
+  if (!(minutes >= 1 && minutes <= 1440)) return;
+  let busy = false;
+  const report = async () => {
+    if (busy || shuttingDown) return;
+    busy = true;
+    try {
+      const [wallet, book] = await Promise.all([
+        getWalletBalances({ force: true, nativeOnly: true }),
+        getMyPositions(),
+      ]);
+      const lines = [
+        `📊 Meridian • ${config.standalone.shadow ? "SHADOW" : "LIVE"}`,
+        `Wallet ${wallet.wallet || book.wallet || "belum tersedia"}`,
+        `Saldo ${!wallet.error && Number.isFinite(wallet.sol) ? `${wallet.sol.toFixed(4)} SOL` : "belum tersedia"}`,
+      ];
+      if (book.error || !Array.isArray(book.positions)) {
+        lines.push("Posisi dan PnL belum tersedia.");
+      } else {
+        const unit = config.management.solMode ? "SOL" : "USD";
+        const known = book.positions.filter(p => Number.isFinite(p.pnl_usd) && !p.pnl_pct_suspicious);
+        const pnl = known.reduce((sum, p) => sum + p.pnl_usd, 0);
+        lines.push(`Posisi terbuka ${book.positions.length}`);
+        lines.push(`PnL terbuka ${known.length || !book.positions.length ? `${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} ${unit}` : "belum tersedia"}${known.length < book.positions.length ? ` (${known.length}/${book.positions.length} terukur)` : ""}`);
+        for (const p of book.positions.slice(0, 10)) {
+          const pct = !p.pnl_pct_suspicious && Number.isFinite(p.pnl_pct) ? `${p.pnl_pct.toFixed(2)}%` : "PnL belum tersedia";
+          const range = typeof p.in_range === "boolean" ? (p.in_range ? "in range" : "out of range") : "range belum tersedia";
+          lines.push(`• ${String(p.pair || p.position).slice(0, 80)} · ${pct} · ${range}`);
+        }
+        if (book.positions.length > 10) lines.push(`+${book.positions.length - 10} posisi lainnya`);
+      }
+      const research = Object.values(store.data.research ?? {}).filter(item => Date.now() - item.at < 86_400_000);
+      if (config.standalone.shadow && config.research.enabled) {
+        lines.push(`Riset 24 jam ${research.length} kandidat · ${research.reduce((sum, item) => sum + item.plans.length, 0)} rencana entry`);
+      }
+      if (!shuttingDown) {
+        await notify(lines.join("\n"));
+        log("lifecycle", "Wallet, position and PnL report generated");
+      }
+    } catch {
+      log("lifecycle_warn", "Wallet report unavailable");
+    } finally {
+      busy = false;
+    }
+  };
+  timers.lifecycle = setInterval(() => void report(), minutes * 60_000);
+  void report();
+}
+
 function acquireLock() {
   lockPath = repoPath("standalone.lock");
   if (fs.existsSync(lockPath)) {
@@ -459,7 +537,17 @@ export async function startStandalone() {
     gmgnKey: process.env.GMGN_API_KEY?.trim(),
     heliusKey: process.env.HELIUS_API_KEY?.trim(),
     notify,
+    thresholds: config.standalone.shadow && config.research.enabled ? {
+      ...config.screening,
+      minMcap: config.research.minMcap,
+      minHolders: config.research.minHolders,
+      minTokenFeesSol: config.research.minTokenFeesSol,
+      minTvl: config.research.minTvl,
+      minTokenAgeHours: config.research.minTokenAgeHours,
+    } : undefined,
+    onMatch: recordResearch,
   });
+  startLifecycleReports();
 
   const trackedWallets = Object.keys(store.data.wallets).length;
   void notify(`🤖 Meridian started — ${config.standalone.shadow ? "SHADOW (nothing submitted)" : "LIVE"}\n${trackedWallets} wallet(s) monitored | trigger: ${config.standalone.walletThreshold} within ${config.standalone.windowSec}s | exits: ${config.pnl.pollIntervalSec}s poller`);

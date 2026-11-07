@@ -14,6 +14,9 @@ export class MonitorStore {
     fs.renameSync(`${this.file}.tmp`, this.file);
   }
   prune(now = Date.now()) {
+    for (const [mint, item] of Object.entries(this.data.research ?? {})) {
+      if (now - item.at > 24 * 3600_000) delete this.data.research[mint];
+    }
     this.data.events = this.data.events.filter(e => now - e.at < 10 * 60_000);
     for (const [key, at] of Object.entries(this.data.seen)) if (now - at > 2 * 3600_000) delete this.data.seen[key];
     const seenEntries = Object.entries(this.data.seen);

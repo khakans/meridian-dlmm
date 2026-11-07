@@ -94,6 +94,16 @@ export const config = {
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
   },
 
+  research: {
+    enabled: u.researchEnabled === true,
+    minMcap: numericConfig(u.researchMinMcap) ?? 50_000,
+    minHolders: numericConfig(u.researchMinHolders) ?? 150,
+    minTokenFeesSol: numericConfig(u.researchMinTokenFeesSol) ?? 5,
+    minTvl: numericConfig(u.researchMinTvl) ?? 5_000,
+    minTokenAgeHours: numericConfig(u.researchMinTokenAgeHours) ?? 0,
+  },
+  lifecycleReportMinutes: numericConfig(u.lifecycleReportMinutes) ?? 0,
+
   // ─── Position Management ────────────────
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,

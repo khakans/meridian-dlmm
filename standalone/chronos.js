@@ -424,7 +424,7 @@ export function stopChronosKeepalive() {
   }
 }
 
-async function fetchGeckoCandles(poolAddress, aggregate, limit = 1000) {
+export async function fetchGeckoCandles(poolAddress, aggregate, limit = 1000) {
   try {
     const url = `https://api.geckoterminal.com/api/v2/networks/solana/pools/${poolAddress}/ohlcv/minute?aggregate=${aggregate}&limit=${limit}`;
     const res = await fetch(url, {
