@@ -178,7 +178,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * fills). Treats both a throw AND result.success===false / missing tx as failure.
  * Returns { swapped, result, token } — swapped=false if nothing to do or all attempts failed.
  */
-async function swapBaseToSolWithRetry(baseMint, label, poolAddress = null) {
+async function swapBaseToSolWithRetry(baseMint, label, poolAddress = null, baselineRaw = null) {
   // Touchpoint 4: Smart Post-Claim & Post-Close Micro-Bounce Swap
   // After close, open positions is 0; after claim, the claimed position itself is open (1).
   const maxOpenForBounce = label === "after claim" ? 1 : 0;
@@ -221,14 +221,19 @@ async function swapBaseToSolWithRetry(baseMint, label, poolAddress = null) {
       const balances = await getWalletBalances({ force: true });
       if (balances.error) throw new Error("Balance unavailable after transaction");
       const token = balances.tokens?.find((t) => t.mint === baseMint);
-      if (!token || token.balance <= 0 || (token.usd != null && token.usd < 0.10)) {
-        // Nothing left to swap (already sold or dust) — treat as done.
-        return { swapped: attempt > 1, result: null, token: null };
+      let amount = token?.balance ?? 0;
+      if (token && baselineRaw != null) {
+        const received = BigInt(token.raw_balance) - baselineRaw;
+        amount = received > 0n ? Number(received) / 10 ** token.decimals : 0;
       }
-      log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ($${token.usd == null ? "unknown" : token.usd.toFixed(2)}) back to SOL (attempt ${attempt}/${attempts})`);
-      const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
+      if (!(amount > 0)) return { swapped: false, status: attempt > 1 ? "settlement_unconfirmed" : "no_balance" };
+      if (token.usd != null && token.usd * amount / token.balance < 0.10) {
+        return { swapped: false, status: "dust_remaining" };
+      }
+      log("executor", `Auto-swapping ${label} ${amount} ${token.symbol || baseMint.slice(0, 8)} back to SOL (attempt ${attempt}/${attempts})`);
+      const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount });
       const ok = swapResult && swapResult.success !== false && !swapResult.error && (swapResult.tx || swapResult.amount_out);
-      if (ok) return { swapped: true, result: swapResult, token };
+      if (ok) return { swapped: true, result: swapResult, token, status: "swapped" };
       lastErr = swapResult?.error || swapResult?.reason || "swap returned no tx";
     } catch (e) {
       lastErr = e.message;
@@ -237,7 +242,7 @@ async function swapBaseToSolWithRetry(baseMint, label, poolAddress = null) {
     if (attempt < attempts) await sleep(delayMs);
   }
   log("executor_warn", `Auto-swap ${label} failed after ${attempts} attempts — base token left unsold (${baseMint.slice(0, 8)})`);
-  return { swapped: false, result: null, token: null };
+  return { swapped: false, result: null, token: null, status: "settlement_unconfirmed" };
 }
 
 /**
@@ -278,6 +283,9 @@ async function executeToolUnlocked(name, args) {
 
   // ─── Execute ──────────────────────────────
   try {
+    const preClose = name === "close_position" && !args.skip_swap && process.env.DRY_RUN !== "true"
+      ? await getWalletBalances({ force: true }).catch(() => null)
+      : null;
     const result = await fn(args);
     const duration = Date.now() - startTime;
     const success = result?.success !== false && !result?.error;
@@ -295,16 +303,19 @@ async function executeToolUnlocked(name, args) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
-      } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+      } else if (name === "close_position" && !result.dry_run) {
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
         // Auto-swap base token back to SOL unless user said to hold (retried).
-        if (!args.skip_swap && result.base_mint) {
-          const { swapped, result: swapResult } = await swapBaseToSolWithRetry(result.base_mint, "after close", result.pool || args.pool_address);
+        result.settlement = args.skip_swap ? "skipped" : "settlement_unconfirmed";
+        if (!args.skip_swap && result.base_mint && !preClose?.error && Array.isArray(preClose?.tokens)) {
+          const original = preClose.tokens.find(t => t.mint === result.base_mint);
+          const { swapped, result: swapResult, status } = await swapBaseToSolWithRetry(result.base_mint, "after close",
+            result.pool || args.pool_address, BigInt(original?.raw_balance ?? 0));
+          result.settlement = status;
           if (swapped) {
             // Tell the model the swap already happened so it doesn't call swap_token again
             result.auto_swapped = true;
@@ -312,6 +323,9 @@ async function executeToolUnlocked(name, args) {
             if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
           }
         }
+        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8),
+          pnlUsd: result.pnl_usd, pnlPct: result.pnl_pct, settlement: result.settlement,
+          solReceived: result.sol_received }).catch(() => {});
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
         await swapBaseToSolWithRetry(result.base_mint, "after claim", result.pool || args.pool_address);
       }

@@ -46,7 +46,7 @@ Balances use standard RPC, including SPL Token and Token-2022. PnL defaults to M
 
 Set `GMGN_API_KEY` for Solana trending tokens or `HELIUS_API_KEY` for confirmed Pump.fun launch and migration logs, then restart. Both can run together. GMGN needs read access only. Helius discovery uses standard WebSockets with its own key independently of the wallet monitor.
 
-The watchlist screens up to four unique mints per minute through the existing Jupiter, on-chain, and Meteora filters. Matches go to the configured Slack owner DM and Telegram notifications. Check the `discovery` and `discovery_warn` logs for screening results and provider errors. Discovery is advisory in both modes. Entry still requires wallet convergence.
+The watchlist combines recent token/SOL DLMM pools and active pools from Meteora with the optional GMGN and Helius feeds. It screens up to six mints per minute through the existing Jupiter, on-chain, and Meteora filters. Candidates with incomplete screening retry after 2, 5 and 10 minutes within a 30-minute queue lifetime. Matches go to the configured Slack owner DM and Telegram notifications. Discovery is advisory in live mode, where entry still requires wallet convergence and a full-size token-to-SOL exit quote.
 
 Example mainnet RPC configuration. Replace the Helius placeholders with your endpoint key.
 
@@ -59,7 +59,9 @@ FALLBACK_RPC_URL=https://api.mainnet.solana.com
 
 The public Solana HTTP endpoint is rate-limited. The HTTP fallback serves RPC reads. It does not replace the configured WebSocket subscription.
 
-Set `researchEnabled: true` in Shadow mode to screen discovery and wallet convergence candidates using the separate `researchMin*` settings and compare volatility-based Spot, wider Spot, Bid-Ask and Curve with experimental DAKUKERU Spot and Bid-Ask. The Fibonacci variant uses the strongest upward swing in the last 96 closed 15-minute candles and assumed 0.236–0.618 levels. Tokens with insufficient candle history still get the volatility variants. Plans are recorded per mint for 24 hours. They do not simulate fills, fees, or PnL. Live entry continues to use wallet convergence, the regular screening thresholds and the configured shape.
+Set `researchEnabled: true` in Shadow mode to compare paper positions for volatility-based Spot, wider Spot, Bid-Ask and Curve with experimental DAKUKERU Spot and Bid-Ask. Fibonacci uses the strongest upward swing in up to 96 closed 15-minute candles and assumed 0.236–0.618 levels. A Fib position is eligible when its range is below the current price. The paper book uses the regular position cap by mint, a fixed allocation per strategy, on-chain active bins, and Jupiter minimum-out quotes to estimate SOL settlement. It persists open positions, pending quote settlements, and up to seven days of results. Its discrete-bin model assumes full conversion across crossed bins, charges an estimated 0.001 SOL round-trip network cost, and credits zero LP fees. Results are estimates for separate strategy portfolios. No paper transaction is submitted.
+
+`paperCapitalSol` and `paperMaxHoldMinutes` configure paper sizing and maximum hold. `paperMinExitRatio` is the minimum quoted liquidation value as a fraction of the current mark in both modes. Live close notifications distinguish confirmed LP closure from the subsequent token-to-SOL swap.
 
 Set `lifecycleReportMinutes` to a positive interval to send wallet balance, open positions and reported open-position PnL to the configured Slack DM and Telegram destination. A report also runs at startup. Edit the interval from the admin menu and restart. Zero disables reports.
 

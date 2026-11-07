@@ -34,6 +34,21 @@ function getJupiterApiKey() {
   return config.jupiter.apiKey || process.env.JUPITER_API_KEY || DEFAULT_JUPITER_API_KEY;
 }
 
+export async function quoteTokenToSol(mint, rawAmount) {
+  const params = new URLSearchParams({ inputMint: mint, outputMint: config.tokens.SOL, amount: String(rawAmount) });
+  const response = await fetch(`${JUPITER_SWAP_V2_API}/order?${params}`, {
+    headers: { 'x-api-key': getJupiterApiKey() }, signal: AbortSignal.timeout(8000),
+  });
+  if (!response.ok) throw Error(`Jupiter quote HTTP ${response.status}`);
+  const quote = await response.json();
+  const expected = Number(quote.outAmount);
+  const minimum = Number(quote.otherAmountThreshold);
+  if (quote.inputMint !== mint || quote.outputMint !== config.tokens.SOL ||
+      quote.inAmount !== String(rawAmount) || !(minimum > 0 && minimum <= expected) ||
+      !Number.isSafeInteger(minimum) || !Number.isSafeInteger(expected)) throw Error('No valid token/SOL exit quote');
+  return minimum / LAMPORTS_PER_SOL;
+}
+
 function getJupiterReferralParams() {
   const referralAccount = String(config.jupiter.referralAccount || "").trim();
   const referralFee = Number(config.jupiter.referralFeeBps || 0);

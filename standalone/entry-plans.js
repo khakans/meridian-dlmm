@@ -38,7 +38,7 @@ export async function entryPlans(pool) {
     { shape: 'curve', range: 'volatility', binsBelow: bins },
   ];
   if (!config.research.enabled || !(step > 0)) return plans;
-  const fib = fibonacciRange(await fetchGeckoCandles(pool.pool_address, 15, 96));
+  const fib = fibonacciRange(await fetchGeckoCandles(pool.pool_address, 15, 96, pool.token_x.address));
   if (!fib) return plans;
   for (const shape of ['spot', 'bid_ask']) {
     const widthBins = Math.ceil(Math.log(fib.upper / fib.lower) / Math.log1p(step / 10_000));

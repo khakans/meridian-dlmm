@@ -1,5 +1,6 @@
 // Outbound notifications used by the standalone runtime and transaction executor.
 import fs from "node:fs";
+import { config } from "./config.js";
 import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
 import { sendSlackNotification } from "./slack-notify.js";
@@ -191,11 +192,19 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct }) {
-  const sign = pnlUsd >= 0 ? "+" : "";
+export async function notifyClose({ pair, pnlUsd, pnlPct, settlement, solReceived }) {
+  const pnl = Number.isFinite(pnlUsd) && Number.isFinite(pnlPct)
+    ? `${pnlUsd >= 0 ? "+" : ""}${pnlUsd.toFixed(4)} ${config.management.solMode ? "SOL" : "USD"} (${pnlPct.toFixed(2)}%)`
+    : "unavailable";
+  const status = {
+    swapped: `Token converted to SOL${Number.isFinite(solReceived) ? ` (${solReceived.toFixed(4)} SOL)` : ""}`,
+    no_balance: "No token balance to convert",
+    dust_remaining: "Token dust remains in wallet",
+    skipped: "Token conversion skipped",
+    settlement_unconfirmed: "Token conversion unconfirmed. Check wallet balance.",
+  }[settlement];
   await sendHTML(
-    `🔒 <b>Closed</b> ${pair}\n` +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    `🔒 <b>Closed LP</b> ${pair}\nPosition PnL: ${pnl}${status ? `\n${status}` : ""}`
   );
 }
 

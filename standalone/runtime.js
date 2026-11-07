@@ -15,6 +15,7 @@ import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
 import { entryPlans } from "./entry-plans.js";
+import { startPaper, validateExitQuote } from "./paper.js";
 import { exposureStillPresent } from "./events.js";
 import { getMyPositions } from "../tools/dlmm.js";
 import { executeTool } from "../tools/executor.js";
@@ -33,6 +34,7 @@ let monitor = null;
 let lockPath = null;
 let stopAdmin = null;
 let stopDiscovery = null;
+let stopPaper = null;
 let slackAdmin = null;
 let shuttingDown = false;
 let manageBusy = false;
@@ -40,6 +42,7 @@ let pollBusy = false;
 let pursuing = false;
 const timers = {};
 const signalQueue = [];
+const discoveryStats = { received: 0, retries: 0, waiting: 0, passed: 0, dropped: 0, reasons: Object.create(null) };
 
 function shadowScreeningThresholds() {
   if (!config.standalone.shadow || !config.research.enabled) return undefined;
@@ -201,6 +204,14 @@ async function attemptEntry(signal) {
     );
   }
   const amountY = computeDeployAmount(balances.sol, convictionMult);
+  if (!config.standalone.shadow && process.env.DRY_RUN !== "true") {
+    try {
+      await validateExitQuote({
+        mint, pool: pool.pool_address, decimals: screened.decimals,
+        binStep: Number(pool.dlmm_params?.bin_step), binsBelow, capital: amountY,
+      });
+    } catch { return "exit quote unavailable or below minimum"; }
+  }
   // Checkpoint before building anything: a crash mid-sequence leaves a
   // recovery pointer instead of a silent duplicate-entry risk.
   store.data.attempts[mint] = {
@@ -410,6 +421,8 @@ async function recordResearch(mint, screened, sources) {
   records[mint] = {
     at: Date.now(), mint, pool: screened.pool.pool_address,
     marketCap: screened.token.mcap,
+    decimals: screened.decimals,
+    binStep: Number(screened.pool.dlmm_params?.bin_step),
     sources: [...new Set([...(latest?.sources ?? []), ...sources])],
     plans,
   };
@@ -454,7 +467,25 @@ function startLifecycleReports() {
       const research = Object.values(store.data.research ?? {}).filter(item => Date.now() - item.at < 86_400_000);
       if (config.standalone.shadow && config.research.enabled) {
         lines.push(`Riset 24 jam ${research.length} kandidat · ${research.reduce((sum, item) => sum + item.plans.length, 0)} rencana entry`);
+        const paper = store.data.paper;
+        const open = Object.values(paper?.open ?? {});
+        const recent = (paper?.closed ?? []).filter(p => Date.now() - p.closedAt < 86_400_000);
+        lines.push(`Paper ${open.length} varian terbuka (${open.filter(p => p.exit).length} tunggu quote) · ${recent.length} close/24j · ${paper?.skipped ?? 0} kandidat terkendala quote`);
+        const performance = new Map();
+        for (const p of recent) {
+          const key = p.variant ?? `${p.range}/${p.shape}`;
+          const metric = performance.get(key) ?? { count: 0, wins: 0, pnl: 0 };
+          metric.count++;
+          if (p.pnl > 0) metric.wins++;
+          metric.pnl += p.pnl;
+          performance.set(key, metric);
+        }
+        for (const [key, p] of performance) lines.push(`• ${key} ${p.wins}/${p.count} untung · ${p.pnl.toFixed(4)} SOL estimasi tanpa fee LP`);
       }
+      const { received, retries, waiting, passed, dropped, reasons } = discoveryStats;
+      lines.push(`Discovery sejak restart ${received} masuk · ${waiting} antre · ${retries} retry · ${passed} lolos · ${dropped} kedaluwarsa/tergeser`);
+      const topReasons = Object.entries(reasons).sort((a, b) => b[1] - a[1]).slice(0, 3);
+      if (topReasons.length) lines.push(`Kendala ${topReasons.map(([reason, n]) => `${reason} ×${n}`).join(" · ")}`);
       if (!shuttingDown) {
         await notify(lines.join("\n"));
         log("lifecycle", "Wallet, position and PnL report generated");
@@ -488,6 +519,7 @@ async function shutdown(signalName, exitCode = 0) {
   log("runtime", `${signalName} received — shutting down`);
   stopChronosKeepalive();
   for (const timer of Object.values(timers)) clearInterval(timer);
+  stopPaper?.();
   await Promise.race([stopDiscovery?.(), sleep(3000)]);
   try { stopAdmin?.(); } catch { /* best-effort */ }
   try { await monitor?.stop(); } catch { /* best-effort */ }
@@ -551,7 +583,9 @@ export async function startStandalone() {
     notify,
     thresholds: shadowScreeningThresholds(),
     onMatch: recordResearch,
+    stats: discoveryStats,
   });
+  if (config.standalone.shadow && config.research.enabled) stopPaper = startPaper(store, notify);
   startLifecycleReports();
 
   const trackedWallets = Object.keys(store.data.wallets).length;

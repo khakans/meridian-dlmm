@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { PublicKey } from '@solana/web3.js';
+import { config } from '../config.js';
 import { log } from '../logger.js';
 import { connection, fetchJson } from './rpc.js';
 import { screenMint } from './screening.js';
@@ -69,12 +70,33 @@ export async function gmgnTrending(key) {
   });
 }
 
-export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds, onMatch }) {
-  if (!gmgnKey && !heliusKey) return null;
+export async function meteoraCandidates(minTvl, minVolume) {
+  const filter = `token_y=${config.tokens.SOL} && tvl>=${minTvl} && is_blacklisted=false`;
+  const feeds = [
+    ['Meteora new pool', 'pool_created_at:desc', filter],
+    ['Meteora active pool', 'fee_tvl_ratio_30m:desc', `${filter} && volume_30m>=${minVolume}`],
+  ];
+  const results = await Promise.allSettled(feeds.map(async ([source, sort, filters]) => {
+    const params = new URLSearchParams({ page_size: '20', sort_by: sort, filter_by: filters });
+    const data = (await fetchJson(`https://dlmm.datapi.meteora.ag/pools?${params}`)).data;
+    if (!Array.isArray(data)) throw Error('Invalid Meteora pool list');
+    return data.flatMap(pool => {
+      const mint = pool.token_x?.address;
+      if (pool.token_y?.address !== config.tokens.SOL || typeof mint !== 'string') return [];
+      if (source === 'Meteora new pool' && !(Date.now() - pool.created_at >= 0 && Date.now() - pool.created_at < 86_400_000)) return [];
+      try { return [{ mint: new PublicKey(mint).toBase58(), source }]; } catch { return []; }
+    });
+  }));
+  for (const result of results) if (result.status === 'rejected') log('discovery_warn', 'Meteora discovery feed unavailable');
+  return results.flatMap(result => result.status === 'fulfilled' ? result.value : []);
+}
+
+export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config.screening, onMatch, stats }) {
   const queue = new Map();
   const screened = new Map();
   let stopped = false;
   let busy = false;
+  let gmgnRetryAt = 0;
   let ws, subscription;
 
   function enqueue(mint, source, priority) {
@@ -87,11 +109,14 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds, onMatch
     const previous = screened.get(mint);
     if (previous && Date.now() < previous.retryAt &&
         (previous.announced || priority <= previous.priority)) return;
-    queue.set(mint, { mint, sources: new Set([source]), priority, addedAt: Date.now() });
+    queue.set(mint, { mint, sources: new Set([source]), priority, addedAt: Date.now(), tries: 0, retryAt: 0 });
+    stats.received++;
     // Keep higher-value signals when the launch feed is busy.
     if (queue.size > 120) {
-      const lowest = [...queue.values()].reduce((a, b) => a.priority <= b.priority ? a : b);
+      const score = item => item.priority + Number(item.tries > 0);
+      const lowest = [...queue.values()].reduce((a, b) => score(a) <= score(b) ? a : b);
       queue.delete(lowest.mint);
+      stats.dropped++;
     }
   }
 
@@ -99,40 +124,60 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds, onMatch
     if (stopped || busy) return;
     busy = true;
     try {
-      if (gmgnKey) {
+      if (gmgnKey && Date.now() >= gmgnRetryAt) {
         try {
           for (const mint of await gmgnTrending(gmgnKey)) enqueue(mint, 'GMGN trending', 2);
         } catch (error) {
+          gmgnRetryAt = Date.now() + 5 * MINUTE;
           log('discovery_warn', error.message.startsWith('Data request failed (HTTP')
             ? `GMGN ${error.message}` : 'GMGN ranking unavailable');
         }
       }
+      for (const { mint, source } of await meteoraCandidates(thresholds.minTvl, thresholds.minVolume)) {
+        enqueue(mint, source, source === 'Meteora new pool' ? 3 : 2);
+      }
       const now = Date.now();
-      for (const [mint, item] of queue) if (now - item.addedAt > 15 * MINUTE) queue.delete(mint);
+      for (const [mint, item] of queue) if (now - item.addedAt > 30 * MINUTE) {
+        queue.delete(mint);
+        stats.dropped++;
+      }
       for (const [mint, item] of screened) if (now >= item.retryAt) screened.delete(mint);
-      const ranked = [...queue.values()].sort((a, b) => b.priority - a.priority);
-      // Reserve one slot for launches even when trending is continuously full.
-      const launch = ranked.find(item => item.priority === 1);
-      const batch = launch ? [...ranked.filter(item => item !== launch).slice(0, 3), launch] : ranked.slice(0, 4);
+      const ranked = [...queue.values()].filter(item => item.retryAt <= now).sort((a, b) => b.priority - a.priority || a.addedAt - b.addedAt);
+      const reserved = [ranked.find(item => item.tries > 0), ranked.find(item => item.priority === 1)].filter(Boolean);
+      const batch = [...new Set([...reserved, ...ranked])].slice(0, 6);
       for (const item of batch) {
         if (stopped) break;
-        const { mint, sources, priority } = item;
+        const { mint, sources } = item;
+        item.tries++;
+        let result;
         try {
-          const result = await screenMint(mint, { thresholds });
-          if (stopped) break;
-          const research = result.pass ? await onMatch?.(mint, result, [...sources]) : null;
-          if (stopped) break;
-          screened.set(mint, { priority: item.priority, announced: result.pass, retryAt: Date.now() + (result.pass ? 60 : 5) * MINUTE });
-          log('discovery', `${mint} [${[...sources].join(', ')}] ${result.pass ? 'passed' : result.reason}`);
-          if (result.pass) await notify(`🔎 Meridian watchlist\n${mint}\nPool ${result.pool.pool_address}\nSource ${[...sources].join(', ')}\nPassed token and DLMM pool screening.${research ? `\n${research}` : ''}`);
+          result = await screenMint(mint, { thresholds });
         } catch {
-          screened.set(mint, { priority, retryAt: Date.now() + MINUTE });
-          log('discovery_warn', `${mint} screening unavailable; will retry when rediscovered`);
-        } finally {
+          result = { pass: false, reason: 'Screening data unavailable' };
+        }
+        if (stopped) break;
+        log('discovery', `${mint} [${[...sources].join(', ')}] ${result.pass ? 'passed' : result.reason}`);
+        if (!result.pass) {
+          const reason = result.reason.split(/ \(|;/)[0];
+          stats.reasons[reason] = (stats.reasons[reason] ?? 0) + 1;
+        }
+        if (result.pass || result.terminal || item.tries >= 4) {
           queue.delete(mint);
+          screened.set(mint, { priority: item.priority, announced: result.pass || result.terminal, retryAt: Date.now() + (result.pass || result.terminal ? 60 : 10) * MINUTE });
+        } else {
+          item.retryAt = Date.now() + [2, 5, 10][item.tries - 1] * MINUTE;
+          stats.retries++;
+        }
+        if (result.pass) {
+          stats.passed++;
+          try {
+            const research = await onMatch?.(mint, result, [...sources]);
+            if (!stopped) await notify(`🔎 Meridian watchlist\n${mint}\nPool ${result.pool.pool_address}\nSource ${[...sources].join(', ')}${research ? `\n${research}` : ''}`);
+          } catch { log('discovery_warn', `${mint} post-screen processing unavailable`); }
         }
       }
     } finally {
+      stats.waiting = queue.size;
       busy = false;
     }
   }

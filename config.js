@@ -101,6 +101,9 @@ export const config = {
     minTokenFeesSol: numericConfig(u.researchMinTokenFeesSol) ?? 5,
     minTvl: numericConfig(u.researchMinTvl) ?? 5_000,
     minTokenAgeHours: numericConfig(u.researchMinTokenAgeHours) ?? 0,
+    paperCapitalSol: numericConfig(u.paperCapitalSol) ?? 0.55,
+    paperMaxHoldMinutes: Math.max(15, numericConfig(u.paperMaxHoldMinutes) ?? 240),
+    paperMinExitRatio: Math.max(0.5, Math.min(1, numericConfig(u.paperMinExitRatio) ?? 0.9)),
   },
   lifecycleReportMinutes: numericConfig(u.lifecycleReportMinutes) ?? 0,
 

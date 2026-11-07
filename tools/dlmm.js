@@ -1137,8 +1137,7 @@ export async function closePosition({ position_address, reason }) {
     let closedConfirmed = false;
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
-        const refreshed = await getMyPositions({ force: true, silent: true });
-        const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
+        const stillOpen = await getConnection().getAccountInfo(positionPubKey, "confirmed");
         if (!stillOpen) {
           closedConfirmed = true;
           break;

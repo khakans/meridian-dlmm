@@ -61,10 +61,16 @@ export async function checkMintOnChain(mint) {
   const result = await readRpc('monitor', c => c.getParsedAccountInfo(new PublicKey(mint), 'confirmed'));
   const account = result.value;
   const info = account?.data?.parsed?.info;
-  if (!account || !TOKEN_PROGRAMS.includes(account.owner.toString()) || !info || info.mintAuthority !== null || info.freezeAuthority !== null) throw new Error('On-chain mint authority check failed');
+  if (!account || !info) throw new Error('On-chain mint data unavailable');
+  if (!TOKEN_PROGRAMS.includes(account.owner.toString()) || info.mintAuthority !== null || info.freezeAuthority !== null) {
+    throw Object.assign(new Error('On-chain mint authority check failed'), { terminal: true });
+  }
   const allowed = new Set(['metadataPointer', 'tokenMetadata']);
   if (account.owner.toString() === TOKEN_PROGRAMS[1] && !Array.isArray(info.extensions)) throw new Error('Token-2022 extensions unavailable');
-  for (const extension of info.extensions || []) if (!allowed.has(extension.extension)) throw new Error(`Unsupported Token-2022 extension: ${extension.extension}`);
+  for (const extension of info.extensions || []) if (!allowed.has(extension.extension)) {
+    throw Object.assign(new Error(`Unsupported Token-2022 extension: ${extension.extension}`), { terminal: true });
+  }
+  return info.decimals;
 }
 export async function screenMint(mint, { poolAddress = null, thresholds = config.screening } = {}) {
   if (isBlacklisted(mint) || isBaseMintOnCooldown(mint)) return { pass: false, terminal: true, reason: 'Token is blocked or on cooldown' };
@@ -73,7 +79,12 @@ export async function screenMint(mint, { poolAddress = null, thresholds = config
   const reason = rejectToken(token, mint, thresholds);
   if (reason) return { pass: false, reason };
   if (token.dev ? isDevBlocked(token.dev) : Object.keys(getBlockedDevs()).length > 0) return { pass: false, terminal: true, reason: 'Deployer blocked or unavailable' };
-  await checkMintOnChain(mint);
+  let decimals;
+  try { decimals = await checkMintOnChain(mint); }
+  catch (error) {
+    if (!error.terminal) throw error;
+    return { pass: false, terminal: true, reason: error.message };
+  }
   let addresses;
   if (poolAddress) addresses = [poolAddress];
   else {
@@ -109,5 +120,5 @@ export async function screenMint(mint, { poolAddress = null, thresholds = config
     };
     candidates.sort((a, b) => scoreCandidate(b) - scoreCandidate(a) || b.active_tvl - a.active_tvl || a.pool_address.localeCompare(b.pool_address));
   }
-  return candidates.length ? { pass: true, pool: candidates[0], token, fetchedAt: Date.now() } : { pass: false, reason: rejected.slice(0, 3).join('; ') || 'No eligible token/SOL pool' };
+  return candidates.length ? { pass: true, pool: candidates[0], token, decimals, fetchedAt: Date.now() } : { pass: false, reason: rejected.slice(0, 3).join('; ') || 'No eligible token/SOL pool' };
 }

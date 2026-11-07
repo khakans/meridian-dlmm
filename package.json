@@ -15,7 +15,7 @@
     "pm2:restart": "pm2 restart meridian --update-env",
     "pm2:logs": "pm2 logs meridian --lines 100",
     "dev": "DRY_RUN=true node index.js",
-    "test": "npm run test:syntax && npm run test:standalone && node --test test/cleanup.test.js test/slack.test.js",
+    "test": "npm run test:syntax && npm run test:standalone && node --test test/cleanup.test.js test/slack.test.js test/paper.test.js",
     "test:syntax": "node scripts/check-syntax.js",
     "postinstall": "node scripts/patch-anchor.js",
     "test:standalone": "node test/test-standalone.js"
