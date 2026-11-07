@@ -162,32 +162,6 @@ function currentValue(setting) {
 
 // ─── Console message: one message, re-rendered in place ─────────────────────
 
-let consoleMessageId = null;
-let lastRenderSig = null;
-let lastRenderAt = 0;
-// While the console is in active use, /menu edits it in place; once stale,
-// /menu starts a fresh message at the bottom so it's actually visible.
-const STALE_CONSOLE_MS = 5 * 60_000;
-
-// Render into the console message. Tapping any older menu message adopts it
-// as the console, so navigation never spawns new messages.
-async function render(text, keyboard) {
-  const sig = `${text}\u0000${JSON.stringify(keyboard ?? [])}`;
-  if (consoleMessageId != null) {
-    if (sig === lastRenderSig) { lastRenderAt = Date.now(); return consoleMessageId; }
-    const res = await editMenu(consoleMessageId, text, keyboard).catch(() => null);
-    if (res?.ok) { lastRenderSig = sig; lastRenderAt = Date.now(); return consoleMessageId; }
-    consoleMessageId = null; // stale id (deleted or too old) — resend below
-  }
-  const sent = await sendMenu(text, keyboard);
-  consoleMessageId = sent?.result?.message_id ?? null;
-  lastRenderSig = consoleMessageId != null ? sig : null;
-  lastRenderAt = Date.now();
-  return consoleMessageId;
-}
-
-// ─── Validation + save ───────────────────────────────────────────────────────
-
 function validate(setting, raw) {
   const text = String(raw).trim();
   if (setting.type === "env") {
@@ -236,10 +210,13 @@ function applySetting(setting, value) {
 
 // ─── Rendering ───────────────────────────────────────────────────────────────
 
-function fmtValue(setting) {
+function fmtValue(setting, slack = false) {
   const v = currentValue(setting);
   if (setting.type === "bool") return v ? "ON" : "OFF";
   if (setting.type === "env" && setting.kind === "secret") return v ? "set ✓" : "not set";
+  if (slack && setting.kind === "url" && v) {
+    try { return new URL(v).hostname; } catch { return "configured"; }
+  }
   if (v == null) return "off";
   if (Array.isArray(v)) return v.length ? v.join(",") : "any";
   return `${v}${setting.unit && setting.unit !== "%" ? ` ${setting.unit}` : setting.unit === "%" ? "%" : ""}`;
@@ -273,9 +250,9 @@ function editHint(setting) {
   }
 }
 
-function sectionMenu(section) {
+function sectionMenu(section, slack = false) {
   const rows = section.settings.map(s => [{
-    text: `${s.label ?? s.k}: ${fmtValue(s)}`,
+    text: `${s.label ?? s.k}: ${fmtValue(s, slack)}`,
     callback_data: s.type === "bool" ? `t:${s.k}` : `e:${s.k}`,
   }]);
   const explainers = {
@@ -295,272 +272,330 @@ const restartRow = () => [{ text: "♻️ Restart now", callback_data: "m:restar
 
 // ─── Views ───────────────────────────────────────────────────────────────────
 
-async function viewRoot() {
-  await render(rootText(), rootKeyboard());
-}
-
-async function viewSection(sectionId, note = "") {
-  if (sectionId === "wallets") {
-    const { wallets } = listSmartWallets();
-    const rows = wallets.map((w, i) => [{ text: `🗑 ${w.name}`, callback_data: `w:rm:${i}` }]);
-    return void await render(
-      `👛 <b>Monitored wallets</b> (${wallets.length})\n${wallets.map(w => `• <b>${w.name}</b>\n<code>${w.address}</code>`).join("\n") || "none — add at least 2 to trigger entries"}${note ? `\n\n${note}` : ""}`,
-      [...rows, [{ text: "➕ Add wallet", callback_data: "w:add" }, { text: "← Back", callback_data: "s:root" }]],
-    );
-  }
-  if (sectionId === "key") {
-    let deposit = config.standalone.walletAddress || null;
-    let keyState = "not set";
-    if (process.env.WALLET_PRIVATE_KEY) {
-      try {
-        deposit = parseSecretKey(process.env.WALLET_PRIVATE_KEY).publicKey.toString();
-        keyState = "configured ✓";
-      } catch { keyState = "configured but unreadable ⚠️"; }
-    }
-    let balanceLine = "";
-    if (deposit) {
-      try {
-        const { getWalletBalances } = await import("../tools/wallet.js");
-        const b = await getWalletBalances({ nativeOnly: true });
-        if (!b.error && Number.isFinite(b.sol)) balanceLine = `\nSOL balance: <b>${b.sol.toFixed(4)}</b>`;
-      } catch { /* balance is best-effort */ }
-    }
-    return void await render(
-      `🔑 <b>Bot wallet</b>\n\n📥 <b>Deposit address:</b>\n<code>${deposit ?? "—"}</code>${balanceLine}\n\nSigning key: ${keyState}\nRead-only override: <code>${config.standalone.walletAddress || "not set"}</code>${note ? `\n\n${note}` : ""}`,
-      [
-        [{ text: "📥 Import private key", callback_data: "k:imp" }],
-        [{ text: "📤 Export private key", callback_data: "k:exp" }, { text: "📍 Set read-only address", callback_data: "k:addr" }],
-        [{ text: "← Back", callback_data: "s:root" }],
-      ],
-    );
-  }
-  if (sectionId === "status") {
-    return void await render(await statusText(), [[{ text: "🔄 Refresh", callback_data: "s:status" }, { text: "← Back", callback_data: "s:root" }]]);
-  }
-  const section = SECTIONS.find(s => s.id === sectionId);
-  if (!section) return void await viewRoot();
-  const menu = sectionMenu(section);
-  await render(note ? `${menu.text}\n\n${note}` : menu.text, menu.keyboard);
-}
-
-const hostOf = url => { try { return new URL(url).host; } catch { return "?"; } };
-
-async function statusText() {
-  const stats = adminContext.monitor?.stats ?? {};
-  const wallets = listSmartWallets();
-  const monitorUrl = config.standalone.monitorRpcUrl || envValue("RPC_URL");
-  const balanceUrl = config.standalone.balanceRpcUrl || envValue("RPC_URL");
-  const fallbackUrl = config.standalone.fallbackRpcUrl;
-  const lines = [
-    `🖥 <b>Status</b>`,
-    `Mode: ${config.standalone.shadow ? "🌑 SHADOW" : "🔴 LIVE"} | DRY_RUN=${process.env.DRY_RUN === "true"}`,
-    `Uptime: ${Math.floor(process.uptime() / 60)} min`,
-    `Wallets monitored: ${wallets.total} (trigger: ${config.standalone.walletThreshold} in ${config.standalone.windowSec}s)`,
-    `RPC: monitor=${hostOf(monitorUrl)} balance=${hostOf(balanceUrl)}${fallbackUrl ? ` fallback=${hostOf(fallbackUrl)}` : ""}`,
-    `Monitor: tx=${stats.transactions ?? 0} entries=${stats.entries ?? 0} lag=${stats.lastLagMs != null ? `${(stats.lastLagMs / 1000).toFixed(1)}s` : "n/a"} errors=${stats.errors ?? 0}`,
-    `Signals active: ${adminContext.activeSignals?.() ?? 0}`,
-  ];
-  try {
-    const { getMyPositions } = await import("../tools/dlmm.js");
-    const positions = await getMyPositions({ force: true, silent: true });
-    lines.push(`Positions: ${positions.total_positions}${positions.positions.length ? ` (${positions.positions.map(p => `${p.pair ?? "?"} ${p.pnl_pct ?? "?"}%`).join(", ")})` : ""}`);
-  } catch { lines.push("Positions: unavailable"); }
-  return lines.join("\n");
-}
-
-function parseSecretKey(raw) {
-  const text = String(raw).trim();
-  if (text.startsWith("[")) {
-    const bytes = JSON.parse(text);
-    if (!Array.isArray(bytes) || bytes.length !== 64 || bytes.some(n => !Number.isInteger(n) || n < 0 || n > 255)) throw new Error("bad array");
-    return Keypair.fromSecretKey(Uint8Array.from(bytes));
-  }
-  const bytes = bs58.decode(text);
-  if (bytes.length !== 64) throw new Error("bad length");
-  return Keypair.fromSecretKey(bytes);
-}
-
-function requestRestart() {
-  void (async () => {
-    await sendMessage("♻️ Restarting — back in a few seconds…").catch(() => {});
-    await new Promise(r => setTimeout(r, 1200));
-    process.exit(1); // systemd Restart=on-failure brings the bot back
-  })();
-}
-
-// ─── Callbacks ───────────────────────────────────────────────────────────────
-
-let pending = null; // { kind, setting?|address? }
-
-async function handleCallback(cb) {
-  const data = cb.data || "";
-  // Whatever message the user taps becomes the console.
-  if (cb.message?.message_id) consoleMessageId = cb.message.message_id;
-  await answerCallbackQuery(cb.id).catch(() => {});
-  try {
-    if (data === "x:cancel") { pending = null; return void await viewRoot(); }
-    if (data === "s:root") { pending = null; return void await viewRoot(); }
-    if (data.startsWith("s:")) { pending = null; return void await viewSection(data.slice(2)); }
-    if (data.startsWith("t:")) {
-      const setting = byKey.get(data.slice(2));
-      if (!setting) return;
-      const needs = applySetting(setting, !currentValue(setting));
-      return void await viewSection(SECTIONS.find(s => s.settings.includes(setting))?.id, `✅ Saved${needs ? " — ♻️ restart to apply" : ""}`);
-    }
-    if (data.startsWith("e:")) {
-      const setting = byKey.get(data.slice(2));
-      if (!setting) return;
-      pending = { kind: "set", setting };
-      return void await render(`✏️ <b>${setting.label ?? setting.k}</b>\nCurrent: <code>${fmtValue(setting)}</code>\n\n${editHint(setting)}`, cancelKB());
-    }
-    if (data === "w:add") {
-      pending = { kind: "waddr" };
-      return void await render("👛 Send the wallet <b>address</b>:", cancelKB());
-    }
-    if (data.startsWith("w:rm2:")) {
-      const { wallets } = listSmartWallets();
-      const w = wallets[Number(data.slice(6))];
-      if (!w) return void await viewSection("wallets", "⚠️ Wallet not found.");
-      const res = removeSmartWallet({ address: w.address });
-      return void await viewSection("wallets", res.success ? `🗑 Removed ${w.name}` : `⚠️ ${res.error}`);
-    }
-    if (data.startsWith("w:rm:")) {
-      const { wallets } = listSmartWallets();
-      const w = wallets[Number(data.slice(5))];
-      if (!w) return void await viewSection("wallets", "⚠️ Wallet not found.");
-      return void await render(`Remove <b>${w.name}</b>\n<code>${w.address}</code>?`, [
-        [{ text: "🗑 Confirm remove", callback_data: `w:rm2:${data.slice(5)}` }, { text: "✖️ Cancel", callback_data: "s:wallets" }],
-      ]);
-    }
-    if (data === "k:imp") {
-      pending = { kind: "pkimport" };
-      return void await render("🔑 Send the private key — base58 secret <b>or</b> JSON byte array.\n\n⚠️ The message will stay in this chat until you delete it.", cancelKB());
-    }
-    if (data === "k:exp") {
-      return void await render("⚠️ <b>Export sends the private key into this chat.</b>\nTelegram history is kept server-side. Anyone with access to this account gets the key.\n\nExport anyway?", [
-        [{ text: "👁 Show key", callback_data: "k:exp2" }, { text: "✖️ Cancel", callback_data: "s:key" }],
-      ]);
-    }
-    if (data === "k:exp2") {
-      const raw = process.env.WALLET_PRIVATE_KEY;
-      if (!raw) { await sendMessage("No WALLET_PRIVATE_KEY configured."); return void await viewSection("key"); }
-      let kp;
-      try { kp = parseSecretKey(raw); } catch { await sendMessage("⚠️ Stored key is unreadable."); return void await viewSection("key"); }
-      // The key itself goes out as its own message so it is easy to find and delete.
-      await sendMessage(`🔑 <code>${bs58.encode(kp.secretKey)}</code>\n\n⚠️ Delete this message from the chat history now.`);
-      return void await viewSection("key", "Key shown above — delete that message now.");
-    }
-    if (data === "k:addr") {
-      pending = { kind: "walletaddr" };
-      return void await render("📍 Send the read-only wallet <b>address</b> (public key):", cancelKB());
-    }
-    if (data === "m:shadow") {
-      const next = !config.standalone.shadow;
-      return void await render(`Set mode to <b>${next ? "SHADOW (nothing submitted)" : "LIVE"}</b>?`, [
-        [{ text: next ? "🌑 Shadow" : "🔴 LIVE", callback_data: "m:shadow2" }, { text: "✖️ Cancel", callback_data: "s:root" }],
-      ]);
-    }
-    if (data === "m:shadow2") {
-      const next = !config.standalone.shadow;
-      writeUserConfig({ shadowMode: next });
-      config.standalone.shadow = next;
-      if (next) process.env.DRY_RUN = "true";
-      else if (envValue("DRY_RUN") !== "true") delete process.env.DRY_RUN;
-      return void await viewRoot();
-    }
-    if (data === "m:restart") {
-      return void await render("♻️ Restart the bot? (takes ~5s)", [
-        [{ text: "♻️ Confirm restart", callback_data: "m:restart2" }, { text: "✖️ Cancel", callback_data: "s:root" }],
-      ]);
-    }
-    if (data === "m:restart2") return void requestRestart();
-  } catch (e) {
-    log("telegram_error", `admin callback failed: ${e.message}`);
-    await viewRoot(`⚠️ ${e.message}`).catch(() => {});
-  }
-}
-
-// ─── Text input ──────────────────────────────────────────────────────────────
-
-async function handleText(text) {
-  if (pending) {
-    const p = pending;
-    pending = null;
-    try {
-      if (p.kind === "set") {
-        const value = validate(p.setting, text);
-        const needs = applySetting(p.setting, value);
-        const sectionId = SECTIONS.find(s => s.settings.includes(p.setting))?.id;
-        return void await viewSection(sectionId, `✅ <b>${p.setting.label ?? p.setting.k}</b> → <code>${fmtValue(p.setting)}</code>${needs ? "\n♻️ Applies after restart" : ""}`);
-      }
-      if (p.kind === "waddr") {
-        if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text.trim())) {
-          pending = { kind: "waddr" };
-          return void await render("⚠️ Not a valid Solana address — send it again, or tap Cancel:", cancelKB());
-        }
-        pending = { kind: "wname", address: text.trim() };
-        return void await render("Name this wallet:", cancelKB());
-      }
-      if (p.kind === "wname") {
-        const name = text.trim().slice(0, 40) || "wallet";
-        const res = addSmartWallet({ address: p.address, name });
-        return void await viewSection("wallets", res.success ? `✅ Added <b>${name}</b>\n<code>${p.address}</code>` : `⚠️ ${res.error}`);
-      }
-      if (p.kind === "pkimport") {
-        const kp = parseSecretKey(text);
-        writeEnvValue("WALLET_PRIVATE_KEY", bs58.encode(kp.secretKey));
-        process.env.WALLET_PRIVATE_KEY = bs58.encode(kp.secretKey); // live immediately; .env survives restarts
-        return void await viewSection("key", `✅ Key imported — wallet <code>${kp.publicKey.toString()}</code>\nSigning is active now (survives restarts).`);
-      }
-      if (p.kind === "walletaddr") {
-        if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text.trim())) return void await render("⚠️ Not a valid address — send again, or tap Cancel:", cancelKB());
-        writeUserConfig({ walletAddress: text.trim() });
-        config.standalone.walletAddress = text.trim();
-        return void await viewSection("key", `✅ Read-only address set: <code>${text.trim()}</code>`);
-      }
-    } catch (e) {
-      return void await render(`⚠️ ${e.message} — try again or tap Cancel`, cancelKB());
-    }
-  }
-
-  const [cmd, ...args] = text.trim().split(/\s+/);
-  if (cmd === "/cancel") { pending = null; return void await viewRoot("Cancelled."); }
-  if (cmd === "/start" || cmd === "/help" || cmd === "/menu") {
-    // An explicit /menu must be visible: reuse the console only when it is fresh.
-    if (consoleMessageId != null && Date.now() - lastRenderAt > STALE_CONSOLE_MS) {
-      consoleMessageId = null;
-      lastRenderSig = null;
-    }
-    return void await viewRoot("Commands: /addwallet <address> <name> · /removewallet <address> · /wallets · /status · /cancel");
-  }
-  if (cmd === "/status") return void await viewSection("status");
-  if (cmd === "/wallets") return void await viewSection("wallets");
-  if (cmd === "/addwallet") {
-    const address = args[0];
-    const name = args.slice(1).join(" ").slice(0, 40) || "wallet";
-    const res = addSmartWallet({ address: address ?? "", name });
-    return void await viewSection("wallets", res.success ? `✅ Added <b>${name}</b> <code>${address}</code>` : `⚠️ ${res.error}`);
-  }
-  if (cmd === "/removewallet") {
-    const res = removeSmartWallet({ address: args[0] ?? "" });
-    return void await viewSection("wallets", res.success ? `🗑 Removed ${res.removed}` : `⚠️ ${res.error}`);
-  }
-}
-
-// ─── Wiring ──────────────────────────────────────────────────────────────────
-
-const adminContext = { monitor: null, activeSignals: null };
-
-// Exposed for the menu-schema tests in test/cleanup.test.js.
+// Exposed for existing menu-schema tests.
 export const _test = { SECTIONS, byKey, editHint, validate, sectionMenu, fmtValue };
 
-export function startAdmin({ monitor = null, activeSignals = null } = {}) {
-  adminContext.monitor = monitor;
-  adminContext.activeSignals = activeSignals;
-  const stop = startAdminPolling(async ({ message, callback }) => {
+export function createAdminConsole(transport, {
+  monitor = null, activeSignals = null, restart, slack = false,
+} = {}) {
+  const { sendMessage, sendMenu, editMenu } = transport;
+  const answerCallbackQuery = transport.answerCallbackQuery ?? (async () => {});
+  const adminContext = { monitor, activeSignals };
+  let consoleMessageId = null;
+  let lastRenderSig = null;
+  let lastRenderAt = 0;
+  // While the console is in active use, /menu edits it in place; once stale,
+  // /menu starts a fresh message at the bottom so it's actually visible.
+  const STALE_CONSOLE_MS = 5 * 60_000;
+
+  // Render into the console message. Tapping any older menu message adopts it
+  // as the console, so navigation never spawns new messages.
+  async function render(text, keyboard) {
+    const sig = `${text}\u0000${JSON.stringify(keyboard ?? [])}`;
+    if (consoleMessageId != null) {
+      if (!slack && sig === lastRenderSig) { lastRenderAt = Date.now(); return consoleMessageId; }
+      const res = await editMenu(consoleMessageId, text, keyboard).catch(() => null);
+      if (res?.ok) { lastRenderSig = sig; lastRenderAt = Date.now(); return consoleMessageId; }
+      consoleMessageId = null; // stale id (deleted or too old) — resend below
+    }
+    const sent = await sendMenu(text, keyboard);
+    consoleMessageId = sent?.result?.message_id ?? null;
+    lastRenderSig = consoleMessageId != null ? sig : null;
+    lastRenderAt = Date.now();
+    return consoleMessageId;
+  }
+
+  async function viewRoot(note = "") {
+    await render(note ? `${rootText()}\n\n${note}` : rootText(), rootKeyboard());
+  }
+
+  async function viewSection(sectionId, note = "") {
+    if (sectionId === "wallets") {
+      const { wallets } = listSmartWallets();
+      const rows = wallets.map(w => [{ text: `🗑 ${w.name}`, callback_data: `w:rm:${w.address}` }]);
+      return void await render(
+        `👛 <b>Monitored wallets</b> (${wallets.length})\n${wallets.map(w => `• <b>${w.name}</b>\n<code>${w.address}</code>`).join("\n") || "none — add at least 2 to trigger entries"}${note ? `\n\n${note}` : ""}`,
+        [...rows, [{ text: "➕ Add wallet", callback_data: "w:add" }, { text: "← Back", callback_data: "s:root" }]],
+      );
+    }
+    if (sectionId === "key") {
+      let deposit = config.standalone.walletAddress || null;
+      let keyState = "not set";
+      if (process.env.WALLET_PRIVATE_KEY) {
+        try {
+          deposit = parseSecretKey(process.env.WALLET_PRIVATE_KEY).publicKey.toString();
+          keyState = "configured ✓";
+        } catch { keyState = "configured but unreadable ⚠️"; }
+      }
+      let balanceLine = "";
+      if (deposit) {
+        try {
+          const { getWalletBalances } = await import("../tools/wallet.js");
+          const b = await getWalletBalances({ nativeOnly: true });
+          if (!b.error && Number.isFinite(b.sol)) balanceLine = `\nSOL balance: <b>${b.sol.toFixed(4)}</b>`;
+        } catch { /* balance is best-effort */ }
+      }
+      return void await render(
+        `🔑 <b>Bot wallet</b>\n\n📥 <b>Deposit address:</b>\n<code>${deposit ?? "—"}</code>${balanceLine}\n\nSigning key: ${keyState}\nRead-only override: <code>${config.standalone.walletAddress || "not set"}</code>${note ? `\n\n${note}` : ""}`,
+        [
+          [{ text: slack ? "Signing key setup" : "📥 Import private key", callback_data: "k:imp" }],
+          [...(slack ? [] : [{ text: "📤 Export private key", callback_data: "k:exp" }]), { text: "📍 Set read-only address", callback_data: "k:addr" }],
+          [{ text: "← Back", callback_data: "s:root" }],
+        ],
+      );
+    }
+    if (sectionId === "status") {
+      return void await render(await statusText(), [[{ text: "🔄 Refresh", callback_data: "s:status" }, { text: "← Back", callback_data: "s:root" }]]);
+    }
+    const section = SECTIONS.find(s => s.id === sectionId);
+    if (!section) return void await viewRoot();
+    const menu = sectionMenu(section, slack);
+    await render(note ? `${menu.text}\n\n${note}` : menu.text, menu.keyboard);
+  }
+
+  const hostOf = url => { try { return new URL(url).host; } catch { return "?"; } };
+
+  async function statusText() {
+    const stats = adminContext.monitor?.stats ?? {};
+    const wallets = listSmartWallets();
+    const monitorUrl = config.standalone.monitorRpcUrl || envValue("RPC_URL");
+    const balanceUrl = config.standalone.balanceRpcUrl || envValue("RPC_URL");
+    const fallbackUrl = config.standalone.fallbackRpcUrl;
+    const lines = [
+      `🖥 <b>Status</b>`,
+      `Mode: ${config.standalone.shadow ? "🌑 SHADOW" : "🔴 LIVE"} | DRY_RUN=${process.env.DRY_RUN === "true"}`,
+      `Uptime: ${Math.floor(process.uptime() / 60)} min`,
+      `Wallets monitored: ${wallets.total} (trigger: ${config.standalone.walletThreshold} in ${config.standalone.windowSec}s)`,
+      `RPC: monitor=${hostOf(monitorUrl)} balance=${hostOf(balanceUrl)}${fallbackUrl ? ` fallback=${hostOf(fallbackUrl)}` : ""}`,
+      `Monitor: tx=${stats.transactions ?? 0} entries=${stats.entries ?? 0} lag=${stats.lastLagMs != null ? `${(stats.lastLagMs / 1000).toFixed(1)}s` : "n/a"} errors=${stats.errors ?? 0}`,
+      `Signals active: ${adminContext.activeSignals?.() ?? 0}`,
+    ];
+    try {
+      const { getMyPositions } = await import("../tools/dlmm.js");
+      const positions = await getMyPositions({ force: true, silent: true });
+      lines.push(`Positions: ${positions.total_positions}${positions.positions.length ? ` (${positions.positions.map(p => `${p.pair ?? "?"} ${p.pnl_pct ?? "?"}%`).join(", ")})` : ""}`);
+    } catch { lines.push("Positions: unavailable"); }
+    return lines.join("\n");
+  }
+
+  function parseSecretKey(raw) {
+    const text = String(raw).trim();
+    if (text.startsWith("[")) {
+      const bytes = JSON.parse(text);
+      if (!Array.isArray(bytes) || bytes.length !== 64 || bytes.some(n => !Number.isInteger(n) || n < 0 || n > 255)) throw new Error("bad array");
+      return Keypair.fromSecretKey(Uint8Array.from(bytes));
+    }
+    const bytes = bs58.decode(text);
+    if (bytes.length !== 64) throw new Error("bad length");
+    return Keypair.fromSecretKey(bytes);
+  }
+
+  function requestRestart() {
+    void (async () => {
+      await sendMessage("♻️ Restarting — back in a few seconds…").catch(() => {});
+      await new Promise(r => setTimeout(r, 1200));
+      process.exit(1); // systemd Restart=on-failure brings the bot back
+    })();
+  }
+
+  // ─── Callbacks ───────────────────────────────────────────────────────────────
+
+  let pending = null; // { kind, setting?|address? }
+
+  async function handleCallback(cb) {
+    const data = cb.data || "";
+    // Whatever message the user taps becomes the console.
+    if (cb.message?.message_id) consoleMessageId = cb.message.message_id;
+    await answerCallbackQuery(cb.id).catch(() => {});
+    try {
+      if (data === "x:cancel") { pending = null; return void await viewRoot(); }
+      if (data === "s:root") { pending = null; return void await viewRoot(); }
+      if (data.startsWith("s:")) { pending = null; return void await viewSection(data.slice(2)); }
+      if (data.startsWith("t:")) {
+        const setting = byKey.get(data.slice(2));
+        if (!setting) return;
+        const needs = applySetting(setting, !currentValue(setting));
+        return void await viewSection(SECTIONS.find(s => s.settings.includes(setting))?.id, `✅ Saved${needs ? " — ♻️ restart to apply" : ""}`);
+      }
+      if (slack && (data.startsWith("k:imp") || data.startsWith("k:exp"))) {
+        return void await viewSection("key", "Manage the signing key in the server .env. Restart to load a new key.");
+      }
+      if (data.startsWith("e:")) {
+        const setting = byKey.get(data.slice(2));
+        if (!setting) return;
+        if (slack && setting.kind === "secret") {
+          return void await viewSection("rpc", "Update this API key in the server .env and restart.");
+        }
+        pending = { kind: "set", setting };
+        return void await render(`✏️ <b>${setting.label ?? setting.k}</b>\nCurrent: <code>${fmtValue(setting, slack)}</code>\n\n${editHint(setting)}`, cancelKB());
+      }
+      if (data === "w:add") {
+        pending = { kind: "waddr" };
+        return void await render("👛 Send the wallet <b>address</b>:", cancelKB());
+      }
+      if (data.startsWith("w:rm2:")) {
+        const { wallets } = listSmartWallets();
+        const w = wallets.find(w => w.address === data.slice(6));
+        if (!w) return void await viewSection("wallets", "⚠️ Wallet not found.");
+        const res = removeSmartWallet({ address: w.address });
+        return void await viewSection("wallets", res.success ? `🗑 Removed ${w.name}` : `⚠️ ${res.error}`);
+      }
+      if (data.startsWith("w:rm:")) {
+        const { wallets } = listSmartWallets();
+        const w = wallets.find(w => w.address === data.slice(5));
+        if (!w) return void await viewSection("wallets", "⚠️ Wallet not found.");
+        return void await render(`Remove <b>${w.name}</b>\n<code>${w.address}</code>?`, [
+          [{ text: "🗑 Confirm remove", callback_data: `w:rm2:${data.slice(5)}` }, { text: "✖️ Cancel", callback_data: "s:wallets" }],
+        ]);
+      }
+      if (data === "k:imp") {
+        pending = { kind: "pkimport" };
+        return void await render("🔑 Send the private key — base58 secret <b>or</b> JSON byte array.\n\n⚠️ The message will stay in this chat until you delete it.", cancelKB());
+      }
+      if (data === "k:exp") {
+        return void await render("⚠️ <b>Export sends the private key into this chat.</b>\nTelegram history is kept server-side. Anyone with access to this account gets the key.\n\nExport anyway?", [
+          [{ text: "👁 Show key", callback_data: "k:exp2" }, { text: "✖️ Cancel", callback_data: "s:key" }],
+        ]);
+      }
+      if (data === "k:exp2") {
+        const raw = process.env.WALLET_PRIVATE_KEY;
+        if (!raw) { await sendMessage("No WALLET_PRIVATE_KEY configured."); return void await viewSection("key"); }
+        let kp;
+        try { kp = parseSecretKey(raw); } catch { await sendMessage("⚠️ Stored key is unreadable."); return void await viewSection("key"); }
+        // The key itself goes out as its own message so it is easy to find and delete.
+        await sendMessage(`🔑 <code>${bs58.encode(kp.secretKey)}</code>\n\n⚠️ Delete this message from the chat history now.`);
+        return void await viewSection("key", "Key shown above — delete that message now.");
+      }
+      if (data === "k:addr") {
+        pending = { kind: "walletaddr" };
+        return void await render("📍 Send the read-only wallet <b>address</b> (public key):", cancelKB());
+      }
+      if (data === "m:shadow") {
+        const next = !config.standalone.shadow;
+        return void await render(`Set mode to <b>${next ? "SHADOW (nothing submitted)" : "LIVE"}</b>?`, [
+          [{ text: next ? "🌑 Shadow" : "🔴 LIVE", callback_data: next ? "m:shadow2:shadow" : "m:shadow2:live" }, { text: "✖️ Cancel", callback_data: "s:root" }],
+        ]);
+      }
+      if (data === "m:shadow2:shadow" || data === "m:shadow2:live") {
+        const next = data.endsWith(":shadow");
+        if (slack && !next && (process.env.SLACK_ALLOW_LIVE !== "true" ||
+            envValue("DRY_RUN") !== "false" || !process.env.WALLET_PRIVATE_KEY)) {
+          return void await sendMessage("Live requires a local signing key, DRY_RUN=false and SLACK_ALLOW_LIVE=true on the server. Restart before confirming.");
+        }
+        if (slack && !next) parseSecretKey(process.env.WALLET_PRIVATE_KEY);
+        writeUserConfig({ shadowMode: next });
+        config.standalone.shadow = next;
+        if (next) process.env.DRY_RUN = "true";
+        else if (envValue("DRY_RUN") !== "true") delete process.env.DRY_RUN;
+        return void await viewRoot();
+      }
+      if (data === "m:restart") {
+        return void await render("♻️ Restart the bot? (takes ~5s)", [
+          [{ text: "♻️ Confirm restart", callback_data: "m:restart2" }, { text: "✖️ Cancel", callback_data: "s:root" }],
+        ]);
+      }
+      if (data === "m:restart2") {
+        if (restart) return void await restart(sendMessage);
+        return void requestRestart();
+      }
+    } catch (e) {
+      log(slack ? "slack_error" : "telegram_error", slack ? "Admin action failed" : `admin callback failed: ${e.message}`);
+      await viewRoot(slack ? "Pengaturan belum bisa diproses. Coba lagi." : `⚠️ ${e.message}`).catch(() => {});
+    }
+  }
+
+  // ─── Text input ──────────────────────────────────────────────────────────────
+
+  async function handleText(text) {
+    if (/^\/(?:cancel|start|help|menu|status|wallets|addwallet|removewallet)(?:\s|$)/.test(text.trim())) pending = null;
+    if (pending) {
+      const p = pending;
+      pending = null;
+      try {
+        if (p.kind === "set") {
+          const raw = slack && p.setting.kind === "url"
+            ? text.replace(/^<(https?:\/\/[^>|]+|wss?:\/\/[^>|]+)(?:\|[^>]*)?>$/, "$1") : text;
+          const value = validate(p.setting, raw);
+          if (slack && p.setting.kind === "url" && value) {
+            let url;
+            try { url = new URL(value); } catch { throw new Error("Enter a valid public URL"); }
+            if (/\s/.test(value) || url.username || url.password || url.search || url.hash || url.pathname !== "/") {
+              throw new Error("Enter a public endpoint without a path or credentials, or edit the server .env");
+            }
+          }
+          const needs = applySetting(p.setting, value);
+          const sectionId = SECTIONS.find(s => s.settings.includes(p.setting))?.id;
+          return void await viewSection(sectionId, `✅ <b>${p.setting.label ?? p.setting.k}</b> → <code>${fmtValue(p.setting, slack)}</code>${needs ? "\n♻️ Applies after restart" : ""}`);
+        }
+        if (p.kind === "waddr") {
+          if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text.trim())) {
+            pending = { kind: "waddr" };
+            return void await render("⚠️ Not a valid Solana address — send it again, or tap Cancel:", cancelKB());
+          }
+          pending = { kind: "wname", address: text.trim() };
+          return void await render("Name this wallet:", cancelKB());
+        }
+        if (p.kind === "wname") {
+          const name = text.trim().slice(0, 40) || "wallet";
+          const res = addSmartWallet({ address: p.address, name });
+          return void await viewSection("wallets", res.success ? `✅ Added <b>${name}</b>\n<code>${p.address}</code>` : `⚠️ ${res.error}`);
+        }
+        if (p.kind === "pkimport") {
+          const kp = parseSecretKey(text);
+          writeEnvValue("WALLET_PRIVATE_KEY", bs58.encode(kp.secretKey));
+          process.env.WALLET_PRIVATE_KEY = bs58.encode(kp.secretKey); // live immediately; .env survives restarts
+          return void await viewSection("key", `✅ Key imported — wallet <code>${kp.publicKey.toString()}</code>\nSigning is active now (survives restarts).`);
+        }
+        if (p.kind === "walletaddr") {
+          if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text.trim())) return void await render("⚠️ Not a valid address — send again, or tap Cancel:", cancelKB());
+          writeUserConfig({ walletAddress: text.trim() });
+          config.standalone.walletAddress = text.trim();
+          return void await viewSection("key", `✅ Read-only address set: <code>${text.trim()}</code>`);
+        }
+      } catch (e) {
+        pending = p;
+        return void await render(`⚠️ ${slack && p.setting?.kind !== "url" && p.kind !== "set" ? "Input could not be saved" : e.message} — try again or tap Cancel`, cancelKB());
+      }
+    }
+
+    const [cmd, ...args] = text.trim().split(/\s+/);
+    if (cmd === "/cancel") { pending = null; return void await viewRoot("Cancelled."); }
+    if (cmd === "/start" || cmd === "/help" || cmd === "/menu") {
+      // An explicit /menu must be visible: reuse the console only when it is fresh.
+      if (consoleMessageId != null && Date.now() - lastRenderAt > STALE_CONSOLE_MS) {
+        consoleMessageId = null;
+        lastRenderSig = null;
+      }
+      return void await viewRoot(slack
+        ? "DM commands: menu · status · wallets · addwallet ADDRESS NAME · removewallet ADDRESS · cancel"
+        : "Commands: /addwallet <address> <name> · /removewallet <address> · /wallets · /status · /cancel");
+    }
+    if (cmd === "/status") return void await viewSection("status");
+    if (cmd === "/wallets") return void await viewSection("wallets");
+    if (cmd === "/addwallet") {
+      const address = args[0];
+      const name = args.slice(1).join(" ").slice(0, 40) || "wallet";
+      const res = addSmartWallet({ address: address ?? "", name });
+      return void await viewSection("wallets", res.success ? `✅ Added <b>${name}</b> <code>${address}</code>` : `⚠️ ${res.error}`);
+    }
+    if (cmd === "/removewallet") {
+      const res = removeSmartWallet({ address: args[0] ?? "" });
+      return void await viewSection("wallets", res.success ? `🗑 Removed ${res.removed}` : `⚠️ ${res.error}`);
+    }
+  }
+
+  let lastInputAt = 0;
+  return async ({ message, callback }) => {
+    if (slack && Date.now() - lastInputAt > STALE_CONSOLE_MS) pending = null;
+    lastInputAt = Date.now();
     if (callback) await handleCallback(callback);
     else if (message) await handleText(message.text);
-  });
-  void setBotCommands(ADMIN_COMMANDS); // register in Telegram clients on every boot
+  };
+}
+
+export function startAdmin(options = {}) {
+  const onUpdate = createAdminConsole({ sendMessage, sendMenu, editMenu, answerCallbackQuery }, options);
+  const stop = startAdminPolling(onUpdate);
+  void setBotCommands(ADMIN_COMMANDS);
   return stop;
 }

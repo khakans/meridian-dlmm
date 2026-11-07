@@ -2,10 +2,20 @@
 import fs from "node:fs";
 import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
+import { sendSlackNotification } from "./slack-notify.js";
 const USER_CONFIG_PATH = repoPath("user-config.json");
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
 const BASE = TOKEN ? `https://api.telegram.org/bot${TOKEN}` : null;
 const chatId = resolveChatId();
+let notificationMirror = null;
+
+export function setNotificationMirror(send) {
+  notificationMirror = send;
+}
+
+export async function sendNotification(text) {
+  await Promise.allSettled([sendMessage(text), Promise.resolve().then(() => (notificationMirror ?? sendSlackNotification)(text))]);
+}
 
 function nonEmptyChatId(value) {
   if (value == null) return null;
@@ -63,8 +73,10 @@ export async function sendMessage(text) {
 }
 
 async function sendHTML(html) {
-  if (!TOKEN || !chatId) return;
-  return postTelegram("sendMessage", { text: String(html).slice(0, 4096), parse_mode: "HTML" });
+  await Promise.allSettled([
+    postTelegram("sendMessage", { text: String(html).slice(0, 4096), parse_mode: "HTML" }),
+    Promise.resolve().then(() => (notificationMirror ?? sendSlackNotification)(html)),
+  ]);
 }
 
 // ─── Admin console transport: inline menus + authorized update polling ──────

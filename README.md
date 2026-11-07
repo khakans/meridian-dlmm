@@ -37,11 +37,35 @@ Supported infrastructure overrides:
 | `PNL_SOURCE` | `meteora` (default) or `rpc` |
 | `PNL_RPC_URL` | Optional on-chain PnL engine endpoint |
 | `JUPITER_API_KEY` | Jupiter price and swap access |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Optional outbound notifications |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Optional Telegram notifications |
+| `TELEGRAM_ALLOWED_USER_IDS` | Enables Telegram admin commands for the listed users |
 
-Balances use standard RPC, including SPL Token and Token-2022. PnL defaults to Meteora portfolio and position APIs, with an on-chain fallback. Jupiter supplies prices, token data, and swaps. Telegram is notification-only; the previous agent chat and command menus are archived.
+Balances use standard RPC, including SPL Token and Token-2022. PnL defaults to Meteora portfolio and position APIs, with an on-chain fallback. Jupiter supplies prices, token data, and swaps. Both Telegram and Slack support the standalone admin console.
 
 To enable live trading, review your thresholds, wallet list, and shadow results, set `shadowMode` to `false`, remove any `DRY_RUN=true` override, and restart. Configuration edits take effect after restart.
+
+### Slack DM console
+
+Create a dedicated Slack app from [slack-manifest.yaml](slack-manifest.yaml), install it in
+the workspace, and generate an app-level token with `connections:write`.
+Set `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_APP_ID`, `SLACK_TEAM_ID`, and
+`SLACK_OWNER_USER_ID` in the server `.env` and restart Meridian. Use separate tokens
+from any other Socket Mode listener. The app opens a DM with the configured owner.
+
+Type `menu`, `status`, `wallets`, `addwallet ADDRESS NAME`, `removewallet ADDRESS`, or
+`cancel` in that DM. The manifest also registers corresponding `/meridian-…` commands.
+The same console supports trigger, screening, risk, position sizing, strategy, exits,
+RPC, PnL, wallet status and public address settings. Settings that need a restart are
+marked. Start, stop, entry proposals, and confirmed deploy, close and swap notices
+go to the owner DM. Menu buttons expire after five minutes and are replaced as the
+card is updated.
+
+Keep signing keys and Jupiter credentials in the private server `.env`. The Slack
+console shows signing status and the public deposit address. Public RPC base URLs
+can be edited from the console. Put endpoints with credentials or custom paths in
+`.env` and restart. Slack live mode requires a valid local signing key,
+`SLACK_ALLOW_LIVE=true`, `DRY_RUN=false`, and explicit owner confirmation.
+The Restart button uses the standalone process supervisor.
 
 ## Commands
 

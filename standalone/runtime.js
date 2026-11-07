@@ -9,7 +9,7 @@ import fs from "node:fs";
 import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import { repoPath } from "../repo-root.js";
-import { sendMessage as tgSend, isEnabled as tgEnabled } from "../telegram.js";
+import { sendNotification as notify, setNotificationMirror } from "../telegram.js";
 import { MonitorStore, finishSignal } from "./store.js";
 import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
@@ -21,6 +21,7 @@ import { getTrackedPosition, getTrackedPositions, confirmPeak, updatePnlAndCheck
 import { recordPositionSnapshot } from "../pool-memory.js";
 import { getDeterministicCloseRule, computeBinsBelow } from "../exit-rules.js";
 import { startAdmin } from "./telegram-admin.js";
+import { startSlackAdmin } from "./slack-admin.js";
 import { analyzePoolWithChronos, getCachedChronosAnalysis, startChronosKeepalive, stopChronosKeepalive } from "./chronos.js";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -29,16 +30,13 @@ let store = null;
 let monitor = null;
 let lockPath = null;
 let stopAdmin = null;
+let slackAdmin = null;
 let shuttingDown = false;
 let manageBusy = false;
 let pollBusy = false;
 let pursuing = false;
 const timers = {};
 const signalQueue = [];
-
-async function notify(text) {
-  try { if (tgEnabled()) await tgSend(text); } catch { /* notifications are best-effort */ }
-}
 
 // ─── Signal pursuit ──────────────────────────────────────────────────────────
 
@@ -392,7 +390,7 @@ function acquireLock() {
   fs.writeFileSync(lockPath, String(process.pid));
 }
 
-async function shutdown(signalName) {
+async function shutdown(signalName, exitCode = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   log("runtime", `${signalName} received — shutting down`);
@@ -400,10 +398,12 @@ async function shutdown(signalName) {
   for (const timer of Object.values(timers)) clearInterval(timer);
   try { stopAdmin?.(); } catch { /* best-effort */ }
   try { await monitor?.stop(); } catch { /* best-effort */ }
-  // Best-effort stop notice; never let a slow Telegram call hold shutdown.
+  // Bound best-effort stop notices so either transport can be unavailable.
   await Promise.race([notify(`🛑 Meridian stopped (${signalName})`), sleep(3000)]).catch(() => {});
+  setNotificationMirror(null);
+  await Promise.race([slackAdmin?.stop(), sleep(3000)]).catch(() => {});
   try { if (lockPath) fs.rmSync(lockPath, { force: true }); } catch { /* best-effort */ }
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 export async function startStandalone() {
@@ -418,6 +418,8 @@ export async function startStandalone() {
   }
 
   monitor = new WalletMonitor(store, config.standalone, { onSignal });
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
   log("runtime", `Standalone starting — ${config.standalone.shadow ? "SHADOW MODE (proposals recorded, nothing submitted)" : "LIVE MODE"} | threshold=${config.standalone.walletThreshold} wallets / ${config.standalone.windowSec}s window | screening deadline=${config.standalone.screeningDeadlineSec}s`);
 
   await monitor.start();
@@ -434,15 +436,25 @@ export async function startStandalone() {
   startHeartbeat();
   startChronosKeepalive();
   void manageOnce();
-  stopAdmin = startAdmin({
+  const adminOptions = {
     monitor,
     activeSignals: () => Object.values(store.data.signals).filter(s => !s.done).length,
+  };
+  stopAdmin = startAdmin(adminOptions);
+  slackAdmin = await startSlackAdmin({
+    ...adminOptions,
+    restart: async send => {
+      if (pursuing || manageBusy || pollBusy) {
+        await send("Meridian sedang memproses pekerjaan. Coba restart lagi setelah selesai.");
+        return;
+      }
+      await shutdown("Slack admin restart", 1);
+    },
   });
+  setNotificationMirror(slackAdmin?.sendMessage ?? null);
 
   const trackedWallets = Object.keys(store.data.wallets).length;
   void notify(`🤖 Meridian started — ${config.standalone.shadow ? "SHADOW (nothing submitted)" : "LIVE"}\n${trackedWallets} wallet(s) monitored | trigger: ${config.standalone.walletThreshold} within ${config.standalone.windowSec}s | exits: ${config.pnl.pollIntervalSec}s poller`);
 
-  process.on("SIGINT", () => void shutdown("SIGINT"));
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
   log("runtime", `Running — exits every ${config.schedule.managementIntervalMin}m + ${config.pnl.pollIntervalSec}s poller; waiting for wallet convergence`);
 }

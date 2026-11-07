@@ -15,13 +15,14 @@
     "pm2:restart": "pm2 restart meridian --update-env",
     "pm2:logs": "pm2 logs meridian --lines 100",
     "dev": "DRY_RUN=true node index.js",
-    "test": "npm run test:syntax && npm run test:standalone && node --test test/cleanup.test.js",
+    "test": "npm run test:syntax && npm run test:standalone && node --test test/cleanup.test.js test/slack.test.js",
     "test:syntax": "node scripts/check-syntax.js",
     "postinstall": "node scripts/patch-anchor.js",
     "test:standalone": "node test/test-standalone.js"
   },
   "dependencies": {
     "@meteora-ag/dlmm": "1.9.4",
+    "@slack/bolt": "^4.7.3",
     "@solana/web3.js": "^1.95.0",
     "bn.js": "^5.2.1",
     "bs58": "^5.0.0",

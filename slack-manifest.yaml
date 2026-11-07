@@ -1,0 +1,42 @@
+display_information:
+  name: Meridian DLMM
+  description: Private admin console for Meridian DLMM
+features:
+  bot_user:
+    display_name: Meridian DLMM
+    always_online: false
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  slash_commands:
+    - command: /meridian-menu
+      description: Open the Meridian menu
+    - command: /meridian-status
+      description: Show monitor status and positions
+    - command: /meridian-wallets
+      description: List monitored wallets
+    - command: /meridian-addwallet
+      description: Add a monitored Solana wallet
+      usage_hint: ADDRESS NAME
+    - command: /meridian-removewallet
+      description: Remove a monitored Solana wallet
+      usage_hint: ADDRESS
+    - command: /meridian-cancel
+      description: Cancel the current edit
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - im:history
+      - im:write
+      - commands
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.im
+  interactivity:
+    is_enabled: true
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false
