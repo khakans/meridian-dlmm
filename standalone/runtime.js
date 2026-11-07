@@ -16,6 +16,7 @@ import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
 import { entryPlans } from "./entry-plans.js";
 import { startPaper, validateExitQuote } from "./paper.js";
+import { paperDay, recommendPaperVariant } from "./paper-accounting.js";
 import { exposureStillPresent } from "./events.js";
 import { getMyPositions } from "../tools/dlmm.js";
 import { executeTool } from "../tools/executor.js";
@@ -122,7 +123,10 @@ async function attemptEntry(signal) {
   }
 
   // A failed position read is unavailable data, never "no positions".
-  const positions = await getMyPositions({ force: true }).catch(() => null);
+  const paperConvergence = config.standalone.shadow && config.research.enabled;
+  const paper = store.data.paper;
+  const baselinePositions = Object.values(paper?.open ?? {}).filter(p => p.variant === "convergence/baseline");
+  const positions = paperConvergence ? { positions: baselinePositions } : await getMyPositions({ force: true }).catch(() => null);
   if (!positions || positions.error || !Array.isArray(positions.positions)) return "position read unavailable";
   if (positions.positions.length >= config.risk.maxPositions) {
     finishSignal(store, signal, "portfolio full");
@@ -132,7 +136,7 @@ async function attemptEntry(signal) {
   // Focused screening: this mint and its eligible pools only.
   let screened;
   try {
-    screened = await screenMint(mint, { thresholds: shadowScreeningThresholds() });
+    screened = await screenMint(mint);
   } catch (e) {
     return `screening error: ${e.message}`;
   }
@@ -144,10 +148,12 @@ async function attemptEntry(signal) {
     return screened.reason;
   }
 
-  const gate = await finalRecheck(signal, screened);
+  const paperReserved = baselinePositions.reduce((total, p) => total + p.capital + 0.001, 0);
+  const simulatedSol = config.research.paperBankrollSol + (paper?.realized?.["convergence/baseline"] ?? 0) - paperReserved;
+  const gate = await finalRecheck(signal, screened, paperConvergence ? simulatedSol : null);
   if (gate) return gate;
 
-  const balances = await getWalletBalances({ force: true, nativeOnly: true });
+  const balances = paperConvergence ? { sol: simulatedSol } : await getWalletBalances({ force: true, nativeOnly: true });
   if (balances.error || !Number.isFinite(balances.sol)) return "balance read unavailable";
   if (balances.sol < config.management.minSolToOpen + config.management.gasReserve) {
     finishSignal(store, signal, "insufficient spendable SOL");
@@ -155,9 +161,6 @@ async function attemptEntry(signal) {
   }
 
   const pool = screened.pool;
-  if (config.standalone.shadow && config.research.enabled) {
-    await recordResearch(mint, screened, ["wallet convergence"]);
-  }
   const configuredBinsAbove = Number(config.strategy.defaultBinsAbove ?? 0);
   const whaleBinsAbove = Math.max(0, ...signal.events.map(e => Number(e.binsAbove || 0)));
   let binsAbove = configuredBinsAbove > 0
@@ -204,13 +207,29 @@ async function attemptEntry(signal) {
     );
   }
   const amountY = computeDeployAmount(balances.sol, convictionMult);
-  if (!config.standalone.shadow && process.env.DRY_RUN !== "true") {
+  if (paperConvergence || (!config.standalone.shadow && process.env.DRY_RUN !== "true")) {
     try {
       await validateExitQuote({
         mint, pool: pool.pool_address, decimals: screened.decimals,
         binStep: Number(pool.dlmm_params?.bin_step), binsBelow, capital: amountY,
       });
     } catch { return "exit quote unavailable or below minimum"; }
+  }
+  if (paperConvergence) {
+    if (binsAbove !== 0) return "paper accounting requires SOL-only configuration";
+    const shape = config.strategy.strategy;
+    const baseline = { shape, range: "volatility", binsBelow, variant: "convergence/baseline" };
+    const plans = [
+      baseline,
+      ...(binsBelow < 69 ? [{ ...baseline, binsBelow: Math.min(69, binsBelow + 10), variant: "convergence/wider" }] : []),
+      { ...baseline, rangeWaitMinutes: config.research.paperInitialRangeWaitMinutes + 15, variant: "convergence/wait-longer" },
+      { ...baseline, maxHoldMinutes: Math.max(15, Math.floor(config.research.paperMaxHoldMinutes * 0.75)), variant: "convergence/hold-shorter" },
+    ];
+    await recordResearch(mint, screened, ["wallet convergence"], { plans, capital: amountY });
+    store.data.attempts[mint] = { at: Date.now(), mint, pool: pool.pool_address, status: "proposed", amountSol: amountY };
+    finishSignal(store, signal, "convergence paper proposal recorded");
+    log("entry", `[SHADOW] Convergence paper proposal for ${mint}`);
+    return null;
   }
   // Checkpoint before building anything: a crash mid-sequence leaves a
   // recovery pointer instead of a silent duplicate-entry risk.
@@ -275,7 +294,7 @@ async function attemptEntry(signal) {
 // Immediate pre-entry conditions: the triggering wallets still hold their
 // exposure, the market has not run away since screening, and spendable funds
 // cover the entry. Returns null when everything holds, else the reason.
-async function finalRecheck(signal, screened) {
+async function finalRecheck(signal, screened, simulatedSol = null) {
   let present = 0;
   for (const e of signal.events) {
     try { if (await exposureStillPresent(e)) present++; } catch { /* unreadable position = not confirmed */ }
@@ -293,7 +312,7 @@ async function finalRecheck(signal, screened) {
   } catch (e) {
     return `fresh pool read failed (${e.message})`;
   }
-  const balances = await getWalletBalances({ force: true, nativeOnly: true });
+  const balances = simulatedSol == null ? await getWalletBalances({ force: true, nativeOnly: true }) : { sol: simulatedSol };
   if (balances.error || !Number.isFinite(balances.sol)) return "balance read unavailable";
   if (balances.sol < config.management.minSolToOpen + config.management.gasReserve) return "insufficient spendable SOL";
   return null;
@@ -406,20 +425,23 @@ function startHeartbeat() {
   }, 60_000);
 }
 
-async function recordResearch(mint, screened, sources) {
+async function recordResearch(mint, screened, sources, convergence = null) {
   if (!config.standalone.shadow || !config.research.enabled || shuttingDown) return;
   const records = store.data.research ??= {};
-  const current = records[mint];
+  const key = convergence ? `convergence:${mint}` : mint;
+  const current = records[key];
   if (current && Date.now() - current.at < 300_000) {
     current.sources = [...new Set([...current.sources, ...sources])];
     store.save();
     return `Shadow research: ${current.plans.length} range/shape variants.`;
   }
-  const plans = await entryPlans(screened.pool);
+  const plans = convergence?.plans ?? await entryPlans(screened.pool);
   if (shuttingDown || !config.standalone.shadow) return;
-  const latest = records[mint];
-  records[mint] = {
+  const latest = records[key];
+  records[key] = {
     at: Date.now(), mint, pool: screened.pool.pool_address,
+    source: convergence ? "convergence" : "discovery",
+    capital: convergence?.capital,
     marketCap: screened.token.mcap,
     decimals: screened.decimals,
     binStep: Number(screened.pool.dlmm_params?.bin_step),
@@ -469,9 +491,17 @@ function startLifecycleReports() {
         lines.push(`Riset 24 jam ${research.length} kandidat · ${research.reduce((sum, item) => sum + item.plans.length, 0)} rencana entry`);
         const paper = store.data.paper;
         const open = Object.values(paper?.open ?? {});
-        const recent = (paper?.closed ?? []).filter(p => Date.now() - p.closedAt < 86_400_000);
+        const recent = (paper?.closed ?? []).filter(p => p.accountingVersion && Date.now() - p.closedAt < 86_400_000);
+        const cancelled = (paper?.cancelled ?? []).filter(p => Date.now() - p.at < 86_400_000).length;
         const pending = open.filter(p => p.exit).length;
-        lines.push(`Paper · ${open.length} terbuka · ${recent.length} close/24j${pending ? ` · ${pending} tunggu quote` : ""}`);
+        lines.push(`Paper · ${open.filter(p => p.filledAt).length} terisi · ${open.filter(p => !p.filledAt).length} tunggu fill · ${recent.length} selesai/24j · ${cancelled} batal${pending ? ` · ${pending} tunggu quote` : ""}`);
+        const rows = (paper?.nav?.["convergence/baseline"] ?? []).filter(r => r.day < paperDay(Date.now()) && r.complete && r.start > 0 && r.end != null).slice(-30);
+        const average = rows.reduce((sum, r) => sum + (r.end / r.start - 1), 0) / rows.length;
+        const rec = recommendPaperVariant([...(paper?.closed ?? []), ...(paper?.cancelled ?? [])].sort((a,b) => a.openedAt-b.openedAt), Date.now());
+        lines.push(rows.length ? `Baseline · ${(average * 100).toFixed(2)}% rata-rata/hari · ${rows.length}/30 hari valid` : "Baseline · belum ada hari valid");
+        if (rec) lines.push(`Uji parameter · ${rec.variant.split("/").at(-1)} unggul ${rec.test.toFixed(4)} SOL/token pada ${rec.testMints} token validasi`);
+        const tracked = Object.keys(store.data.wallets).length;
+        if (tracked < config.standalone.walletThreshold) lines.push(`Convergence · ${tracked}/${config.standalone.walletThreshold} wallet siap`);
       }
       const { received, retries, waiting, passed, dropped, reasons } = discoveryStats;
       lines.push(`Discovery sejak restart ${received} masuk · ${waiting} antre · ${retries} retry · ${passed} lolos · ${dropped} kedaluwarsa/tergeser`);

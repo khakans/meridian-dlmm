@@ -1,8 +1,9 @@
 import { config } from '../config.js';
 import { getDeterministicCloseRule } from '../exit-rules.js';
 import { log } from '../logger.js';
-import { getActiveBin } from '../tools/dlmm.js';
+import { getActiveBin, getPaperBinSnapshot } from '../tools/dlmm.js';
 import { quoteTokenToSol } from '../tools/wallet.js';
+import { markPaperBins, paperRiskBlocked, recordPaperNav, seedPaperBins } from './paper-accounting.js';
 
 const MINUTE = 60_000;
 const COST_SOL = 0.001; // Estimated round-trip network cost, excluding refundable rent.
@@ -67,9 +68,9 @@ export function paperCloseRule(p, active, pnlPct, now) {
     minutes_out_of_range: p.outsideSince ? (now - p.outsideSince) / MINUTE : 0,
   }, m);
   if (rule?.rule === 1) return rule.reason;
-  if (now - p.openedAt >= config.research.paperMaxHoldMinutes * MINUTE) return 'paper max hold';
+  if (now - p.openedAt >= (p.maxHoldMinutes ?? config.research.paperMaxHoldMinutes) * MINUTE) return 'paper max hold';
   if (!p.rangeReached && outside === 'above') {
-    return now - p.openedAt >= config.research.paperInitialRangeWaitMinutes * MINUTE
+    return now - p.openedAt >= (p.rangeWaitMinutes ?? config.research.paperInitialRangeWaitMinutes) * MINUTE
       ? 'entry range not reached' : null;
   }
   const trailing = Number.isFinite(pnlPct) && m.trailingTakeProfit && p.peakPct >= m.trailingTriggerPct &&
@@ -84,16 +85,25 @@ export function paperCloseRule(p, active, pnlPct, now) {
 }
 
 export function startPaper(store, notify, {
-  getBin = getActiveBin, quote = quoteTokenToSol, schedule = setInterval,
+  getBin = getActiveBin, snapshot = getPaperBinSnapshot, quote = quoteTokenToSol, schedule = setInterval,
 } = {}) {
   const paper = store.data.paper ??= { open: {}, closed: [], skipped: 0 };
+  paper.realized ??= {};
+  paper.cancelled ??= [];
+  paper.legacy ??= [];
+  for (const p of Object.values(paper.open)) {
+    if (p.binSeed) continue;
+    paper.legacy.push({ ...p, archivedAt: Date.now() });
+    delete paper.open[p.id];
+  }
   let stopped = false, busy = false;
   async function tick() {
     if (busy || stopped || !config.standalone.shadow) return;
     busy = true;
     try {
       const now = Date.now();
-      paper.closed = paper.closed.filter(p => now - p.closedAt < 7 * 86_400_000).slice(-1000);
+      paper.closed = paper.closed.filter(p => now - p.closedAt < 90 * 86_400_000).slice(-10_000);
+      paper.cancelled = paper.cancelled.filter(p => now - p.at < 90 * 86_400_000).slice(-10_000);
       const activeReads = new Map();
       const quotes = new Map();
       const readActive = pool => {
@@ -107,15 +117,24 @@ export function startPaper(store, notify, {
         return quotes.get(key);
       };
       const closed = [];
+      const snapshots = new Map();
+      const readSnapshot = (pool, lower, upper) => {
+        const key = `${pool}:${lower}:${upper}`;
+        if (!snapshots.has(key)) snapshots.set(key, snapshot(pool, lower, upper).catch(() => null));
+        return snapshots.get(key);
+      };
       for (const p of Object.values(paper.open)) {
         if (stopped || !config.standalone.shadow) return;
         try {
           const active = p.exit ? null : await readActive(p.pool);
           if (!p.exit && !validActive(active)) { p.mark = null; continue; }
-          const inventory = p.exit?.inventory ?? paperInventory(p, active.binId);
-          const proceeds = await sellQuote(p.mint, rawTokens(inventory.tokens, p.decimals));
+          const bins = p.exit ? null : await readSnapshot(p.pool, p.lower, p.upper);
+          const inventory = p.exit?.inventory ?? (bins && markPaperBins(p, active.binId, bins));
+          if (!inventory) { p.mark = null; continue; }
+          if (!p.filledAt && (inventory.tokens > 0 || inventory.feeEvidence)) p.filledAt = now;
+          const proceeds = await sellQuote(p.mint, rawTokens(inventory.tokens + inventory.feeTokens, p.decimals));
           if (stopped || !config.standalone.shadow) return;
-          const pnl = proceeds == null ? null : inventory.sol + proceeds - p.capital - COST_SOL;
+          const pnl = proceeds == null ? null : inventory.sol + inventory.feeSol + proceeds - p.capital - COST_SOL;
           p.mark = pnl == null ? null : { at: Date.now(), pnl };
           if (!p.exit) {
             const reason = paperCloseRule(p, active, pnl == null ? null : pnl / p.capital * 100, now);
@@ -123,32 +142,49 @@ export function startPaper(store, notify, {
             p.exitSignal = reason;
             if (reason && p.exitTicks >= Math.max(1, config.pnl.confirmTicks)) p.exit = { at: now, reason, inventory };
           }
-          if (p.exit && pnl != null) {
+          if (p.exit && !p.filledAt) {
+            paper.cancelled.push({ id: p.id, mint: p.mint, source: p.source, variant: p.variant, at: now, closedAt: now,
+              openedAt: p.openedAt, reason: p.exit.reason, costSol: COST_SOL, pnl: -COST_SOL, outcome: 'cancelled', accountingVersion: 1 });
+            paper.realized[p.variant] -= COST_SOL;
+            delete paper.open[p.id];
+          } else if (p.exit && pnl != null) {
             paper.closed.push({ id: p.id, mint: p.mint, shape: p.shape, range: p.range, variant: p.variant, openedAt: p.openedAt,
-              closedAt: Date.now(), pnl, reason: p.exit.reason, solInventory: inventory.sol, quotedSol: proceeds });
+              closedAt: Date.now(), filledAt: p.filledAt, pnl, reason: p.exit.reason, solInventory: inventory.sol, quotedSol: proceeds,
+              feeSol: inventory.feeSol, feeTokens: inventory.feeTokens, costSol: COST_SOL,
+              source: p.source, outcome: 'settled', accountingVersion: 1 });
+            paper.realized[p.variant] += pnl;
             delete paper.open[p.id];
             closed.push(`• ${p.mint.slice(0, 8)} · ${p.variant ?? `${p.range}/${p.shape}`} · ${pnl.toFixed(4)} SOL · ${p.exit.reason}`);
           }
         } catch { p.mark = null; }
       }
-      const openMints = new Set(Object.values(paper.open).map(p => p.mint));
-      const recentClosed = new Set(paper.closed.filter(p => now - p.closedAt < 6 * 60 * MINUTE).map(p => p.mint));
+      recordPaperNav(paper, Date.now(), config.research.paperBankrollSol);
+      const openMints = new Set(Object.values(paper.open).map(p => `${p.source}:${p.mint}`));
+      const recentClosed = new Set([
+        ...paper.closed.filter(p => now - p.closedAt < 6 * 60 * MINUTE).map(p => `${p.source}:${p.mint}`),
+        ...paper.cancelled.filter(p => now - p.at < 60 * MINUTE).map(p => `${p.source}:${p.mint}`),
+      ]);
+      const candidateKey = c => `${c.source ?? 'discovery'}:${c.mint}`;
       const candidates = Object.values(store.data.research ?? {}).filter(c =>
         now - c.at <= 5 * MINUTE && c.at <= now && c.paperAt == null &&
-        !openMints.has(c.mint) && !recentClosed.has(c.mint)).sort((a, b) => a.at - b.at);
+        !openMints.has(candidateKey(c)) && !recentClosed.has(candidateKey(c)))
+        .sort((a, b) => Number(b.source === 'convergence') - Number(a.source === 'convergence') || a.at - b.at);
       for (const c of candidates.slice(0, 4)) {
         if (stopped || !config.standalone.shadow) return;
-        if (openMints.size >= config.risk.maxPositions) break;
+        const source = c.source ?? 'discovery';
+        if ([...openMints].filter(key => key.startsWith(`${source}:`)).length >= config.risk.maxPositions) continue;
         if (!Number.isInteger(c.decimals) || c.decimals < 0 || c.decimals > 18 || !(c.binStep > 0)) continue;
         const active = await readActive(c.pool);
         if (!validActive(active)) continue;
         const price = Number(active.price);
-        const capital = config.research.paperCapitalSol;
+        const capital = c.capital ?? config.research.paperCapitalSol;
         if (!(capital > COST_SOL)) break;
         try {
           const plans = c.plans.flatMap((plan, index) => {
             const range = paperBins(plan, { ...active, price }, c.binStep);
-            return range ? [{ ...range, shape: plan.shape, range: plan.range, variant: `${plan.range}/${plan.shape}${index === 1 && plan.shape === 'spot' ? '-wide' : ''}` }] : [];
+            return range ? [{ ...range, shape: plan.shape, range: plan.range,
+              maxHoldMinutes: plan.maxHoldMinutes, rangeWaitMinutes: plan.rangeWaitMinutes,
+              variant: plan.variant ?? `discovery/${plan.range}/${plan.shape}${index === 1 && plan.shape === 'spot' ? '-wide' : ''}` }] : [];
           });
           if (!plans.length) continue;
           const worstPrice = Math.min(...plans.map(plan => price * plan.ratio ** (plan.lower - active.binId)));
@@ -160,20 +196,33 @@ export function startPaper(store, notify, {
             c.paperRejectedAt = now;
             continue;
           }
+          const entryBins = await readSnapshot(c.pool, Math.min(...plans.map(p => p.lower)), Math.max(...plans.map(p => p.upper)));
+          if (!entryBins || stopped || !config.standalone.shadow) continue;
+          let admitted = 0;
           for (const [index, plan] of plans.entries()) {
-            const id = `${c.mint}:${c.at}:${index}`;
-            paper.open[id] = { ...plan, id, mint: c.mint, pool: c.pool, decimals: c.decimals,
-              openedAt: now, entryBin: active.binId, entryPrice: price, capital };
+            if (paperRiskBlocked(paper, plan.variant, now, config.research.paperDailyLossLimitPct, config.research.paperDrawdownLimitPct)) continue;
+            const reserved = Object.values(paper.open).filter(p => p.variant === plan.variant).reduce((n, p) => n + p.capital + COST_SOL, 0);
+            const available = config.research.paperBankrollSol + (paper.realized[plan.variant] ?? 0) - reserved;
+            if (available < capital + COST_SOL) continue;
+            const id = `${source}:${c.mint}:${c.at}:${index}`;
+            const position = { ...plan, id, mint: c.mint, pool: c.pool, decimals: c.decimals, source,
+              openedAt: now, entryBin: active.binId, entryPrice: price, capital, mark: { at: now, pnl: -COST_SOL } };
+            position.binSeed = seedPaperBins(position, entryBins);
+            paper.realized[plan.variant] ??= 0;
+            paper.open[id] = position;
+            admitted++;
           }
-          openMints.add(c.mint);
+          if (!admitted) continue;
+          openMints.add(candidateKey(c));
           c.paperAt = now;
-          log('paper', `Opened ${plans.length} simulated variants for ${c.mint}`);
+          log('paper', `Opened ${admitted} simulated variants for ${c.mint} (${source})`);
         } catch { log('paper_warn', `Paper admission unavailable for ${c.mint}`); }
       }
+      recordPaperNav(paper, Date.now(), config.research.paperBankrollSol);
       store.save();
       if (closed.length && !stopped) {
         const limit = config.research.paperCloseListLimit;
-        const lines = [`🧪 Meridian paper close · ${closed.length} varian (estimasi, tanpa fee LP)`, '', ...closed.slice(0, limit)];
+        const lines = [`🧪 Meridian paper close · ${closed.length} varian (estimasi net)`, '', ...closed.slice(0, limit)];
         if (closed.length > limit) lines.push(`+${closed.length - limit} close lainnya tersimpan.`);
         await notify(lines.join('\n'));
       }

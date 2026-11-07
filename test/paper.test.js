@@ -2,6 +2,31 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { config } from '../config.js';
 import { paperBins, paperCloseRule, paperInventory, startPaper } from '../standalone/paper.js';
+import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
+
+test('paper mark credits only fee growth after admission and rejects backwards counters', () => {
+  const q = 1n << 64n;
+  const p = { lower: 1, upper: 1, shape: 'spot', capital: 1, decimals: 6 };
+  const bin = { supply: 10_000_000_000n * q, yAmount: 10_000_000_000n, xAmount: 0n,
+    pricePerToken: '1', feeAmountXPerTokenStored: 0n, feeAmountYPerTokenStored: q };
+  p.binSeed = seedPaperBins(p, new Map([[1, bin]]));
+  assert.equal(markPaperBins(p, 2, new Map([[1, bin]])).feeSol, 0);
+  assert.equal(markPaperBins(p, 2, new Map([[1, { ...bin, feeAmountYPerTokenStored: 2n * q }]])).feeSol, 1);
+  assert.equal(markPaperBins(p, 2, new Map([[1, { ...bin, feeAmountYPerTokenStored: 0n }]])), null);
+});
+
+test('parameter recommendation requires paired mints and an independent validation window', () => {
+  const now = 1_800_000_000_000, day = 86_400_000;
+  const rows = Array.from({ length: 30 }, (_, i) => {
+    const openedAt = now - (i < 20 ? 4 : 2) * day;
+    const base = { mint: String(i), openedAt, closedAt: openedAt + 1,
+      source: 'convergence', outcome: 'settled', accountingVersion: 1 };
+    return [{ ...base, variant: 'convergence/baseline', pnl: 0 },
+      { ...base, variant: 'convergence/wider', pnl: 0.01 }];
+  }).flat();
+  assert.equal(recommendPaperVariant(rows, now).variant, 'convergence/wider');
+  assert.equal(recommendPaperVariant(rows.slice(0, -2), now), null);
+});
 
 test('paper exits wait for initial range and buffer losing exits while honoring risk stops', () => {
   const minute = 60_000;
@@ -44,6 +69,15 @@ test('paper entry checks exit quote and persists an exit awaiting settlement', a
   const messages = [];
   const stop = startPaper(store, async text => messages.push(text), {
     getBin: async () => active,
+    snapshot: async (_pool, lower, upper) => {
+      const q = 1n << 64n;
+      return new Map(Array.from({ length: upper - lower + 1 }, (_, i) => [lower + i, {
+        supply: 10_000_000_000n * q, pricePerToken: '1',
+        yAmount: active.binId === 100 ? 10_000_000_000n : 0n,
+        xAmount: active.binId === 100 ? 0n : 10_000_000n,
+        feeAmountXPerTokenStored: 0n, feeAmountYPerTokenStored: 0n,
+      }]));
+    },
     quote: async (_, amount) => {
       if (!quoteAvailable) throw Error('No route');
       return amount / 1e6 * active.price;

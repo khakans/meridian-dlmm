@@ -215,6 +215,12 @@ export async function getActiveBin({ pool_address }) {
   };
 }
 
+export async function getPaperBinSnapshot(poolAddress, lower, upper) {
+  const pool = await getPool(poolAddress);
+  const { bins } = await pool.getBinsBetweenLowerAndUpperBound(lower, upper);
+  return new Map(bins.map(bin => [bin.binId, bin]));
+}
+
 // ─── Deploy Position ───────────────────────────────────────────
 export async function deployPosition({
   pool_address,

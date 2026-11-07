@@ -143,7 +143,11 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config
       }
       for (const [mint, item] of screened) if (now >= item.retryAt) screened.delete(mint);
       const ranked = [...queue.values()].filter(item => item.retryAt <= now).sort((a, b) => b.priority - a.priority || a.addedAt - b.addedAt);
-      const reserved = [ranked.find(item => item.tries > 0), ranked.find(item => item.priority === 1)].filter(Boolean);
+    const reserved = [
+      ranked.find(item => item.tries > 0 && [...item.sources].some(source => source.startsWith('Meteora'))),
+      ranked.find(item => item.tries > 0),
+      ranked.find(item => item.priority === 1),
+    ].filter(Boolean);
       const batch = [...new Set([...reserved, ...ranked])].slice(0, 6);
       for (const item of batch) {
         if (stopped) break;
