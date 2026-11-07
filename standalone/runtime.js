@@ -41,6 +41,18 @@ let pursuing = false;
 const timers = {};
 const signalQueue = [];
 
+function shadowScreeningThresholds() {
+  if (!config.standalone.shadow || !config.research.enabled) return undefined;
+  return {
+    ...config.screening,
+    minMcap: config.research.minMcap,
+    minHolders: config.research.minHolders,
+    minTokenFeesSol: config.research.minTokenFeesSol,
+    minTvl: config.research.minTvl,
+    minTokenAgeHours: config.research.minTokenAgeHours,
+  };
+}
+
 // ─── Signal pursuit ──────────────────────────────────────────────────────────
 
 function onSignal(signal) {
@@ -117,7 +129,7 @@ async function attemptEntry(signal) {
   // Focused screening: this mint and its eligible pools only.
   let screened;
   try {
-    screened = await screenMint(mint);
+    screened = await screenMint(mint, { thresholds: shadowScreeningThresholds() });
   } catch (e) {
     return `screening error: ${e.message}`;
   }
@@ -537,14 +549,7 @@ export async function startStandalone() {
     gmgnKey: process.env.GMGN_API_KEY?.trim(),
     heliusKey: process.env.HELIUS_API_KEY?.trim(),
     notify,
-    thresholds: config.standalone.shadow && config.research.enabled ? {
-      ...config.screening,
-      minMcap: config.research.minMcap,
-      minHolders: config.research.minHolders,
-      minTokenFeesSol: config.research.minTokenFeesSol,
-      minTvl: config.research.minTvl,
-      minTokenAgeHours: config.research.minTokenAgeHours,
-    } : undefined,
+    thresholds: shadowScreeningThresholds(),
     onMatch: recordResearch,
   });
   startLifecycleReports();
