@@ -470,17 +470,8 @@ function startLifecycleReports() {
         const paper = store.data.paper;
         const open = Object.values(paper?.open ?? {});
         const recent = (paper?.closed ?? []).filter(p => Date.now() - p.closedAt < 86_400_000);
-        lines.push(`Paper ${open.length} varian terbuka (${open.filter(p => p.exit).length} tunggu quote) · ${recent.length} close/24j · ${paper?.skipped ?? 0} kandidat terkendala quote`);
-        const performance = new Map();
-        for (const p of recent) {
-          const key = p.variant ?? `${p.range}/${p.shape}`;
-          const metric = performance.get(key) ?? { count: 0, wins: 0, pnl: 0 };
-          metric.count++;
-          if (p.pnl > 0) metric.wins++;
-          metric.pnl += p.pnl;
-          performance.set(key, metric);
-        }
-        for (const [key, p] of performance) lines.push(`• ${key} ${p.wins}/${p.count} untung · ${p.pnl.toFixed(4)} SOL estimasi tanpa fee LP`);
+        const pending = open.filter(p => p.exit).length;
+        lines.push(`Paper · ${open.length} terbuka · ${recent.length} close/24j${pending ? ` · ${pending} tunggu quote` : ""}`);
       }
       const { received, retries, waiting, passed, dropped, reasons } = discoveryStats;
       lines.push(`Discovery sejak restart ${received} masuk · ${waiting} antre · ${retries} retry · ${passed} lolos · ${dropped} kedaluwarsa/tergeser`);
