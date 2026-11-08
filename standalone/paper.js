@@ -40,7 +40,7 @@ function validActive(active) {
   return Number.isSafeInteger(active?.binId) && Number.isFinite(Number(active?.price)) && Number(active.price) > 0;
 }
 
-export async function validateExitQuote({ mint, pool, decimals, binStep, binsBelow, capital }) {
+export async function validateExitQuote({ mint, pool, decimals, binStep, binsBelow, capital, verifyRange = false }) {
   if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18 ||
       !(binStep > 0 && binsBelow > 0 && capital > 0)) throw Error('Invalid exit sizing inputs');
   const active = await getActiveBin({ pool_address: pool });
@@ -50,6 +50,20 @@ export async function validateExitQuote({ mint, pool, decimals, binStep, binsBel
   const quote = await quoteTokenToSol(mint, raw);
   const mark = raw / 10 ** decimals * price;
   if (quote < mark * config.research.paperMinExitRatio) throw Error('Exit quote below minimum');
+  if (!verifyRange) return;
+  if (Number(active.binStep) !== binStep) throw Error('Pool bin step changed');
+  const bins = await getPaperBinSnapshot(pool, active.binId - binsBelow, active.binId, { verifyRange });
+  return { ...active, bins };
+}
+
+export function prepareMirrorPosition({ source, mint, pool, pair, decimals, binStep, binsBelow, capital, shape, entry }, now = Date.now()) {
+  const id = `mirror:${mint}:${now}`;
+  const variant = source === 'convergence' ? 'convergence/baseline' : 'discovery/volatility/mirror';
+  const p = { id, mint, pool, pair, decimals, capital, source, shape, variant, mirror: true, range: 'volatility',
+    lower: entry.binId - binsBelow, upper: entry.binId, entryBin: entry.binId, entryPrice: Number(entry.price),
+    ratio: 1 + binStep / 10_000, openedAt: now, filledAt: now, mark: { at: now, pnl: -COST_SOL } };
+  p.binSeed = seedPaperBins(p, entry.bins);
+  return p;
 }
 
 export function paperCloseRule(p, active, pnlPct, now) {
@@ -83,8 +97,16 @@ export function paperCloseRule(p, active, pnlPct, now) {
   return now - p.lossExitSince >= config.research.paperLossGraceMinutes * MINUTE ? reason : null;
 }
 
+export function mirrorExitReason(p, active, pnlPct, now) {
+  const reason = paperCloseRule(p, active, pnlPct, now);
+  p.exitTicks = reason && reason === p.exitSignal ? (p.exitTicks ?? 0) + 1 : Number(Boolean(reason));
+  p.exitSignal = reason;
+  if (reason && p.exitTicks >= Math.max(1, config.pnl.confirmTicks)) return reason;
+  return null;
+}
+
 export function startPaper(store, notify, {
-  getBin = getActiveBin, snapshot = getPaperBinSnapshot, quote = quoteTokenToSol, schedule = setInterval,
+  getBin = getActiveBin, snapshot = getPaperBinSnapshot, quote = quoteTokenToSol, schedule = setInterval, admitResearch = true,
 } = {}) {
   const paper = store.data.paper ??= { open: {}, closed: [], skipped: 0 };
   paper.realized ??= {};
@@ -141,6 +163,7 @@ export function startPaper(store, notify, {
           const inventory = p.exit?.inventory ?? (bins && markPaperBins(p, active.binId, bins));
           if (!inventory) {
             markUnavailable(p, bins ? 'Inventori bin belum bisa dinilai' : 'Snapshot bin belum tersedia');
+            if (p.mirror) p.manualExit ??= mirrorExitReason(p, active, null, now);
             continue;
           }
           if (!p.filledAt && (inventory.tokens > 0 || inventory.feeEvidence)) p.filledAt = now;
@@ -161,10 +184,8 @@ export function startPaper(store, notify, {
             markUnavailable(p, 'Quote jual belum tersedia', Number.isFinite(indicative) ? { at: Date.now(), pnl: indicative } : null);
           }
           if (!p.exit) {
-            const reason = paperCloseRule(p, active, pnl == null ? null : pnl / p.capital * 100, now);
-            p.exitTicks = reason && reason === p.exitSignal ? (p.exitTicks ?? 0) + 1 : Number(Boolean(reason));
-            p.exitSignal = reason;
-            if (reason && p.exitTicks >= Math.max(1, config.pnl.confirmTicks)) p.exit = { at: now, reason, inventory };
+            const reason = mirrorExitReason(p, active, pnl == null ? null : pnl / p.capital * 100, now);
+            if (reason) p.exit = { at: now, reason, inventory };
           }
           if (p.exit && !p.filledAt) {
             paper.cancelled.push({ id: p.id, mint: p.mint, pool: p.pool, pair: p.pair, capital: p.capital,
@@ -177,8 +198,9 @@ export function startPaper(store, notify, {
               lower: p.lower, upper: p.upper, entryBin: p.entryBin, shape: p.shape, range: p.range, variant: p.variant, openedAt: p.openedAt,
               closedAt: Date.now(), filledAt: p.filledAt, pnl, reason: p.exit.reason, solInventory: inventory.sol, quotedSol: proceeds,
               feeSol: inventory.feeSol, feeTokens: inventory.feeTokens, costSol: COST_SOL,
-              source: p.source, outcome: 'settled', accountingVersion: 1 });
+              source: p.source, mirror: p.mirror, outcome: 'settled', accountingVersion: 1 });
             paper.realized[p.variant] += pnl;
+            if (p.mirror) paper.mirrorRealized = (paper.mirrorRealized ?? 0) + pnl;
             delete paper.open[p.id];
             closed.push(`• ${p.mint.slice(0, 8)} · ${p.variant ?? `${p.range}/${p.shape}`} · ${pnl.toFixed(4)} SOL · ${p.exit.reason}`);
           }
@@ -195,7 +217,7 @@ export function startPaper(store, notify, {
         now - c.at <= 5 * MINUTE && c.at <= now && c.paperAt == null &&
         !openMints.has(candidateKey(c)) && !recentClosed.has(candidateKey(c)))
         .sort((a, b) => Number(b.source === 'convergence') - Number(a.source === 'convergence') || a.at - b.at);
-      for (const c of candidates.slice(0, 4)) {
+      for (const c of admitResearch ? candidates.slice(0, 4) : []) {
         if (stopped || !config.standalone.shadow) return;
         const source = c.source ?? 'discovery';
         if ([...openMints].filter(key => key.startsWith(`${source}:`)).length >= config.risk.maxPositions) continue;

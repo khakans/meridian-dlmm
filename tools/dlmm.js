@@ -216,8 +216,9 @@ export async function getActiveBin({ pool_address }) {
   };
 }
 
-export async function getPaperBinSnapshot(poolAddress, lower, upper) {
+export async function getPaperBinSnapshot(poolAddress, lower, upper, { verifyRange = false } = {}) {
   const pool = await getPool(poolAddress);
+  if (verifyRange) await assertRangeDoesNotRequireBinArrayInitialization(pool, lower, upper);
   const { bins } = await pool.getBinsBetweenLowerAndUpperBound(lower, upper);
   return new Map(bins.map(bin => [bin.binId, bin]));
 }
@@ -249,6 +250,7 @@ export async function deployPosition({
   x_ratio_mult,
   before_submit,
   on_prepared,
+  expected_active_bin,
 }) {
   pool_address = normalizeMint(pool_address);
   if (typeof before_submit !== "function") throw new Error("Deploy requires a wallet-signal recheck (before_submit)");
@@ -276,6 +278,7 @@ export async function deployPosition({
     return { success: false, error: "Token on cooldown — recently closed out-of-range too many times. Try a different token." };
   }
   let activeBin = await pool.getActiveBin();
+  if (expected_active_bin != null && activeBin.binId !== expected_active_bin) throw new Error("Active bin changed after entry validation");
   const actualBinStep = pool.lbPair.binStep;
   let activePrice = Number(getPriceOfBinByBinId(activeBin.binId, actualBinStep).toString());
 
@@ -938,6 +941,9 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           total_value_true_usd: binData
             ? Math.round(parseFloat(binData.unrealizedPnl?.balances || 0) * 10000) / 10000
             : null,
+          equity_sol: binData ? nullableRound(Number(binData.unrealizedPnl?.balancesSol) +
+            Number(binData.unrealizedPnl?.unclaimedFeeTokenX?.amountSol ?? 0) +
+            Number(binData.unrealizedPnl?.unclaimedFeeTokenY?.amountSol ?? 0), 8) : null,
           collected_fees_usd: binData
             ? Math.round(parseFloat(config.management.solMode ? (binData.allTimeFees?.total?.sol || 0) : (binData.allTimeFees?.total?.usd || 0)) * 10000) / 10000
             : null,
@@ -946,6 +952,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
             : null,
           pnl_usd:            nullableRound(config.management.solMode ? binData?.pnlSol : binData?.pnlUsd),
           pnl_true_usd:       nullableRound(binData?.pnlUsd),
+          strategy_pnl_pct:   maybeNum(binData?.pnlSolPctChange) ?? (binData ? deriveOpenPnlPct(binData, true) : null),
           pnl_pct:            nullableRound(reportedPnlPct ?? derivedPnlPct, 2),
           pnl_pct_derived:    derivedPnlPct != null ? Math.round(derivedPnlPct * 100) / 100 : null,
           pnl_pct_diff:       pnlPctDiff != null ? Math.round(pnlPctDiff * 100) / 100 : null,

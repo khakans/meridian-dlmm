@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { config } from '../config.js';
-import { paperBins, paperCloseRule, paperInventory, startPaper } from '../standalone/paper.js';
+import { mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMirrorPosition, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
 import { paperPnlLines, summarizePaper } from '../standalone/pnl-summary.js';
 import { lowerRangeStop } from '../exit-rules.js';
@@ -33,6 +33,25 @@ test('Convergence baseline distinguishes no positions, missing valuation, and me
   const group = { variant: 'convergence/baseline', open: 1, marked: 0 };
   assert.match(line([group]), /menunggu valuasi \(1 posisi\)/);
   assert.match(line([{ ...group, marked: 1, openPnl: 0, closed: 1, realized: 0 }]), /terbuka \+0\.0000 SOL · terealisasi \+0\.0000 SOL/);
+});
+
+test('mirror uses the planned on-chain range and replay yields the same confirmed exits', () => {
+  const now = Date.UTC(2026, 10, 8);
+  const bins = new Map(Array.from({ length: 36 }, (_, i) => [65 + i, {
+    supply: 0n, xAmount: 0n, yAmount: 0n, pricePerToken: 1,
+    feeAmountXPerTokenStored: 0n, feeAmountYPerTokenStored: 0n,
+  }]));
+  const model = prepareMirrorPosition({ source: 'discovery', mint: 'mint', pool: 'pool', shape: 'spot',
+    capital: 0.2, decimals: 6, binStep: 100, binsBelow: 35, entry: { binId: 100, price: 1, bins } }, now);
+  assert.deepEqual([model.lower, model.upper, model.entryBin, model.filledAt], [65, 100, 100, now]);
+  const live = { id: 'live', openedAt: now, lower: 65, upper: 100, rangeReached: true };
+  const marks = Array.from({ length: Math.max(1, config.pnl.confirmTicks) }, (_, i) => ({
+    binId: 95, pnl: config.management.takeProfitPct + 1, at: now + i * 60_000,
+  }));
+  const replay = position => marks.map(({ binId, pnl, at }) => mirrorExitReason(position, { binId }, pnl, at));
+  const paperDecisions = replay(model);
+  assert.deepEqual(paperDecisions, replay(live));
+  assert.equal(paperDecisions.at(-1), 'take profit');
 });
 
 test('position pages preserve mode separation, history past a reset, and unknown PnL', async () => {

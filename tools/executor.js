@@ -51,7 +51,7 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
   return (data?.data || [])[0] ?? null;
 }
 
-async function validateDeployPoolThresholds(args) {
+export async function validateDeployPoolThresholds(args) {
   let detail;
   try {
     detail = await fetchFreshPoolDetail(args.pool_address);
@@ -356,7 +356,7 @@ async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
       if (typeof args.before_submit !== "function") {
-        return { pass: false, reason: "Entries require a fresh wallet-convergence signal" };
+        return { pass: false, reason: "Entries require a fresh strategy recheck" };
       }
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;

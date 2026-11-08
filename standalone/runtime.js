@@ -14,25 +14,25 @@ import { MonitorStore, finishSignal } from "./store.js";
 import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
-import { entryPlans, isActivePaperVariant } from "./entry-plans.js";
-import { startPaper, validateExitQuote } from "./paper.js";
+import { isActivePaperVariant } from "./entry-plans.js";
+import { mirrorExitReason, prepareMirrorPosition, startPaper, validateExitQuote } from "./paper.js";
 import { advanceSettlement, dueSettlements, settlementRows } from "./settlement.js";
 import { withWalletLock } from "./transactions.js";
-import { paperDay, recommendPaperVariant } from "./paper-accounting.js";
+import { paperDay } from "./paper-accounting.js";
 import { getPerformanceHistory } from "../performance.js";
 import { paperPnlLines, signed, summarizePaper } from "./pnl-summary.js";
 import { openPositions, positionsPage, positionTarget } from "./positions-view.js";
 import { exposureStillPresent } from "./events.js";
 import { getActiveBin, getMyPositions } from "../tools/dlmm.js";
-import { executeTool } from "../tools/executor.js";
+import { executeTool, validateDeployPoolThresholds } from "../tools/executor.js";
 import { getWalletBalances } from "../tools/wallet.js";
-import { getTrackedPosition, getTrackedPositions, confirmPeak, updatePnlAndCheckExits, registerExitSignal, syncOpenPositions } from "../state.js";
+import { getTrackedPosition, getTrackedPositions, syncOpenPositions } from "../state.js";
 import { latchLowerRangeExit } from "../state.js";
 import { recordPositionSnapshot } from "../pool-memory.js";
-import { getDeterministicCloseRule, computeBinsBelow, lowerRangeStop } from "../exit-rules.js";
+import { computeBinsBelow, lowerRangeStop } from "../exit-rules.js";
 import { startAdmin } from "./telegram-admin.js";
 import { startSlackAdmin } from "./slack-admin.js";
-import { analyzePoolWithChronos, getCachedChronosAnalysis, startChronosKeepalive, stopChronosKeepalive } from "./chronos.js";
+import { analyzePoolWithChronos, startChronosKeepalive, stopChronosKeepalive } from "./chronos.js";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -52,6 +52,28 @@ const signalQueue = [];
 const discoveryStats = { received: 0, retries: 0, waiting: 0, passed: 0, dropped: 0, reasons: Object.create(null) };
 let preflight = null;
 let settlementBusy = false;
+
+function riskGate(positions, cash, shadow, now = Date.now()) {
+  if (shadow ? positions.some(p => p.exit || p.manualExit || p.hardLowerExit) :
+    settlementRows().some(row => !["swapped", "no_balance"].includes(row.status))) {
+    return "position settlement pending";
+  }
+  const values = positions.map(p => shadow
+    ? (!p.markIssue && p.mark?.at <= now && now - p.mark.at <= 180_000 ? p.capital + p.mark.pnl : null)
+    : p.equity_sol);
+  if (!Number.isFinite(cash) || values.some(value => !Number.isFinite(value) || value < 0)) return "portfolio equity unavailable";
+  const equity = cash + values.reduce((sum, value) => sum + value, 0);
+  const day = paperDay(now);
+  const prior = store.data.strategyRisk;
+  const state = {
+    day, equity, start: prior?.day === day ? prior.start : equity, peak: Math.max(prior?.peak ?? 0, equity),
+  };
+  store.data.strategyRisk = state;
+  store.save();
+  if (state.start > 0 && equity <= state.start * (1 - config.research.paperDailyLossLimitPct / 100)) return "daily loss limit reached";
+  if (state.peak > 0 && equity <= state.peak * (1 - config.research.paperDrawdownLimitPct / 100)) return "drawdown limit reached";
+  return null;
+}
 
 function startSettlementWorker() {
   if (config.standalone.shadow) return;
@@ -93,18 +115,6 @@ async function refreshPreflight() {
   return preflight = result;
 }
 
-function shadowScreeningThresholds() {
-  if (!config.standalone.shadow || !config.research.enabled) return undefined;
-  return {
-    ...config.screening,
-    minMcap: config.research.minMcap,
-    minHolders: config.research.minHolders,
-    minTokenFeesSol: config.research.minTokenFeesSol,
-    minTvl: config.research.minTvl,
-    minTokenAgeHours: config.research.minTokenAgeHours,
-  };
-}
-
 // ─── Signal pursuit ──────────────────────────────────────────────────────────
 
 function onSignal(signal) {
@@ -134,7 +144,7 @@ async function drainSignals() {
 // signal; temporary failures retry every retrySec until the deadline expires.
 async function pursueSignal(signal) {
   const wallets = signal.events.map(e => `${e.wallet.slice(0, 6)}(◎${e.depositSol.toFixed(1)})`).join(", ");
-  log("signal", `Convergence on ${signal.mint.slice(0, 8)}: ${signal.events.length} wallets [${wallets}] — screening with ${config.standalone.screeningDeadlineSec}s deadline`);
+  log("signal", `${signal.source ?? "convergence"} on ${signal.mint.slice(0, 8)}: ${signal.events.length} wallets [${wallets}] — screening with ${config.standalone.screeningDeadlineSec}s deadline`);
   let lastReason = "no attempt";
   while (!shuttingDown && !signal.done && Date.now() < signal.deadline) {
     const reason = await attemptEntry(signal);
@@ -171,20 +181,22 @@ async function attemptEntry(signal) {
   }
 
   // A failed position read is unavailable data, never "no positions".
-  const paperConvergence = config.standalone.shadow && config.research.enabled;
+  const shadow = config.standalone.shadow;
+  const source = signal.source ?? "convergence";
   const paper = store.data.paper;
-  const baselinePositions = Object.values(paper?.open ?? {}).filter(p => p.variant === "convergence/baseline");
-  const positions = paperConvergence ? { positions: baselinePositions } : await getMyPositions({ force: true }).catch(() => null);
+  const mirror = Object.values(paper?.open ?? {}).filter(p => p.mirror);
+  const positions = shadow ? { positions: mirror } : await getMyPositions({ force: true }).catch(() => null);
   if (!positions || positions.error || !Array.isArray(positions.positions)) return "position read unavailable";
-  if (positions.positions.length >= config.risk.maxPositions) {
-    finishSignal(store, signal, "portfolio full");
+  if (positions.positions.length >= config.risk.maxPositions ||
+      positions.positions.some(p => (p.mint ?? p.base_mint) === mint)) {
+    finishSignal(store, signal, "portfolio full or mint already open");
     return null;
   }
 
   // Focused screening: this mint and its eligible pools only.
   let screened;
   try {
-    screened = await screenMint(mint);
+    screened = await screenMint(mint, { poolAddress: signal.pool });
   } catch (e) {
     return `screening error: ${e.message}`;
   }
@@ -196,26 +208,22 @@ async function attemptEntry(signal) {
     return screened.reason;
   }
 
-  const paperReserved = baselinePositions.reduce((total, p) => total + p.capital + 0.001, 0);
-  const simulatedSol = config.research.paperBankrollSol + (paper?.realized?.["convergence/baseline"] ?? 0) - paperReserved;
-  const gate = await finalRecheck(signal, screened, paperConvergence ? simulatedSol : null);
+  const simulatedSol = shadow ? config.research.paperBankrollSol + (paper?.mirrorRealized ?? 0) -
+    mirror.reduce((total, p) => total + p.capital, 0) : null;
+  const gate = await finalRecheck(signal, screened, simulatedSol);
   if (gate) return gate;
 
-  const balances = paperConvergence ? { sol: simulatedSol } : await getWalletBalances({ force: true, nativeOnly: true });
+  const balances = shadow ? { sol: simulatedSol } : await getWalletBalances({ force: true, nativeOnly: true });
   if (balances.error || !Number.isFinite(balances.sol)) return "balance read unavailable";
-  if (balances.sol < config.management.minSolToOpen + config.management.gasReserve) {
-    finishSignal(store, signal, "insufficient spendable SOL");
-    return null;
-  }
+  if (balances.sol < config.management.minSolToOpen + config.management.gasReserve) return "insufficient spendable SOL";
+  const risk = riskGate(positions.positions, balances.sol, shadow);
+  if (risk) return risk;
 
   const pool = screened.pool;
-  const configuredBinsAbove = Number(config.strategy.defaultBinsAbove ?? 0);
-  const whaleBinsAbove = Math.max(0, ...signal.events.map(e => Number(e.binsAbove || 0)));
-  let binsAbove = configuredBinsAbove > 0
-    ? Math.min(configuredBinsAbove, whaleBinsAbove > 0 ? whaleBinsAbove : configuredBinsAbove)
-    : 0;
+  // Both execution paths use the same SOL-only range and allocation.
+  const binsAbove = 0;
   const rawBinsBelow = computeBinsBelow(pool.volatility);
-  let binsBelow = Math.max(MIN_SAFE_BINS_BELOW, Math.min(rawBinsBelow, 69 - binsAbove));
+  let binsBelow = Math.max(config.strategy.minBinsBelow, Math.min(rawBinsBelow, 69));
 
   // Chronos AI Pre-Deploy Gate & Dynamic Bin Calibration (InstaBox 5-Node Cluster + Fallback)
   const chronos = await analyzePoolWithChronos(pool.pool_address, {
@@ -227,14 +235,10 @@ async function attemptEntry(signal) {
   }).catch(() => null);
 
   let convictionMult = 1.0;
-  let xRatioMult = 0.65;
   if (chronos) {
     if (chronos.gate?.action === "DEFER") {
       log("chronos_gate", `Deferred ${mint.slice(0, 8)} (${pool.pool_address.slice(0, 8)}): ${chronos.gate.reason}`);
       return `chronos gate: ${chronos.gate.reason}`;
-    }
-    if (configuredBinsAbove > 0 && chronos.recommended_bins?.bins_above > 0) {
-      binsAbove = chronos.recommended_bins.bins_above;
     }
     if (chronos.recommended_bins?.bins_below > 0) {
       binsBelow = Math.max(
@@ -245,38 +249,40 @@ async function attemptEntry(signal) {
     if (Number.isFinite(Number(chronos.tactical_signals?.conviction_mult))) {
       convictionMult = Number(chronos.tactical_signals.conviction_mult);
     }
-    if (Number.isFinite(Number(chronos.tactical_signals?.x_ratio_mult))) {
-      xRatioMult = Number(chronos.tactical_signals.x_ratio_mult);
-    }
     const s = chronos.summary ?? {};
     log(
       "chronos",
-      `Pool ${pool.pool_address.slice(0, 8)} [${chronos.engine}]: P10=${s.p10_pct}% P50=${s.p50_pct}% P90=${s.p90_pct}% RSI=${s.rsi_14} BB%B=${s.bb_pct_b} → bins=${binsBelow}↓/${binsAbove}↑ xMult=${xRatioMult} convMult=${convictionMult} (${chronos.latency_ms}ms)`,
+      `Pool ${pool.pool_address.slice(0, 8)} [${chronos.engine}]: P10=${s.p10_pct}% P50=${s.p50_pct}% P90=${s.p90_pct}% RSI=${s.rsi_14} BB%B=${s.bb_pct_b} → bins=${binsBelow}↓/${binsAbove}↑ convMult=${convictionMult} (${chronos.latency_ms}ms)`,
     );
   }
   const amountY = computeDeployAmount(balances.sol, convictionMult);
-  if (paperConvergence || (!config.standalone.shadow && process.env.DRY_RUN !== "true")) {
-    try {
-      await validateExitQuote({
-        mint, pool: pool.pool_address, decimals: screened.decimals,
-        binStep: Number(pool.dlmm_params?.bin_step), binsBelow, capital: amountY,
-      });
-    } catch { return "exit quote unavailable or below minimum"; }
-  }
-  if (paperConvergence) {
-    if (binsAbove !== 0) return "paper accounting requires SOL-only configuration";
-    const shape = config.strategy.strategy;
-    const baseline = { shape, range: "volatility", binsBelow, variant: "convergence/baseline" };
-    const plans = [
-      baseline,
-      ...(binsBelow < 69 ? [{ ...baseline, binsBelow: Math.min(69, binsBelow + 10), variant: "convergence/wider" }] : []),
-      { ...baseline, rangeWaitMinutes: config.research.paperInitialRangeWaitMinutes + 15, variant: "convergence/wait-longer" },
-      { ...baseline, maxHoldMinutes: Math.max(15, Math.floor(config.research.paperMaxHoldMinutes * 0.75)), variant: "convergence/hold-shorter" },
-    ];
-    await recordResearch(mint, screened, ["wallet convergence"], { plans, capital: amountY });
-    store.data.attempts[mint] = { at: Date.now(), mint, pool: pool.pool_address, status: "proposed", amountSol: amountY };
-    finishSignal(store, signal, "convergence paper proposal recorded");
-    log("entry", `[SHADOW] Convergence paper proposal for ${mint}`);
+  const minDeploy = Math.max(0.1, Number((config.management.deployAmountSol * 0.75).toFixed(2)));
+  if (!(amountY >= minDeploy && amountY <= config.risk.maxDeployAmount &&
+        amountY + config.management.gasReserve <= balances.sol)) return "invalid or unaffordable position size";
+  if (positions.positions.some(p => p.pool === pool.pool_address)) return "pool already open";
+  const poolCheck = await validateDeployPoolThresholds({ pool_address: pool.pool_address });
+  if (!poolCheck.pass) return poolCheck.reason;
+  let entry, model;
+  try {
+    entry = await validateExitQuote({
+      mint, pool: pool.pool_address, decimals: screened.decimals,
+      binStep: Number(pool.dlmm_params?.bin_step), binsBelow, capital: amountY, verifyRange: true,
+    });
+    model = prepareMirrorPosition({ source, mint, pool: pool.pool_address, pair: pool.name,
+      decimals: screened.decimals, binStep: Number(pool.dlmm_params?.bin_step), binsBelow,
+      capital: amountY, shape: config.strategy.strategy, entry });
+  } catch { return "exit quote or entry range unavailable"; }
+  const fresh = await finalRecheck(signal, screened, simulatedSol);
+  if (fresh) return fresh;
+  if (shadow) {
+    if (!Number.isSafeInteger(entry.binId) || (await getActiveBin({ pool_address: pool.pool_address })).binId !== entry.binId) {
+      return "active bin changed after entry validation";
+    }
+    if (shuttingDown || Date.now() >= signal.deadline) return "entry window expired";
+    paper.realized[model.variant] ??= 0;
+    paper.open[model.id] = model;
+    store.data.attempts[mint] = { at: Date.now(), mint, pool: pool.pool_address, status: "entered", amountSol: amountY };
+    finishSignal(store, signal, "entered");
     return null;
   }
   // Checkpoint before building anything: a crash mid-sequence leaves a
@@ -299,13 +305,16 @@ async function attemptEntry(signal) {
     amount_y: amountY,
     bins_below: binsBelow,
     bins_above: binsAbove,
-    x_ratio_mult: xRatioMult,
+    expected_active_bin: entry.binId,
+    strategy: config.strategy.strategy,
     before_submit: async (stage = "lp") => {
       // Always recheck before the pre-deploy swap AND before the first LP creation tx.
       // Subsequent chunks of a multi-tx LP creation skip recheck so a half-built position completes.
       if (stage !== "swap" && submitted++ > 0) return;
       const fresh = await finalRecheck(signal, screened);
       if (fresh) throw new Error(`Pre-submit recheck failed: ${fresh}`);
+      const active = await getActiveBin({ pool_address: pool.pool_address });
+      if (active.binId !== entry.binId) throw new Error("Active bin changed before entry");
     },
     on_prepared: position => {
       store.data.attempts[mint].position = position;
@@ -326,7 +335,7 @@ async function attemptEntry(signal) {
     store.save();
     finishSignal(store, signal, record.status === "proposed" ? "shadow proposal recorded" : "entered");
     const label = result.dry_run ? "[SHADOW] Would deploy" : "Deployed";
-    log("entry", `${label} ${amountY} SOL → pool ${pool.pool_address.slice(0, 8)} mint ${mint.slice(0, 8)} (${binsBelow} bins below, ${signal.events.length}-wallet convergence)`);
+    log("entry", `${label} ${amountY} SOL → pool ${pool.pool_address.slice(0, 8)} mint ${mint.slice(0, 8)} (${binsBelow} bins below, ${source})`);
     void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.pool_address.slice(0, 8)} (mint ${mint.slice(0, 8)}, ${signal.events.length} wallets)`);
     return null;
   }
@@ -343,11 +352,12 @@ async function attemptEntry(signal) {
 // exposure, the market has not run away since screening, and spendable funds
 // cover the entry. Returns null when everything holds, else the reason.
 async function finalRecheck(signal, screened, simulatedSol = null) {
+  if (shuttingDown || Date.now() >= signal.deadline) return "entry window expired";
   let present = 0;
   for (const e of signal.events) {
     try { if (await exposureStillPresent(e)) present++; } catch { /* unreadable position = not confirmed */ }
   }
-  if (present < config.standalone.walletThreshold) {
+  if (signal.source !== "discovery" && present < config.standalone.walletThreshold) {
     return `wallet exposure gone (${present}/${signal.events.length} remain)`;
   }
   try {
@@ -381,35 +391,8 @@ export async function manageOnce() {
     }
     syncOpenPositions(live.positions.map(p => p.position));
     if (live.positions.length === 0) return "No open positions";
-    const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
     for (const p of live.positions) {
       recordPositionSnapshot(p.pool, p);
-      const tracked = getTrackedPosition(p.position);
-      // Refresh Chronos tactical context for open position during management pass
-      const chronos = await analyzePoolWithChronos(p.pool, {
-        binStep: tracked?.bin_step ?? 100,
-      }).catch(() => getCachedChronosAnalysis(p.pool));
-      const chronosCtx = chronos
-        ? { ...(chronos.tactical_signals ?? {}), oor_below_outlook: chronos.oor_below_outlook }
-        : null;
-      confirmPeak(p.position, p.pnl_pct, confirmTicks);
-      const exit = updatePnlAndCheckExits(p.position, p, config.management, chronosCtx);
-      const closeRule = exit
-        ? { action: "CLOSE", rule: "exit", reason: exit.reason }
-        : getDeterministicCloseRule(p, config.management, chronosCtx);
-      const exitSignalName = exit ? (exit.action ?? "EXIT") : closeRule ? `RULE_${closeRule.rule}` : null;
-      const { fire: exitConfirmed } = registerExitSignal(p.position, exitSignalName, confirmTicks);
-      let action = null;
-      if (closeRule?.action === "CLOSE" && exitConfirmed) {
-        action = { tool: "close_position", args: { position_address: p.position, reason: closeRule.reason }, label: `close (${closeRule.reason})` };
-      } else if ((p.unclaimed_fees_true_usd ?? p.unclaimed_fees_usd ?? 0) >= config.management.minClaimAmount) {
-        action = { tool: "claim_fees", args: { position_address: p.position }, label: "claim fees" };
-      }
-      // LLM-set free-text instructions have no execution path in standalone — hold.
-      if (!action) continue;
-      const res = await executeTool(action.tool, action.args).catch(e => ({ error: e.message }));
-      const ok = res?.success !== false && !res?.error && !res?.blocked;
-      log("manage", `${p.pair ?? p.position.slice(0, 8)}: ${action.label} ${ok ? "done" : `FAILED — ${res?.error || res?.reason || "unknown"}`}`);
     }
     return null;
   } finally {
@@ -422,7 +405,7 @@ export async function manageOnce() {
 function startPnlPoller() {
   if (config.standalone.shadow) return;
   const pollMs = Math.max(1, Number(config.pnl.pollIntervalSec ?? 3)) * 1000;
-  const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
+  let lastDecisionAt = 0;
   timers.pnl = setInterval(async () => {
     if (pollBusy || shuttingDown) return;
     const tracked = getTrackedPositions(true);
@@ -452,33 +435,38 @@ function startPnlPoller() {
         }
         if (breaches.some(Boolean)) return;
       }
-      if (manageBusy || shuttingDown) return;
+      const now = Date.now();
+      if (manageBusy || shuttingDown || now - lastDecisionAt < 60_000) return;
+      lastDecisionAt = now;
       const live = await getMyPositions({ force: true, silent: true }).catch(() => null);
-      if (!live?.positions?.length) return;
+      if (!live || live.error || !Array.isArray(live.positions)) return;
+      const states = store.data.mirrorExits ??= {};
+      const openIds = new Set(live.positions.map(p => p.position));
+      for (const id of Object.keys(states)) if (!openIds.has(id)) delete states[id];
       for (const p of live.positions) {
-        const cachedChronos = getCachedChronosAnalysis(p.pool);
-        const chronosCtx = cachedChronos
-          ? { ...(cachedChronos.tactical_signals ?? {}), oor_below_outlook: cachedChronos.oor_below_outlook }
-          : null;
-        confirmPeak(p.position, p.pnl_pct, confirmTicks);
-        const exit = updatePnlAndCheckExits(p.position, p, config.management, chronosCtx);
-        const closeRule = exit ? null : getDeterministicCloseRule(p, config.management, chronosCtx);
-        let signal = null, reason = null;
-        if (exit) { signal = exit.action ?? "EXIT"; reason = exit.reason; }
-        else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; }
-        const { fire } = registerExitSignal(p.position, signal, confirmTicks);
-        if (!signal || !fire) continue;
-        log("poll", `Exit confirmed (${confirmTicks} ticks): ${p.pair ?? p.position.slice(0, 8)} — ${reason} — closing`);
-        manageBusy = true; // hold the slow cycle off this position
+        if (![p.active_bin, p.lower_bin, p.upper_bin].every(Number.isSafeInteger)) continue;
+        const trackedPosition = getTrackedPosition(p.position);
+        const openedAt = Date.parse(p.opened_at ?? trackedPosition?.deployed_at);
+        const state = states[p.position] ??= {
+          id: p.position,
+          openedAt: typeof p.opened_at === "number" ? p.opened_at :
+            Number.isFinite(openedAt) ? openedAt : now - (p.age_minutes ?? 0) * 60_000,
+          rangeReached: true,
+        };
+        state.lower = p.lower_bin;
+        state.upper = p.upper_bin;
+        const pnlPct = Number.isFinite(p.strategy_pnl_pct) ? p.strategy_pnl_pct : null;
+        const reason = state.closeReason ?? mirrorExitReason(state, { binId: p.active_bin }, pnlPct, now);
+        if (!reason) continue;
+        state.closeReason = reason;
+        store.save();
+        manageBusy = true;
         try {
           const res = await executeTool("close_position", { position_address: p.position, reason }).catch(e => ({ error: e.message }));
-          const ok = res?.success !== false && !res?.error && !res?.blocked;
-          log("poll", `${p.pair ?? p.position.slice(0, 8)}: ${ok ? "closed" : `close FAILED — ${res?.error || res?.reason || "unknown"}`}`);
-        } finally {
-          manageBusy = false;
-        }
-        break; // one action per tick
+          log("poll", `${p.position.slice(0, 8)}: ${reason} — ${res?.error || res?.reason || (res?.success ? "closed" : "unconfirmed")}`);
+        } finally { manageBusy = false; }
       }
+      store.save();
     } finally {
       pollBusy = false;
     }
@@ -497,34 +485,6 @@ function startHeartbeat() {
     store.prune();
     store.save();
   }, 60_000);
-}
-
-async function recordResearch(mint, screened, sources, convergence = null) {
-  if (!config.standalone.shadow || !config.research.enabled || shuttingDown) return;
-  const records = store.data.research ??= {};
-  const key = convergence ? `convergence:${mint}` : mint;
-  const current = records[key];
-  if (current && Date.now() - current.at < 300_000) {
-    current.sources = [...new Set([...current.sources, ...sources])];
-    store.save();
-    return `Shadow research: ${current.plans.length} range/shape variants.`;
-  }
-  const plans = convergence?.plans ?? entryPlans(screened.pool);
-  if (shuttingDown || !config.standalone.shadow) return;
-  const latest = records[key];
-  records[key] = {
-    at: Date.now(), mint, pool: screened.pool.pool_address, pair: screened.pool.name,
-    source: convergence ? "convergence" : "discovery",
-    capital: convergence?.capital,
-    marketCap: screened.token.mcap,
-    decimals: screened.decimals,
-    binStep: Number(screened.pool.dlmm_params?.bin_step),
-    sources: [...new Set([...(latest?.sources ?? []), ...sources])],
-    plans,
-  };
-  store.save();
-  log("research", `${mint} ${plans.length} shadow plans (${sources.join(", ")})`);
-  return `Shadow research: ${plans.length} range/shape variants.`;
 }
 
 async function lifecycleStatusLines(detailed = false) {
@@ -569,7 +529,12 @@ async function lifecycleStatusLines(detailed = false) {
   const resetAt = store.data.pnlResetAt?.[store.database.mode] ?? 0;
   const from = Math.max(now - 86_400_000, resetAt);
   if (config.standalone.shadow) {
-    lines.push(...paperPnlLines(summarizePaper(store.data.paper, from, now), detailed));
+    const paper = store.data.paper;
+    const mirror = { open: Object.fromEntries(Object.entries(paper?.open ?? {}).filter(([, p]) => p.mirror)),
+      closed: (paper?.closed ?? []).filter(p => p.mirror) };
+    lines.push(...paperPnlLines(summarizePaper(mirror, from, now), detailed, "discovery/volatility/mirror"));
+    const legacy = Object.values(paper?.open ?? {}).filter(p => !p.mirror).length;
+    if (legacy) lines.push(`Eksperimen lama · ${legacy} posisi terbuka di riwayat paper`);
   }
   if (resetAt > now - 86_400_000) lines.push(`Periode PnL sejak reset ${new Date(resetAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })} WIB`);
   if (!config.standalone.shadow) {
@@ -578,31 +543,14 @@ async function lifecycleStatusLines(detailed = false) {
     const estimated = closed.filter(p => p.pnl_source === "cached").length;
     lines.push(closed.length ? `PnL LP ditutup · ${signed(closed.reduce((n,p) => n + p.pnl_usd, 0))} USD · ${closed.length} posisi${estimated ? ` (${estimated} estimasi)` : ""}` : "PnL LP ditutup · belum ada catatan");
   }
-  if (config.standalone.shadow && config.research.enabled) {
-    const research = Object.values(store.data.research ?? {}).filter(item => now - item.at < 86_400_000);
-    lines.push(`Riset 24 jam ${research.length} kandidat · ${research.reduce((sum, item) => sum + item.plans.length, 0)} rencana entry`);
-    const convergenceCount = research.filter(item => item.source === "convergence").length;
-    const { walletThreshold, windowSec } = config.standalone;
-    lines.push(`Convergence 24 jam · ${convergenceCount} kandidat · syarat ${walletThreshold} wallet berbeda / ${windowSec}s`);
+  const signals = Object.values(store.data.signals).filter(signal => now - signal.createdAt < 86_400_000);
+  const discovery = signals.filter(signal => signal.source === "discovery").length;
+  lines.push(`Entry 24 jam · Discovery ${discovery} kandidat · Convergence ${signals.length - discovery} sinyal`);
+  if (config.standalone.shadow) {
     const paper = store.data.paper;
-    const open = Object.values(paper?.open ?? {});
-    const recent = (paper?.closed ?? []).filter(p => p.accountingVersion && isActivePaperVariant(p.variant) && Date.now() - p.closedAt < 86_400_000);
-    const cancelled = (paper?.cancelled ?? []).filter(p => isActivePaperVariant(p.variant) && Date.now() - p.at < 86_400_000).length;
-    const pending = open.filter(p => p.exit).length;
-    lines.push(`Paper · ${open.filter(p => p.filledAt).length} terisi · ${open.filter(p => !p.filledAt).length} tunggu fill · ${recent.length} selesai/24j · ${cancelled} batal${pending ? ` · ${pending} tunggu quote` : ""}`);
-    const rows = (paper?.nav?.["convergence/baseline"] ?? []).filter(r => r.day < paperDay(Date.now()) && r.complete && r.start > 0 && r.end != null).slice(-30);
-    const average = rows.reduce((sum, r) => sum + (r.end / r.start - 1), 0) / rows.length;
-    const rec = recommendPaperVariant([...(paper?.closed ?? []), ...(paper?.cancelled ?? [])].sort((a,b) => a.openedAt-b.openedAt), Date.now());
-    lines.push(rows.length ? `Baseline · ${(average * 100).toFixed(2)}% rata-rata/hari · ${rows.length}/30 hari valid` : "Baseline · belum ada hari valid");
-    if (rec) lines.push(`Uji parameter · ${rec.variant.split("/").at(-1)} unggul ${rec.test.toFixed(4)} SOL/token pada ${rec.testMints} token validasi`);
-    if (detailed && config.research.paperSizingExperiment) for (const size of ["0.14", "0.30"]) {
-      const nav = (paper?.nav?.[`discovery/volatility/sizing-${size}`] ?? [])
-        .filter(r => r.complete && r.day < paperDay(now) && r.start > 0 && r.end != null);
-      const returns = nav.map(r => (r.end / r.start - 1) * 100);
-      lines.push(returns.length ? `Sizing ${size} SOL · rata-rata ${(returns.reduce((a,b) => a+b,0)/returns.length).toFixed(2)}% · target ≥5% ${returns.filter(r => r >= 5).length}/${returns.length} hari · drawdown ${(Math.max(...nav.map(r=>r.drawdown??0))*100).toFixed(2)}%` : `Sizing ${size} SOL · belum ada hari valid`);
-    }
-    const tracked = Object.keys(store.data.wallets).length;
-    if (tracked < config.standalone.walletThreshold) lines.push(`Convergence · ${tracked}/${config.standalone.walletThreshold} wallet siap`);
+    const open = Object.values(paper?.open ?? {}).filter(p => p.mirror);
+    const closed = (paper?.closed ?? []).filter(p => p.mirror && now - p.closedAt < 86_400_000);
+    lines.push(`Mirror · ${open.length} terbuka · ${closed.length} selesai/24j · ${open.filter(p => p.exit).length} tunggu settlement`);
   }
   const { received, retries, waiting, passed, dropped, reasons } = discoveryStats;
   lines.push(`Discovery sejak restart ${received} masuk · ${waiting} antre · ${retries} retry · ${passed} lolos · ${dropped} kedaluwarsa/tergeser`);
@@ -689,6 +637,7 @@ export async function startStandalone() {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   log("runtime", `Standalone starting — ${config.standalone.shadow ? "SHADOW MODE (proposals recorded, nothing submitted)" : "LIVE MODE"} | threshold=${config.standalone.walletThreshold} wallets / ${config.standalone.windowSec}s window | screening deadline=${config.standalone.screeningDeadlineSec}s`);
 
+  if (config.standalone.shadow) stopPaper = startPaper(store, notify, { admitResearch: false });
   await monitor.start();
   if (!monitor.healthy()) {
     log("runtime_warn", "Monitor baseline incomplete — wallets without a portfolio baseline produce no signals until reconciliation succeeds");
@@ -711,7 +660,6 @@ export async function startStandalone() {
   async function forceClosePositions(targets) {
     if (shuttingDown) return "Meridian sedang restart. Coba lagi setelah aktif.";
     if (store.database.mode === "shadow") {
-      if (!config.research.enabled) return "Lifecycle simulasi nonaktif. Aktifkan riset Shadow sebelum menutup posisi.";
       const open = store.data.paper?.open ?? {};
       const positions = targets.map(({ id }) => open[id]).filter(Boolean);
       const newlyQueued = positions.filter(p => !p.exit && !p.manualExit);
@@ -769,19 +717,24 @@ export async function startStandalone() {
     gmgnKey: process.env.GMGN_API_KEY?.trim(),
     heliusKey: process.env.HELIUS_API_KEY?.trim(),
     notify,
-    thresholds: shadowScreeningThresholds(),
     onMatch: (mint, screened, sources) => {
       store.data.preflightCandidate = { mint, pool: screened.pool.pool_address, at: Date.now() };
-      store.save();
-      return recordResearch(mint, screened, sources);
+      const now = Date.now();
+      const prior = store.data.signals[mint];
+      if (!shuttingDown && (!prior || (prior.done && now >= prior.cooldownUntil))) {
+        const signal = { mint, pool: screened.pool.pool_address, source: "discovery", sources, events: [],
+          createdAt: now, deadline: now + config.standalone.screeningDeadlineSec * 1000, done: false };
+        store.data.signals[mint] = signal;
+        store.save();
+        onSignal(signal);
+      } else store.save();
     },
     stats: discoveryStats,
   });
-  if (config.standalone.shadow && config.research.enabled) stopPaper = startPaper(store, notify);
   startLifecycleReports();
 
   const trackedWallets = Object.keys(store.data.wallets).length;
   void notify(`🤖 Meridian started — ${config.standalone.shadow ? "SHADOW (nothing submitted)" : "LIVE"}\n${trackedWallets} wallet(s) monitored | trigger: ${config.standalone.walletThreshold} within ${config.standalone.windowSec}s | exits: ${config.pnl.pollIntervalSec}s poller`);
 
-  log("runtime", `Running — exits every ${config.schedule.managementIntervalMin}m + ${config.pnl.pollIntervalSec}s poller; waiting for wallet convergence`);
+  log("runtime", `Running — exits every ${config.schedule.managementIntervalMin}m + ${config.pnl.pollIntervalSec}s poller; waiting for Discovery and Convergence`);
 }

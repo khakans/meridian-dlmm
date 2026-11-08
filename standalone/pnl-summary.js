@@ -37,8 +37,8 @@ export function summarizePaper(paper, from, to = Date.now()) {
   return { uniqueClosedMints: mints.size, variants: [...groups.values()].sort((a,b) => a.variant.localeCompare(b.variant)) };
 }
 
-export function paperPnlLines(summary, detailed) {
-  const primary = ["convergence/baseline", "discovery/volatility/spot"];
+export function paperPnlLines(summary, detailed, discoveryVariant = "discovery/volatility/spot") {
+  const primary = ["convergence/baseline", discoveryVariant];
   const active = summary.variants.filter(g => isActivePaperVariant(g.variant));
   const settled = active.filter(g => g.closed || g.cancelled);
   const total = settled.reduce((sum, g) => sum + g.realized, 0);
