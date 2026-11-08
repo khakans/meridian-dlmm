@@ -132,8 +132,20 @@ function startSettlementWorker() {
         await executeTool("close_position", { position_address: result.id, reason: "resume interrupted close" });
       }
       if (result && settlementComplete(result)) {
-        const dust = result.status === "dust_remaining" ? `\nSisa token di wallet ≈ ${result.dustSol.toFixed(8)} SOL` : "";
-        await notify(`✅ LP settlement selesai\nPosition ${result.id}\nPnL net ${Number.isFinite(result.netSol) ? signed(result.netSol) + " SOL" : "belum tersedia"}${dust}${result.signature ? "\nTx: " + result.signature : ""}`);
+        const pair = String(result.pool_name ?? "").replace(/[<>&\r\n]/g, " ").trim().slice(0, 100);
+        const pnl = Number.isFinite(result.netSol)
+          ? `${result.netSol >= 0 ? "+" : ""}${result.netSol.toFixed(6)} SOL` : "belum tersedia";
+        const lines = [
+          `✅ LP ditutup · ${pair || "Pair belum tercatat"}`,
+          `PnL net posisi (setelah biaya) ${pnl}`,
+          `Position ${result.id}`,
+        ];
+        if (result.pool) lines.push(`Pool ${result.pool}`);
+        if (result.status === "dust_remaining") {
+          lines.push(`Sisa token ≈ ${result.dustSol.toFixed(8)} SOL · masih di wallet, di luar PnL net posisi`);
+        }
+        if (result.signature) lines.push(`Tx: ${result.signature}`);
+        await notify(lines.join("\n"));
       }
     } catch { log("settlement_warn", "Settlement retry unavailable"); }
     finally { settlementBusy = false; }
@@ -624,6 +636,9 @@ async function lifecycleStatusLines(detailed = false) {
   const signals = Object.values(store.data.signals).filter(signal => now - signal.createdAt < 86_400_000);
   const discovery = signals.filter(signal => signal.source === "discovery").length;
   lines.push(`Entry 24 jam · Discovery ${discovery} kandidat · Convergence ${signals.length - discovery} sinyal`);
+  const walletMints = Object.values(store.data.convergenceDiagnostics ?? {}).filter(d => now - d.at < 86_400_000);
+  const qualifyingMints = walletMints.filter(d => d.current > 0).length;
+  lines.push(`Convergence · ${Object.keys(store.data.wallets).length} wallet dipantau · ${qualifyingMints} mint dengan deposit yang lolos (24j) · trigger ${config.standalone.walletThreshold} wallet / ${config.standalone.windowSec}s`);
   if (config.standalone.shadow) {
     const paper = store.data.paper;
     const open = Object.values(paper?.open ?? {}).filter(p => p.mirror);
