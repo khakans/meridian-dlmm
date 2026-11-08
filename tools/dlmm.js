@@ -24,6 +24,7 @@ import { normalizeMint, swapToken, getWalletBalances } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
 import { reconcilePositionWrites, sendPositionWrite, simulateLegacy } from "../standalone/position-journal.js";
+import { readRpc } from "../standalone/rpc.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -101,7 +102,7 @@ function formatSolFee(value) {
   return Number.isFinite(number) ? number.toFixed(8).replace(/0+$/, "").replace(/\.$/, "") : "unknown";
 }
 
-async function assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId) {
+async function assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId, connection = getConnection()) {
   const {
     getBinArrayKeysCoverage,
     getBinArrayIndexesCoverage,
@@ -121,7 +122,7 @@ async function assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, m
   const upper = new BN(Math.max(minBinId, maxBinId));
   const indexes = getBinArrayIndexesCoverage(lower, upper);
   const keys = getBinArrayKeysCoverage(lower, upper, poolPubkey, programId);
-  const accounts = await getConnection().getMultipleAccountsInfo(keys, "confirmed");
+  const accounts = await connection.getMultipleAccountsInfo(keys, "confirmed");
   const missing = accounts
     .map((account, index) => account ? null : {
       index: indexes[index]?.toString?.() ?? String(index),
@@ -143,7 +144,7 @@ async function assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, m
     const needsBitmapExtension = indexes.some((index) => isOverflowDefaultBinArrayBitmap(index));
     if (needsBitmapExtension) {
       const [bitmapExtension] = deriveBinArrayBitmapExtension(poolPubkey, programId);
-      const account = await getConnection().getAccountInfo(bitmapExtension, "confirmed");
+      const account = await connection.getAccountInfo(bitmapExtension, "confirmed");
       if (!account) {
         throw new Error(
           `Deploy skipped: selected range requires Meteora bin-array bitmap extension initialization ` +
@@ -233,20 +234,22 @@ function buildPosition(pool, user, positionPubKey, totalXAmount, totalYAmount, m
 
 export async function simulateEntryPosition({ poolAddress, binsBelow, capital }) {
   const owner = config.standalone.walletAddress ? new PublicKey(config.standalone.walletAddress) : getWallet().publicKey;
-  const pool = await getPool(poolAddress);
-  const active = await pool.getActiveBin();
-  const lower = active.binId - binsBelow;
-  await assertRangeDoesNotRequireBinArrayInitialization(pool, lower, active.binId);
-  const { StrategyType } = await getDLMM();
+  const { DLMM, StrategyType } = await getDLMM();
   const strategy = { spot: StrategyType.Spot, curve: StrategyType.Curve, bid_ask: StrategyType.BidAsk }[config.strategy.strategy];
-  if (strategy == null || !(capital > 0) || binsBelow > 69 || pool.lbPair.tokenYMint.toString() !== config.tokens.SOL) {
+  if (strategy == null || !(capital > 0) || !Number.isSafeInteger(binsBelow) || binsBelow < 1 || binsBelow > 69) {
     throw Error("Unsupported preflight plan");
   }
-  const tx = await buildPosition(pool, owner, Keypair.generate().publicKey, new BN(0),
-    new BN(Math.floor(capital * 1e9)), lower, active.binId, strategy);
-  const connection = getConnection();
-  const { blockhash } = await connection.getLatestBlockhash("confirmed");
-  return simulateLegacy(connection, tx, owner, blockhash);
+  return readRpc("monitor", async connection => {
+    const pool = await DLMM.create(connection, new PublicKey(poolAddress));
+    if (pool.lbPair.tokenYMint.toString() !== config.tokens.SOL) return { err: "Pool quote asset is not SOL" };
+    const active = await pool.getActiveBin();
+    const lower = active.binId - binsBelow;
+    await assertRangeDoesNotRequireBinArrayInitialization(pool, lower, active.binId, connection);
+    const tx = await buildPosition(pool, owner, Keypair.generate().publicKey, new BN(0),
+      new BN(Math.floor(capital * 1e9)), lower, active.binId, strategy);
+    const { blockhash } = await connection.getLatestBlockhash("confirmed");
+    return simulateLegacy(connection, tx, owner, blockhash);
+  });
 }
 
 // ─── Deploy Position ───────────────────────────────────────────
