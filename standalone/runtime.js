@@ -494,8 +494,8 @@ async function lifecycleStatusLines(detailed = false) {
     const estimated = closed.filter(p => p.pnl_source === "cached").length;
     lines.push(closed.length ? `PnL LP ditutup · ${signed(closed.reduce((n,p) => n + p.pnl_usd, 0))} USD · ${closed.length} posisi${estimated ? ` (${estimated} estimasi)` : ""}` : "PnL LP ditutup · belum ada catatan");
   }
-  const research = Object.values(store.data.research ?? {}).filter(item => now - item.at < 86_400_000);
   if (config.standalone.shadow && config.research.enabled) {
+    const research = Object.values(store.data.research ?? {}).filter(item => now - item.at < 86_400_000);
     lines.push(`Riset 24 jam ${research.length} kandidat · ${research.reduce((sum, item) => sum + item.plans.length, 0)} rencana entry`);
     const paper = store.data.paper;
     const open = Object.values(paper?.open ?? {});
@@ -515,7 +515,7 @@ async function lifecycleStatusLines(detailed = false) {
   lines.push(`Discovery sejak restart ${received} masuk · ${waiting} antre · ${retries} retry · ${passed} lolos · ${dropped} kedaluwarsa/tergeser`);
   const topReasons = Object.entries(reasons).sort((a, b) => b[1] - a[1]).slice(0, 3);
   if (topReasons.length) lines.push(`Kendala ${topReasons.map(([reason, n]) => `${reason} ×${n}`).join(" · ")}`);
-  if (detailed) {
+  if (detailed && config.standalone.shadow) {
     try {
       const saved = store.database.get("overnight");
       lines.push(`Arsip semalam · ${saved.periodWib} · ${saved.uniqueClosedMints} mint selesai`);
