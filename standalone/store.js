@@ -25,6 +25,11 @@ export class MonitorStore {
     fs.writeFileSync(`${this.file}.tmp`, JSON.stringify(this.data, null, 2), { mode: 0o600 });
     fs.renameSync(`${this.file}.tmp`, this.file);
   }
+  resetPnl(now = Date.now()) {
+    const pnlResetAt = { [this.database.mode]: now };
+    this.database.saveMonitor({ ...this.data, pnlResetAt }, this.historyIds);
+    this.data.pnlResetAt = pnlResetAt;
+  }
   prune(now = Date.now()) {
     for (const [mint, item] of Object.entries(this.data.research ?? {})) {
       if (now - item.at > 24 * 3600_000) delete this.data.research[mint];

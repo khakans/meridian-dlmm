@@ -35,6 +35,8 @@ test('SQLite migrates paper and live data separately and persists paper history 
     assert.equal(shadow.get('monitor').paper.closed.length, 0);
     assert.equal(shadow.db.prepare("SELECT count(*) AS n FROM history WHERE kind='paper-close'").get().n, 1);
     assert.equal(live.db.prepare("SELECT count(*) AS n FROM history WHERE kind='paper-close'").get().n, 0);
+    assert.equal(shadow.db.prepare("SELECT count(*) AS n FROM history WHERE kind='pnl-reset'").get().n, 1);
+    assert.equal(live.get('monitor').pnlResetAt.live, 20);
   } finally {
     if (shadow?.db.isOpen) shadow.db.close();
     if (live?.db.isOpen) live.db.close();

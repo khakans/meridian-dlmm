@@ -49,6 +49,11 @@ export function openModeDatabase(mode, root = REPO_ROOT) {
     const added = [];
     transaction(() => {
       put('monitor', state);
+      const reset = state.pnlResetAt?.[mode];
+      if (Number.isSafeInteger(reset) && reset > 0 && !known.has(`pnl-reset:${reset}`)) {
+        append('pnl-reset', reset, reset, { mode, at: reset });
+        added.push(`pnl-reset:${reset}`);
+      }
       for (const [kind, rows] of [['paper-close', state.paper?.closed], ['paper-cancel', state.paper?.cancelled]]) {
         for (const row of rows ?? []) {
           const id = row.id ?? `${row.mint}:${row.variant}:${row.closedAt ?? row.at}`;

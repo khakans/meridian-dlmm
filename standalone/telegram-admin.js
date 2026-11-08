@@ -348,7 +348,7 @@ export function createAdminConsole(transport, {
     if (sectionId === "status") {
       return void await render(`${await statusText()}${note ? `\n\n${note}` : ""}`, [
         [{ text: "🔄 Refresh", callback_data: "s:status" }, { text: "← Back", callback_data: "s:root" }],
-        ...(resetPnl ? [[{ text: "Reset PnL", callback_data: "m:pnlreset" }]] : []),
+        ...(resetPnl ? [[{ text: `Reset PnL · ${config.standalone.shadow ? "Shadow" : "Live"}`, callback_data: "m:pnlreset" }]] : []),
       ]);
     }
     const section = SECTIONS.find(s => s.id === sectionId);
@@ -493,7 +493,7 @@ export function createAdminConsole(transport, {
       }
       if (data === "m:pnlreset" && resetPnl) {
         pending = { kind: "pnlreset", shadow: config.standalone.shadow };
-        return void await render("Mulai periode PnL terealisasi baru untuk mode ini? Riwayat, posisi terbuka, dan batas risiko tetap tersimpan.", [
+        return void await render(`Mulai periode PnL terealisasi baru untuk ${pending.shadow ? "Shadow" : "Live"}? Riwayat, posisi terbuka, dan batas risiko tetap tersimpan.`, [
           [{ text: "Konfirmasi reset", callback_data: "m:pnlreset2" }, { text: "Batal", callback_data: "s:status" }],
         ]);
       }

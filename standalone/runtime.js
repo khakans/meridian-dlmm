@@ -482,7 +482,7 @@ async function lifecycleStatusLines(detailed = false) {
     if (book.positions.length > 10) lines.push(`+${book.positions.length - 10} posisi lainnya`);
   }
   const now = Date.now();
-  const resetAt = store.data.pnlResetAt?.[config.standalone.shadow ? "shadow" : "live"] ?? 0;
+  const resetAt = store.data.pnlResetAt?.[store.database.mode] ?? 0;
   const from = Math.max(now - 86_400_000, resetAt);
   if (resetAt > now - 86_400_000) lines.push(`Periode PnL sejak reset ${new Date(resetAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })} WIB`);
   if (!config.standalone.shadow) {
@@ -613,11 +613,7 @@ export async function startStandalone() {
   const adminOptions = {
     monitor,
     statusDetails: () => lifecycleStatusLines(true),
-    resetPnl: () => {
-      store.data.pnlResetAt ??= {};
-      store.data.pnlResetAt[config.standalone.shadow ? "shadow" : "live"] = Date.now();
-      store.save();
-    },
+    resetPnl: () => store.resetPnl(),
     activeSignals: () => Object.values(store.data.signals).filter(s => !s.done).length,
     restart: async (send, beforeRestart) => {
       if (pursuing || manageBusy || pollBusy) {
