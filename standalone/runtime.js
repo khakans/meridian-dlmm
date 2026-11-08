@@ -18,13 +18,13 @@ import { startDiscovery } from "./discovery.js";
 import { isActivePaperVariant } from "./entry-plans.js";
 import { mirrorExitReason, prepareMirrorPosition, startPaper, validateExitQuote } from "./paper.js";
 import { advanceSettlement, dueSettlements, settlementComplete, settlementRows } from "./settlement.js";
-import { positionWrites, reconcilePositionWrites } from "./position-journal.js";
+import { isRetryableEntryError, positionWrites, reconcilePositionWrites } from "./position-journal.js";
 import { readRpc } from "./rpc.js";
 import { withWalletLock } from "./transactions.js";
 import { paperDay } from "./paper-accounting.js";
 import { paperPnlLines, paperRealizedLine, signed, summarizePaper } from "./pnl-summary.js";
 import { openPositions, positionsPage, positionTarget } from "./positions-view.js";
-import { exposureStillPresent } from "./events.js";
+import { exposureStillPresent, recoverablePositionRent } from "./events.js";
 import { getActiveBin, getMyPositions, simulateEntryPosition } from "../tools/dlmm.js";
 import { executeTool, validateDeployPoolThresholds } from "../tools/executor.js";
 import { getWalletBalances } from "../tools/wallet.js";
@@ -93,7 +93,7 @@ async function reconcileEntries() {
   }
 }
 
-function riskGate(positions, cash, shadow, now = Date.now()) {
+async function riskGate(positions, cash, shadow, wallet, now = Date.now()) {
   if (shadow ? positions.some(p => p.exit || p.manualExit || p.hardLowerExit) :
     settlementRows().some(row => !settlementComplete(row))) {
     return "position settlement pending";
@@ -102,11 +102,16 @@ function riskGate(positions, cash, shadow, now = Date.now()) {
     ? (!p.markIssue && p.mark?.at <= now && now - p.mark.at <= 180_000 ? p.capital + p.mark.pnl : null)
     : p.equity_sol);
   if (!Number.isFinite(cash) || values.some(value => !Number.isFinite(value) || value < 0)) return "portfolio equity unavailable";
-  const equity = cash + values.reduce((sum, value) => sum + value, 0);
+  let rent = 0;
+  if (!shadow) {
+    try { rent = await recoverablePositionRent(positions, wallet); }
+    catch { return "portfolio LP rent unavailable"; }
+  }
+  const equity = cash + rent + values.reduce((sum, value) => sum + value, 0);
   const day = paperDay(now);
   const prior = store.data.strategyRisk;
   const state = {
-    day, equity, start: prior?.day === day ? prior.start : equity, peak: Math.max(prior?.peak ?? 0, equity),
+    day, equity, rent, start: prior?.day === day ? prior.start : equity, peak: Math.max(prior?.peak ?? 0, equity),
   };
   store.data.strategyRisk = state;
   store.save();
@@ -244,7 +249,9 @@ async function attemptEntry(signal) {
     finishSignal(store, signal, `mint already attempted (${attempt.status})`);
     return null;
   }
-  if (attempt?.status === "failed" && (attempt.failures ?? 0) >= 2) {
+  if (attempt?.status === "failed" && (attempt.failures ?? 0) >= 2 &&
+      (!isRetryableEntryError(attempt.error) || attempt.txs?.length ||
+       (attempt.position && positionWrites(attempt.position).length))) {
     finishSignal(store, signal, "deploy failed repeatedly");
     return null;
   }
@@ -285,7 +292,8 @@ async function attemptEntry(signal) {
   const balances = shadow ? { sol: simulatedSol } : await getWalletBalances({ force: true, nativeOnly: true });
   if (balances.error || !Number.isFinite(balances.sol)) return "balance read unavailable";
   if (balances.sol < config.management.minSolToOpen + config.management.gasReserve) return "insufficient spendable SOL";
-  const risk = riskGate(positions.positions, balances.sol, shadow);
+  if (!shadow && positions.wallet !== balances.wallet) return "portfolio wallet mismatch";
+  const risk = await riskGate(positions.positions, balances.sol, shadow, balances.wallet);
   if (risk) return risk;
 
   const pool = screened.pool;
@@ -419,11 +427,18 @@ async function attemptEntry(signal) {
     finishSignal(store, signal, "entry submitted; awaiting on-chain reconciliation");
     return null;
   }
-  record.status = "failed";
-  record.failures = (record.failures ?? 0) + 1;
   record.error = result?.error || result?.reason || "unknown";
+  const retryable = !record.txs?.length && isRetryableEntryError(record.error);
+  record.status = retryable ? "retryable" : "failed";
+  if (!retryable && !signal.done) record.failures = (record.failures ?? 0) + 1;
   if (Array.isArray(record.txs) && record.txs.length > 0) record.note = "transaction submitted before failure — outcome uncertain";
+  if (retryable) signal.entryRetries = (signal.entryRetries ?? 0) + 1;
   store.save();
+  if (signal.done) return null;
+  if (retryable && signal.entryRetries >= 2) {
+    finishSignal(store, signal, `entry market/RPC retry limit: ${record.error}`);
+    return null;
+  }
   return `deploy failed (${record.error})`;
 }
 

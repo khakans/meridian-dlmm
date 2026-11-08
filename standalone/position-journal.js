@@ -20,8 +20,13 @@ export async function simulateLegacy(connection, tx, payer, blockhash) {
 
 export async function sendPositionWrite(connection, tx, signers, position, stage, db = modeDatabase(), assertActive) {
   if (db.mode !== 'live' || process.env.DRY_RUN === 'true') throw Error('Position submission requires Live');
-  const validity = await connection.getLatestBlockhash('confirmed');
-  const simulation = await simulateLegacy(connection, tx, signers[0].publicKey, validity.blockhash);
+  let validity = await connection.getLatestBlockhash('confirmed');
+  let simulation = await simulateLegacy(connection, tx, signers[0].publicKey, validity.blockhash);
+  if (simulation.err === 'BlockhashNotFound') {
+    assertActive?.();
+    validity = await connection.getLatestBlockhash('confirmed');
+    simulation = await simulateLegacy(connection, tx, signers[0].publicKey, validity.blockhash);
+  }
   if (simulation.err) throw Error(`Transaction simulation rejected: ${JSON.stringify(simulation.err)}`);
   tx.sign(...signers);
   const bytes = tx.serialize();
@@ -35,6 +40,15 @@ export async function sendPositionWrite(connection, tx, signers, position, stage
   if (confirmation.value.err) throw Error('Transaction failed on-chain; reconciling final status');
   save(position, { ...row, status: 'confirmed' }, db);
   return signature;
+}
+
+export function isRetryableEntryError(error) {
+  return typeof error === 'string' && (
+    error === 'Transaction simulation rejected: "BlockhashNotFound"' ||
+    /^Transaction simulation rejected: \{"InstructionError":\[\d+,\{"Custom":6004\}\]\}$/.test(error) ||
+    error === 'Active bin changed after entry validation' ||
+    error === 'Active bin changed before entry'
+  );
 }
 
 export function writeStatus(row, signatureStatus, finalizedHeight) {

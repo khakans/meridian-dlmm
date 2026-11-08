@@ -13,6 +13,27 @@ async function getCoder() {
   }
   return coder;
 }
+
+export async function recoverablePositionRent(positions, wallet, rpc = readRpc, getAccountCoder = getCoder) {
+  if (!positions.length) return 0;
+  if (!wallet) throw Error('Position wallet unavailable');
+  const ids = positions.map(p => new PublicKey(p.position));
+  if (new Set(ids.map(String)).size !== ids.length) throw Error('Duplicate LP position');
+  const accounts = await rpc('monitor', c => c.getMultipleAccountsInfo(ids, 'confirmed'));
+  const coder = await getAccountCoder();
+  let lamports = 0;
+  for (const [i, position] of positions.entries()) {
+    const account = accounts[i];
+    if (!account || String(account.owner) !== DLMM_PROGRAM || !Number.isSafeInteger(account.lamports) || account.lamports < 0) {
+      throw Error('LP account unavailable or invalid');
+    }
+    const decoded = coder.accounts.decode('positionV2', account.data);
+    if (String(decoded.owner) !== wallet || String(decoded.lbPair) !== position.pool) throw Error('LP account ownership mismatch');
+    lamports += account.lamports;
+  }
+  if (!Number.isSafeInteger(lamports)) throw Error('LP account rent unavailable');
+  return lamports / 1e9;
+}
 // Decode only Anchor event CPI instructions emitted by the verified DLMM program.
 // Never interpret arbitrary log strings or another program's payload as an LP entry.
 export function decodeEvents(tx, eventCoder) {

@@ -12,7 +12,8 @@ import { lowerRangeStop } from '../exit-rules.js';
 import { settlementComplete, tokenDelta } from '../standalone/settlement.js';
 import { meetsSettlementMinimum } from '../tools/wallet.js';
 import { positionsPage } from '../standalone/positions-view.js';
-import { netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
+import { isRetryableEntryError, netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
+import { DLMM_PROGRAM, recoverablePositionRent } from '../standalone/events.js';
 
 test('settlement only attributes the closed mint balance change to the specified wallet', () => {
   const token = (owner, mint, amount) => ({ owner, mint, uiTokenAmount: { amount } });
@@ -29,6 +30,25 @@ test('hard lower-range stop measures price beyond the lower bin, not position Pn
   assert.equal(lowerRangeStop(97, null, 100, 2), null);
 });
 import { emptyMonitor, openModeDatabase } from '../standalone/database.js';
+
+test('LP rent only counts a valid position owned by the trading wallet', async () => {
+  const positions = [{ position: Keypair.generate().publicKey.toBase58(), pool: 'pool' }];
+  const rpc = (_, fn) => fn({ getMultipleAccountsInfo: async () => [
+    { owner: DLMM_PROGRAM, lamports: 41_899_840, data: Buffer.alloc(0) },
+  ] });
+  const coder = owner => async () => ({ accounts: { decode: () => ({ owner, lbPair: 'pool' }) } });
+  assert.equal(await recoverablePositionRent(positions, 'wallet', rpc, coder('wallet')), 0.04189984);
+  await assert.rejects(recoverablePositionRent(positions, 'wallet', rpc, coder('another')), /ownership mismatch/);
+  await assert.rejects(recoverablePositionRent([...positions, ...positions], 'wallet', rpc, coder('wallet')), /Duplicate/);
+});
+
+test('temporary entry failures are separated from unrelated and post-submit failures', () => {
+  assert.equal(isRetryableEntryError('Transaction simulation rejected: {"InstructionError":[6,{"Custom":6004}]}'), true);
+  assert.equal(isRetryableEntryError('Transaction simulation rejected: "BlockhashNotFound"'), true);
+  assert.equal(isRetryableEntryError('Active bin changed before entry'), true);
+  assert.equal(isRetryableEntryError('Transaction failed on-chain; reconciling final status'), false);
+  assert.equal(isRetryableEntryError('Transaction simulation rejected: {"InstructionError":[6,{"Custom":6005}]}'), false);
+});
 
 test('settlement bounds executable slippage and treats recorded dust as complete', () => {
   const order = { inputMint: 'token', outputMint: 'sol', inAmount: '6052117', outAmount: '52524',
@@ -51,12 +71,15 @@ test('position signature survives a timeout and can be reconciled after reopenin
     const position = Keypair.generate().publicKey;
     const tx = new Transaction().add(SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: position, lamports: 1 }));
     const blockhash = Keypair.generate().publicKey.toBase58();
+    const freshBlockhash = Keypair.generate().publicKey.toBase58();
+    let refreshes = 0;
+    let expire = false;
     const connection = {
-      getLatestBlockhash: async () => ({ blockhash, lastValidBlockHeight: 100 }),
+      getLatestBlockhash: async () => ({ blockhash: expire && ++refreshes > 1 ? freshBlockhash : blockhash, lastValidBlockHeight: 100 }),
       simulateTransaction: async (candidate, options) => {
         assert.equal(options.sigVerify, false);
         assert.ok(candidate.signatures.every(sig => sig.every(byte => byte === 0)));
-        return { value: { err: null } };
+        return { value: { err: expire && candidate.message.recentBlockhash === blockhash ? 'BlockhashNotFound' : null } };
       },
       sendRawTransaction: async () => {
         assert.equal(positionWrites(position, db)[0].status, 'pending');
@@ -67,7 +90,10 @@ test('position signature survives a timeout and can be reconciled after reopenin
     await assert.rejects(sendPositionWrite(connection, tx, [payer], position, 'entry', db,
       () => { throw Error('entry stopped'); }), /entry stopped/);
     assert.deepEqual(positionWrites(position, db), []);
+    expire = true;
     await assert.rejects(sendPositionWrite(connection, tx, [payer], position, 'entry', db), /timeout after send/);
+    assert.equal(refreshes, 2);
+    assert.equal(positionWrites(position, db)[0].blockhash, freshBlockhash);
     db.db.close();
     db = openModeDatabase('live', dir);
     const signature = positionWrites(position, db)[0].signature;
