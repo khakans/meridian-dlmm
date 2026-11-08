@@ -56,7 +56,7 @@ function paperLines(p, tab, now, research) {
   if (p.capital != null || p.costSol != null) lines.push(`Modal ${amount(p.capital, 'SOL')} · Biaya simulasi ${amount(p.costSol, 'SOL')}`);
   if (p.feeSol != null || p.quotedSol != null) lines.push(`Fee LP ${amount(p.feeSol, 'SOL')}${p.feeTokens > 0 ? ` + ${p.feeTokens.toPrecision(5)} token` : ''} · Quote keluar ${amount(p.quotedSol, 'SOL')}`);
   if (p.lower != null && p.upper != null) lines.push(`Range bin ${p.lower}–${p.upper}${p.entryBin == null ? '' : ` · Entry bin ${p.entryBin}`}`);
-  const reason = p.reason ?? p.exit?.reason ?? p.hardLowerExit;
+  const reason = p.reason ?? p.exit?.reason ?? p.manualExit ?? p.hardLowerExit;
   if (reason) lines.push(`Alasan ${safe(reason)}`);
   if (p.mint) lines.push(`Mint ${safe(p.mint)}`);
   if (p.pool) lines.push(`Pool ${safe(p.pool)}`);
@@ -105,6 +105,20 @@ function liveLines(p, tab, now, solMode, tracked, settlement) {
   return lines;
 }
 
+export async function openPositions({ store, readBook }) {
+  if (store.database.mode === 'shadow') {
+    return Object.values(store.data.paper?.open ?? {}).filter(p => isActivePaperVariant(p.variant))
+      .sort((a, b) => b.openedAt - a.openedAt);
+  }
+  const book = await readBook().catch(() => null);
+  if (book?.error || !Array.isArray(book?.positions)) return null;
+  return book.positions.slice().sort((a, b) => (a.age_minutes ?? Infinity) - (b.age_minutes ?? Infinity));
+}
+
+export function positionTarget(p) {
+  return { id: p.position ?? p.id, label: safe(p.pair || p.mint?.slice(0, 8) || p.position?.slice(0, 8)) };
+}
+
 export async function positionsPage({ store, tab, page, readBook, getTracked, getSettlements, solMode, now = Date.now() }) {
   const shadow = store.database.mode === 'shadow';
   const tabs = shadow ? ['open', 'closed', 'cancelled'] : ['open', 'closed'];
@@ -113,13 +127,10 @@ export async function positionsPage({ store, tab, page, readBook, getTracked, ge
   const header = `📋 Positions · ${shadow ? 'SHADOW' : 'LIVE'} · ${labels[tab]}`;
   let result;
   if (tab === 'open') {
-    const book = shadow ? null : await readBook().catch(() => null);
-    if (!shadow && (book?.error || !Array.isArray(book?.positions))) {
+    const positions = await openPositions({ store, readBook });
+    if (!positions) {
       return { text: `${header}\nData posisi on-chain belum tersedia. Coba Muat ulang.`, tab, tabs, page: 0, pages: 1 };
     }
-    const positions = shadow
-      ? Object.values(store.data.paper?.open ?? {}).filter(p => isActivePaperVariant(p.variant)).sort((a, b) => b.openedAt - a.openedAt)
-      : book.positions.slice().sort((a, b) => (a.age_minutes ?? Infinity) - (b.age_minutes ?? Infinity));
     const pages = Math.max(1, Math.ceil(positions.length / PAGE_SIZE));
     page = Math.min(page, pages - 1);
     result = { rows: positions.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE), total: positions.length, page, pages };
@@ -135,5 +146,6 @@ export async function positionsPage({ store, tab, page, readBook, getTracked, ge
       ? paperLines(p, tab, now, store.data.research ?? {})
       : liveLines(p, tab, now, solMode, tab === 'open' ? getTracked(p.position) : null, settlements.get(p.position))));
   }
-  return { text: lines.join('\n'), tab, tabs, page: result.page, pages: result.pages };
+  return { text: lines.join('\n'), tab, tabs, page: result.page, pages: result.pages, total: result.total,
+    targets: tab === 'open' ? result.rows.map(positionTarget) : [] };
 }

@@ -125,6 +125,7 @@ export function startPaper(store, notify, {
       for (const p of Object.values(paper.open)) {
         if (stopped || !config.standalone.shadow) return;
         try {
+          if (p.manualExit && !p.exit) p.manualExitCheckedAt = now;
           const active = p.exit ? null : await readActive(p.pool);
           if (!p.exit && !validActive(active)) { p.mark = null; continue; }
           if (!p.exit) p.hardLowerExit ??= lowerRangeStop(active.binId, p.lower,
@@ -133,7 +134,8 @@ export function startPaper(store, notify, {
           const inventory = p.exit?.inventory ?? (bins && markPaperBins(p, active.binId, bins));
           if (!inventory) { p.mark = null; continue; }
           if (!p.filledAt && (inventory.tokens > 0 || inventory.feeEvidence)) p.filledAt = now;
-          if (!p.exit && p.hardLowerExit) p.exit = { at: now, reason: p.hardLowerExit, inventory };
+          const forcedExit = p.hardLowerExit ?? p.manualExit;
+          if (!p.exit && forcedExit) p.exit = { at: now, reason: forcedExit, inventory };
           const proceeds = await sellQuote(p.mint, rawTokens(inventory.tokens + inventory.feeTokens, p.decimals));
           if (stopped || !config.standalone.shadow) return;
           const pnl = proceeds == null ? null : inventory.sol + inventory.feeSol + proceeds - p.capital - COST_SOL;
@@ -255,7 +257,9 @@ export function startPaper(store, notify, {
   const timer = schedule(tick, MINUTE);
   let watching = false;
   const fastTimer = setInterval(async () => {
-    if (watching || stopped || !config.standalone.shadow || !(config.management.outOfRangeBelowStopPct > 0)) return;
+    if (watching || stopped || !config.standalone.shadow) return;
+    if (Object.values(paper.open).some(p => p.manualExit && !p.exit && !p.manualExitCheckedAt)) void tick();
+    if (!(config.management.outOfRangeBelowStopPct > 0)) return;
     watching = true;
     try {
       const reads = new Map();

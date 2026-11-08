@@ -167,9 +167,11 @@ test('quote-only bins convert inventory as price crosses and reject retired rang
   assert.equal(paperBins({ range: 'retired', lower: 0.5, upper: 0.8 }, active, 100), null);
 });
 
-test('paper entry checks exit quote and persists an exit awaiting settlement', async () => {
+test('paper entry checks exit quote and manual close persists while settlement is unavailable', async () => {
   const before = config.standalone.shadow;
+  const previousLowerStop = config.management.outOfRangeBelowStopPct;
   config.standalone.shadow = true;
+  config.management.outOfRangeBelowStopPct = 0;
   const c = { at: Date.now(), mint: 'fixture', pool: 'fixture', decimals: 6, binStep: 100,
     plans: [{ range: 'volatility', shape: 'spot', binsBelow: 35 }] };
   const store = { data: { research: { fixture: c } }, save() {} };
@@ -204,10 +206,11 @@ test('paper entry checks exit quote and persists an exit awaiting settlement', a
     const [position] = Object.values(store.data.paper.open);
     assert.ok(position);
     active = { binId: 20, price: 0.3 };
-    position.openedAt = Date.now() - (config.research.paperMaxHoldMinutes + 1) * 60_000;
+    position.manualExit = 'manual force close';
     quoteAvailable = false;
-    for (let i = 0; i < config.pnl.confirmTicks; i++) await run();
+    await run();
     assert.ok(position.exit?.inventory.tokens > 0);
+    assert.equal(position.exit.reason, 'manual force close');
     assert.equal(store.data.paper.closed.length, 0);
     quoteAvailable = true;
     await run();
@@ -218,5 +221,6 @@ test('paper entry checks exit quote and persists an exit awaiting settlement', a
   } finally {
     stop();
     config.standalone.shadow = before;
+    config.management.outOfRangeBelowStopPct = previousLowerStop;
   }
 });

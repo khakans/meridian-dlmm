@@ -21,7 +21,7 @@ import { withWalletLock } from "./transactions.js";
 import { paperDay, recommendPaperVariant } from "./paper-accounting.js";
 import { getPerformanceHistory } from "../performance.js";
 import { paperPnlLines, signed, summarizePaper } from "./pnl-summary.js";
-import { positionsPage } from "./positions-view.js";
+import { openPositions, positionsPage, positionTarget } from "./positions-view.js";
 import { exposureStillPresent } from "./events.js";
 import { getActiveBin, getMyPositions } from "../tools/dlmm.js";
 import { executeTool } from "../tools/executor.js";
@@ -703,13 +703,51 @@ export async function startStandalone() {
   startSettlementWorker();
   startHeartbeat();
   startChronosKeepalive();
+  const readBook = () => getMyPositions({ force: true, silent: true });
+  const listCloseTargets = async () => (await openPositions({ store, readBook }))?.map(positionTarget);
+  async function forceClosePositions(targets) {
+    if (shuttingDown) return "Meridian sedang restart. Coba lagi setelah aktif.";
+    if (store.database.mode === "shadow") {
+      if (!config.research.enabled) return "Lifecycle simulasi nonaktif. Aktifkan riset Shadow sebelum menutup posisi.";
+      const open = store.data.paper?.open ?? {};
+      const positions = targets.map(({ id }) => open[id]).filter(Boolean);
+      const newlyQueued = positions.filter(p => !p.exit && !p.manualExit);
+      for (const p of newlyQueued) p.manualExit = "manual force close";
+      try { store.save(); }
+      catch (error) {
+        for (const p of newlyQueued) delete p.manualExit;
+        throw error;
+      }
+      return `Shadow · ${newlyQueued.length} masuk antrean close · ${positions.length - newlyQueued.length} sudah diproses/antre · ${targets.length - positions.length} sudah tidak terbuka. Lifecycle menyelesaikan close setelah data tersedia.`;
+    }
+    if (config.standalone.shadow || process.env.DRY_RUN === "true") return "Mode berubah. Buka Positions lagi.";
+    const current = await listCloseTargets();
+    if (!current) return "Posisi on-chain gagal dibaca. Coba lagi.";
+    const open = new Set(current.map(p => p.id));
+    let closed = 0, skipped = 0;
+    const failed = [];
+    for (const target of targets) {
+      if (shuttingDown || !open.has(target.id)) { skipped++; continue; }
+      const result = await executeTool("close_position", { position_address: target.id, reason: "manual force close" })
+        .catch(error => ({ error: error.message }));
+      if (result?.success && !result.dry_run) closed++;
+      else {
+        failed.push(target.id);
+        log("close_warn", `Slack force close ${target.id} failed: ${result?.error || result?.reason || "unknown"}`);
+      }
+    }
+    return [`Live · ${closed} ditutup · ${skipped} dilewati · ${failed.length} gagal. Settlement ke SOL dipantau terpisah.`,
+      ...failed.slice(0, 10).map(id => `Position ${id}`)].join("\n");
+  }
   const adminOptions = {
     monitor,
     statusDetails: () => lifecycleStatusLines(true),
     positionDetails: (tab, page) => positionsPage({
-      store, tab, page, readBook: () => getMyPositions({ force: true, silent: true }),
+      store, tab, page, readBook,
       getTracked: getTrackedPosition, getSettlements: settlementRows, solMode: config.management.solMode,
     }),
+    listCloseTargets,
+    forceClosePositions,
     resetPnl: () => store.resetPnl(),
     activeSignals: () => Object.values(store.data.signals).filter(s => !s.done).length,
     restart: async (send, beforeRestart) => {

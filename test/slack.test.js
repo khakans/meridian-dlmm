@@ -34,6 +34,9 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   let request = 0;
   let card;
   let restarts = 0;
+  const closedPositions = [];
+  const target = { id: "paper-position-1", label: "MEME/SOL" };
+  const otherTarget = { id: "paper-position-2", label: "OTHER/SOL" };
   const replies = [];
   const client = { chat: {
     async postMessage(body) {
@@ -55,7 +58,10 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
     positionDetails: async (tab, page) => ({
       text: `Positions · ${tab} · Halaman ${page + 1}/2`,
       tab, page, pages: 2, tabs: ["open", "closed", "cancelled"],
+      total: 2, targets: tab === "open" ? [page ? otherTarget : target] : [],
     }),
+    listCloseTargets: async () => [target, otherTarget],
+    forceClosePositions: async targets => { closedPositions.push(targets); return "Test close result"; },
   });
   const message = (text, event = {}, body = {}) => slack.message(
     { team_id: "T1", api_app_id: "A1", event_id: String(++request), ...body },
@@ -88,6 +94,21 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   assert.match(card.text, /open · Halaman 1/);
   await click(find("Berikutnya"));
   assert.match(card.text, /open · Halaman 2/);
+  await click(find("Force Close"));
+  assert.match(card.text, /OTHER\/SOL/);
+  const confirmClose = find("Konfirmasi tutup");
+  await click(confirmClose, { user: { id: "U2" } });
+  assert.equal(closedPositions.length, 0);
+  await click(confirmClose);
+  await click(confirmClose);
+  assert.deepEqual(closedPositions, [[otherTarget]]);
+  await click(find("Close All"));
+  await click(find("Batal"));
+  assert.equal(closedPositions.length, 1);
+  await click(find("Close All"));
+  assert.match(card.text, /Tutup 2 posisi/);
+  await click(find("Konfirmasi tutup"));
+  assert.deepEqual(closedPositions, [[otherTarget], [target, otherTarget]]);
   await click(find("Riwayat tutup"));
   assert.match(card.text, /closed · Halaman 1/);
   await click(find("Muat ulang"));

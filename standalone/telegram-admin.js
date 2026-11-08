@@ -279,7 +279,8 @@ const restartRow = () => [{ text: "♻️ Restart now", callback_data: "m:restar
 export const _test = { SECTIONS, byKey, editHint, validate, sectionMenu, fmtValue };
 
 export function createAdminConsole(transport, {
-  monitor = null, activeSignals = null, restart, statusDetails, positionDetails, resetPnl, slack = false,
+  monitor = null, activeSignals = null, restart, statusDetails, positionDetails, listCloseTargets, forceClosePositions,
+  resetPnl, slack = false,
 } = {}) {
   const { sendMessage, sendMenu, editMenu } = transport;
   const answerCallbackQuery = transport.answerCallbackQuery ?? (async () => {});
@@ -287,6 +288,7 @@ export function createAdminConsole(transport, {
   let consoleMessageId = null;
   let lastRenderSig = null;
   let lastRenderAt = 0;
+  let closePageTargets = [];
   // While the console is in active use, /menu edits it in place; once stale,
   // /menu starts a fresh message at the bottom so it's actually visible.
   const STALE_CONSOLE_MS = 5 * 60_000;
@@ -321,9 +323,17 @@ export function createAdminConsole(transport, {
       const navigation = [];
       if (view.page > 0) navigation.push(button("← Sebelumnya", view.tab, view.page - 1));
       if (view.page + 1 < view.pages) navigation.push(button("Berikutnya →", view.tab, view.page + 1));
+      closePageTargets = view.targets ?? [];
+      const closeButtons = slack && forceClosePositions && closePageTargets.length ? [
+        ...closePageTargets.map((target, index) => [{
+          text: `Force Close #${index + 1} · ${target.label} · ${target.id.slice(-6)}`, callback_data: `close:${index}`,
+        }]),
+        [{ text: `Close All (${view.total})`, callback_data: "close:all" }],
+      ] : [];
       return void await render(view.text, [
         view.tabs.map(tab => button(labels[tab], tab)),
         ...(navigation.length ? [navigation] : []),
+        ...closeButtons,
         [button("↻ Muat ulang", view.tab, view.page), { text: "← Back", callback_data: "s:root" }],
       ]);
     }
@@ -432,6 +442,32 @@ export function createAdminConsole(transport, {
       if (data === "x:cancel") { pending = null; return void await viewRoot(); }
       if (data === "s:root") { pending = null; return void await viewRoot(); }
       if (data.startsWith("s:")) { pending = null; return void await viewSection(data.slice(2)); }
+      if (slack && forceClosePositions && data.startsWith("close:")) {
+        if (data === "close:confirm") {
+          if (pending?.kind !== "force-close") return;
+          const { targets, shadow } = pending;
+          pending = null;
+          if (shadow !== config.standalone.shadow) return void await sendMessage("Mode berubah. Buka Positions lagi.");
+          await render("Permintaan close sedang diproses…", []);
+          await sendMessage(await forceClosePositions(targets));
+          return void await viewSection("positions");
+        }
+        const selection = data.slice(6);
+        const one = closePageTargets[Number(selection)];
+        const targets = selection === "all" ? await listCloseTargets() : one ? [one] : [];
+        if (!targets?.length) {
+          return void await sendMessage(targets ? "Posisi sudah tidak tersedia." : "Posisi on-chain gagal dibaca. Coba lagi.");
+        }
+        const shadow = config.standalone.shadow;
+        pending = { kind: "force-close", targets, shadow };
+        const detail = selection === "all"
+          ? "Posisi baru setelah konfirmasi ini dibuat tidak ikut ditutup."
+          : `${one.label}\n${shadow ? one.id : `Position ${one.id}`}`;
+        return void await render(
+          `${shadow ? "SHADOW · simulasi" : "LIVE · transaksi on-chain"}\nTutup ${targets.length} posisi?\n${detail}`,
+          [[{ text: "Konfirmasi tutup", callback_data: "close:confirm" }, { text: "Batal", callback_data: "s:positions" }]],
+        );
+      }
       if (data.startsWith("t:")) {
         const setting = byKey.get(data.slice(2));
         if (!setting) return;
