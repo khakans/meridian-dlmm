@@ -1,7 +1,7 @@
 import { deployPosition, getMyPositions, claimFees, closePosition } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { withWalletLock } from "../standalone/transactions.js";
-import { beginSettlement } from "../standalone/settlement.js";
+import { beginSettlement, confirmPositionClosed } from "../standalone/settlement.js";
 import { invalidateBalances } from "../standalone/balances.js";
 import { config, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { addPoolNote } from "../pool-memory.js";
@@ -290,11 +290,12 @@ async function executeToolUnlocked(name, args) {
     let settlement;
     const result = await fn(name === "close_position" && !args.skip_swap ? {
       ...args,
-      onClosed: ({ mint, wallet, txs }) => {
+      onClosing: ({ mint, wallet, ...details }) => {
         const baseline = !preClose?.error && preClose?.wallet === wallet
-          ? preClose.tokens.find(t => t.mint === mint)?.raw_balance ?? "0" : null;
-        settlement = beginSettlement({ id: args.position_address, mint, wallet, baseline, txs });
+          ? preClose.tokens?.find(t => t.mint === mint)?.raw_balance ?? "0" : null;
+        settlement = beginSettlement({ id: args.position_address, mint, wallet, baseline, reason: args.reason, ...details });
       },
+      onClosed: ({ txs }) => { settlement = confirmPositionClosed(args.position_address, txs); },
     } : args);
     const duration = Date.now() - startTime;
     const success = result?.success !== false && !result?.error;

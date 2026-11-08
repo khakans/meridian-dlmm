@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Keypair, SystemProgram, Transaction } from '@solana/web3.js';
 import { config } from '../config.js';
 import { mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMirrorPosition, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
@@ -10,6 +11,7 @@ import { paperPnlLines, paperRealizedLine, summarizePaper } from '../standalone/
 import { lowerRangeStop } from '../exit-rules.js';
 import { tokenDelta } from '../standalone/settlement.js';
 import { positionsPage } from '../standalone/positions-view.js';
+import { netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
 
 test('settlement only attributes the closed mint balance change to the specified wallet', () => {
   const token = (owner, mint, amount) => ({ owner, mint, uiTokenAmount: { amount } });
@@ -26,6 +28,62 @@ test('hard lower-range stop measures price beyond the lower bin, not position Pn
   assert.equal(lowerRangeStop(97, null, 100, 2), null);
 });
 import { emptyMonitor, openModeDatabase } from '../standalone/database.js';
+
+test('position signature survives a timeout and can be reconciled after reopening SQLite', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-journal-'));
+  let db = openModeDatabase('live', dir);
+  const previous = process.env.DRY_RUN;
+  process.env.DRY_RUN = 'false';
+  try {
+    const payer = Keypair.generate();
+    const position = Keypair.generate().publicKey;
+    const tx = new Transaction().add(SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: position, lamports: 1 }));
+    const blockhash = Keypair.generate().publicKey.toBase58();
+    const connection = {
+      getLatestBlockhash: async () => ({ blockhash, lastValidBlockHeight: 100 }),
+      simulateTransaction: async (candidate, options) => {
+        assert.equal(options.sigVerify, false);
+        assert.ok(candidate.signatures.every(sig => sig.every(byte => byte === 0)));
+        return { value: { err: null } };
+      },
+      sendRawTransaction: async () => {
+        assert.equal(positionWrites(position, db)[0].status, 'pending');
+        throw Error('timeout after send');
+      },
+    };
+    assert.equal((await simulateLegacy(connection, tx, payer.publicKey, blockhash)).err, null);
+    await assert.rejects(sendPositionWrite(connection, tx, [payer], position, 'entry', db), /timeout after send/);
+    db.db.close();
+    db = openModeDatabase('live', dir);
+    const signature = positionWrites(position, db)[0].signature;
+    const rpc = (_, fn) => fn({
+      getSignatureStatuses: async ([value]) => {
+        assert.equal(value, signature);
+        return { value: [null] };
+      },
+      getBlockHeight: async () => 101,
+      getTransaction: async value => {
+        assert.equal(value, signature);
+        return { meta: { err: null } };
+      },
+    });
+    assert.equal((await reconcilePositionWrites(position, db, rpc))[0].status, 'confirmed');
+  } finally {
+    if (previous == null) delete process.env.DRY_RUN; else process.env.DRY_RUN = previous;
+    db.db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('settlement net SOL includes wallet cash changes and failed transaction fees', () => {
+  const tx = (pre, post, err = null) => ({ transaction: { message: { staticAccountKeys: ['wallet', 'other'] } },
+    meta: { preBalances: [pre, 500], postBalances: [post, 500], err } });
+  assert.equal(netWalletSol([
+    tx(1_000_000_000, 799_995_000), tx(799_995_000, 949_990_000),
+    tx(949_990_000, 949_985_000, 'failed swap'), tx(949_985_000, 1_019_980_000),
+  ], 'wallet'), 0.01998);
+  assert.equal(netWalletSol([tx(100, 200), null], 'wallet'), null);
+});
 
 test('Shadow All includes historical bankrolls while Mirror reports separately', () => {
   const closed = [

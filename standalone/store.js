@@ -47,7 +47,9 @@ export class MonitorStore {
     }
     // Attempt records double as mint-level duplicate protection; a day matches
     // the pool-memory cooldown horizon. Never prune mid-submit checkpoints.
-    for (const [mint, a] of Object.entries(this.data.attempts)) if (a.status !== "submitting" && now - a.at > 24 * 3600_000) delete this.data.attempts[mint];
+    for (const [mint, a] of Object.entries(this.data.attempts)) {
+      if (!["submitting", "review_required"].includes(a.status) && now - a.at > 24 * 3600_000) delete this.data.attempts[mint];
+    }
   }
 }
 export function qualifyingEvents(events, mint, options, now = Date.now()) {

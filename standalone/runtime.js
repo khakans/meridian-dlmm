@@ -6,6 +6,7 @@
 // (close_position > other writes > deploy_position) in standalone/transactions.js.
 
 import fs from "node:fs";
+import { PublicKey } from "@solana/web3.js";
 import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import { repoPath } from "../repo-root.js";
@@ -17,16 +18,18 @@ import { startDiscovery } from "./discovery.js";
 import { isActivePaperVariant } from "./entry-plans.js";
 import { mirrorExitReason, prepareMirrorPosition, startPaper, validateExitQuote } from "./paper.js";
 import { advanceSettlement, dueSettlements, settlementRows } from "./settlement.js";
+import { positionWrites, reconcilePositionWrites } from "./position-journal.js";
+import { readRpc } from "./rpc.js";
 import { withWalletLock } from "./transactions.js";
 import { paperDay } from "./paper-accounting.js";
 import { getPerformanceHistory } from "../performance.js";
 import { paperPnlLines, paperRealizedLine, signed, summarizePaper } from "./pnl-summary.js";
 import { openPositions, positionsPage, positionTarget } from "./positions-view.js";
 import { exposureStillPresent } from "./events.js";
-import { getActiveBin, getMyPositions } from "../tools/dlmm.js";
+import { getActiveBin, getMyPositions, simulateEntryPosition } from "../tools/dlmm.js";
 import { executeTool, validateDeployPoolThresholds } from "../tools/executor.js";
 import { getWalletBalances } from "../tools/wallet.js";
-import { getTrackedPosition, getTrackedPositions, syncOpenPositions } from "../state.js";
+import { getTrackedPosition, getTrackedPositions, syncOpenPositions, trackPosition } from "../state.js";
 import { latchLowerRangeExit } from "../state.js";
 import { recordPositionSnapshot } from "../pool-memory.js";
 import { computeBinsBelow, lowerRangeStop } from "../exit-rules.js";
@@ -52,6 +55,44 @@ const signalQueue = [];
 const discoveryStats = { received: 0, retries: 0, waiting: 0, passed: 0, dropped: 0, reasons: Object.create(null) };
 let preflight = null;
 let settlementBusy = false;
+let entryInFlight = false;
+
+async function reconcileEntries() {
+  if (entryInFlight) return;
+  for (const [mint, attempt] of Object.entries(store.data.attempts)) {
+    if (attempt.status !== "submitting") continue;
+    const rows = attempt.position ? await reconcilePositionWrites(attempt.position) : [];
+    if (rows.some(row => row.status === "pending")) continue;
+    if (!attempt.journalVersion && !rows.length) continue;
+    const confirmed = rows.filter(row => row.stage === "entry" && row.status === "confirmed");
+    if (confirmed.length) {
+      const book = await getMyPositions({ force: true, silent: true });
+      const position = book.positions?.find(p => p.position === attempt.position);
+      if (book.error || !position) {
+        const account = await readRpc("monitor", c => c.getAccountInfo(new PublicKey(attempt.position), "finalized"));
+        if (account) continue;
+        // A confirmed signature with no account still requires attribution before re-entry.
+        attempt.status = "review_required";
+      } else {
+        if (!getTrackedPosition(attempt.position)) trackPosition({
+          position: attempt.position, pool: position.pool, pool_name: position.pair,
+          strategy: attempt.strategy, amount_sol: attempt.amountSol,
+          bin_step: attempt.binStep, bin_range: { min: position.lower_bin, max: position.upper_bin },
+        });
+        attempt.status = "entered";
+        attempt.txs = confirmed.map(row => row.signature);
+      }
+    } else {
+      attempt.status = "failed";
+      attempt.failures = (attempt.failures ?? 0) + 1;
+    }
+    attempt.at = Date.now();
+    const signal = store.data.signals[mint];
+    if (signal && !signal.done) finishSignal(store, signal, `recovered entry: ${attempt.status}`);
+    else store.save();
+    log("recovery", `${mint.slice(0, 8)} entry reconciled: ${attempt.status}`);
+  }
+}
 
 function riskGate(positions, cash, shadow, now = Date.now()) {
   if (shadow ? positions.some(p => p.exit || p.manualExit || p.hardLowerExit) :
@@ -80,14 +121,19 @@ function startSettlementWorker() {
   timers.settlement = setInterval(async () => {
     if (shuttingDown || settlementBusy) return;
     const next = dueSettlements()[0];
-    if (!next) return;
     settlementBusy = true;
     try {
-      const result = await withWalletLock(() => {
-        const fresh = dueSettlements().find(r => r.id === next.id);
+      const result = await withWalletLock(async () => {
+        await reconcileEntries();
+        const fresh = next && dueSettlements().find(r => r.id === next.id);
         return fresh && !shuttingDown ? advanceSettlement(fresh) : null;
       }, 1);
-      if (result?.status === "swapped") await notify(`✅ LP settlement selesai\nPosition ${result.id}\nTx: ${result.signature}`);
+      if (result?.status === "closing" && result.retryClose && !shuttingDown) {
+        await executeTool("close_position", { position_address: result.id, reason: "resume interrupted close" });
+      }
+      if (["swapped", "no_balance"].includes(result?.status)) {
+        await notify(`✅ LP settlement selesai\nPosition ${result.id}\nPnL net ${Number.isFinite(result.netSol) ? signed(result.netSol) + " SOL" : "belum tersedia"}${result.signature ? "\nTx: " + result.signature : ""}`);
+      }
     } catch { log("settlement_warn", "Settlement retry unavailable"); }
     finally { settlementBusy = false; }
   }, 10_000);
@@ -97,18 +143,23 @@ async function refreshPreflight() {
   if (preflight && Date.now() - preflight.at < 60_000) return preflight;
   const sample = [store.data.preflightCandidate, ...Object.values(store.data.research ?? {})].filter(c => c && Date.now() - c.at < 300_000)
     .sort((a,b) => b.at - a.at)[0];
-  const result = { at: Date.now(), pool: "belum ada sampel segar", quote: "belum diuji" };
+  const result = { at: Date.now(), pool: "belum ada sampel segar", quote: "belum diuji", simulation: "belum diuji" };
   if (sample) {
     try {
       const screened = await screenMint(sample.mint, { poolAddress: sample.pool });
       result.pool = screened.pass ? "lolos screening ulang" : screened.reason;
       if (screened.pass) {
+        const binsBelow = Math.max(config.strategy.minBinsBelow, Math.min(69, computeBinsBelow(screened.pool.volatility)));
         try {
           await validateExitQuote({ mint: sample.mint, pool: sample.pool, decimals: screened.decimals,
-            binStep: Number(screened.pool.dlmm_params?.bin_step), binsBelow: computeBinsBelow(screened.pool.volatility),
+            binStep: Number(screened.pool.dlmm_params?.bin_step), binsBelow,
             capital: config.risk.maxDeployAmount });
           result.quote = "lolos ukuran maksimum";
         } catch { result.quote = "tidak lolos atau provider gagal"; }
+        try {
+          const sim = await simulateEntryPosition({ poolAddress: sample.pool, binsBelow, capital: config.risk.maxDeployAmount });
+          result.simulation = sim.err ? `RPC menolak ${JSON.stringify(sim.err).slice(0, 120)}` : "lolos tanpa broadcast";
+        } catch { result.simulation = "build atau RPC belum tersedia"; }
       }
     } catch { result.pool = "data tidak tersedia"; }
   }
@@ -163,6 +214,9 @@ async function pursueSignal(signal) {
 // terminal rejection, or fatal condition), or a reason string to retry.
 async function attemptEntry(signal) {
   const mint = signal.mint;
+  if (!config.standalone.shadow && Object.values(store.data.attempts).some(a => a.status === "submitting" || a.status === "review_required")) {
+    return "an earlier entry needs on-chain reconciliation";
+  }
   const attempt = store.data.attempts[mint];
   const attemptCooldownMs = (config.standalone.cooldownSec ?? 300) * 1000;
   // Block concurrent mid-submit or immediate duplicate signal within signal cooldown;
@@ -290,10 +344,12 @@ async function attemptEntry(signal) {
   store.data.attempts[mint] = {
     at: Date.now(), mint, pool: pool.pool_address, wallets: signal.events.map(e => e.wallet),
     status: "submitting", failures: attempt?.failures ?? 0, position: null, txs: [],
+    amountSol: amountY, strategy: config.strategy.strategy, binStep: entry.binStep, journalVersion: 1,
   };
   store.save();
 
   let submitted = 0;
+  entryInFlight = true;
   const result = await executeTool("deploy_position", {
     pool_address: pool.pool_address,
     base_mint: mint,
@@ -320,7 +376,7 @@ async function attemptEntry(signal) {
       store.data.attempts[mint].position = position;
       store.save();
     },
-  }).catch(e => ({ error: e.message }));
+  }).catch(e => ({ error: e.message })).finally(() => { entryInFlight = false; });
 
   const record = store.data.attempts[mint];
   if (Array.isArray(result?.txs) && result.txs.length > 0) {
@@ -340,6 +396,11 @@ async function attemptEntry(signal) {
     return null;
   }
 
+  if (record.position && positionWrites(record.position).some(row => ["pending", "confirmed"].includes(row.status))) {
+    store.save();
+    finishSignal(store, signal, "entry submitted; awaiting on-chain reconciliation");
+    return null;
+  }
   record.status = "failed";
   record.failures = (record.failures ?? 0) + 1;
   record.error = result?.error || result?.reason || "unknown";
@@ -502,7 +563,7 @@ async function lifecycleStatusLines(detailed = false) {
   if (detailed) {
     const check = await refreshPreflight();
     lines.push(`Preflight · pool ${check.pool} · quote keluar ${check.quote}`);
-    lines.push("Simulasi close berurutan · belum diverifikasi");
+    lines.push(`Simulasi build entry · ${check.simulation}`);
     if (unsettled.length) for (const row of unsettled.slice(0, 4)) {
       lines.push(`• Settlement ${row.id.slice(0, 8)} · ${row.status}${row.reason ? ` · ${row.reason}` : ""}`);
     }
@@ -539,10 +600,17 @@ async function lifecycleStatusLines(detailed = false) {
   }
   if (resetAt > now - 86_400_000) lines.push(`Periode PnL sejak reset ${new Date(resetAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })} WIB`);
   if (!config.standalone.shadow) {
+    const recovering = Object.values(store.data.attempts).filter(row => row.status === "submitting").length;
+    const review = Object.values(store.data.attempts).filter(row => row.status === "review_required").length;
+    if (recovering || review) lines.push(`Recovery entry · ${recovering} rekonsiliasi · ${review} perlu diperiksa`);
+    const settled = settlements.filter(row => ["swapped", "no_balance"].includes(row.status) && row.updatedAt >= from);
+    const priced = settled.filter(row => Number.isFinite(row.netSol));
+    const missing = settled.length - priced.length;
+    lines.push(`PnL net settlement ${priced.length ? signed(priced.reduce((total, row) => total + row.netSol, 0)) + " SOL" : "—"} · ${priced.length} terukur · ${unsettled.length} tertunda${missing ? ` · ${missing} tanpa data lengkap` : ""}`);
     const closed = getPerformanceHistory({ hours: 24, limit: 10000 }).positions.filter(p =>
       Date.parse(p.closed_at) >= from && Number.isFinite(p.pnl_usd) && p.pnl_source !== "unavailable");
     const estimated = closed.filter(p => p.pnl_source === "cached").length;
-    lines.push(closed.length ? `PnL LP ditutup · ${signed(closed.reduce((n,p) => n + p.pnl_usd, 0))} USD · ${closed.length} posisi${estimated ? ` (${estimated} estimasi)` : ""}` : "PnL LP ditutup · belum ada catatan");
+    lines.push(closed.length ? `PnL LP sebelum settlement · ${signed(closed.reduce((n,p) => n + p.pnl_usd, 0))} USD · ${closed.length} posisi${estimated ? ` (${estimated} estimasi)` : ""}` : "PnL LP ditutup · belum ada catatan");
   }
   const signals = Object.values(store.data.signals).filter(signal => now - signal.createdAt < 86_400_000);
   const discovery = signals.filter(signal => signal.source === "discovery").length;

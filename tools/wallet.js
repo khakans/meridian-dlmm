@@ -105,6 +105,7 @@ export async function swapToken({
   amount,
   raw_amount,
   beforeExecute,
+  minimumOut,
 }) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
@@ -160,6 +161,11 @@ export async function swapToken({
     if (order.errorCode || order.errorMessage) {
       throw new Error(`Swap V2 order error: ${order.errorMessage || order.errorCode}`);
     }
+    if (minimumOut != null && (order.inputMint !== input_mint || order.outputMint !== output_mint ||
+      order.inAmount !== amountStr || !Number.isSafeInteger(Number(order.otherAmountThreshold)) ||
+      Number(order.otherAmountThreshold) < Math.round(minimumOut * LAMPORTS_PER_SOL))) {
+      throw Error("Executable swap order does not meet quoted minimum");
+    }
 
     const { transaction: unsignedTx, requestId } = order;
 
@@ -168,7 +174,12 @@ export async function swapToken({
     tx.sign([wallet]);
     const signedTx = Buffer.from(tx.serialize()).toString("base64");
     const signature = tx.signatures[0]?.some(Boolean) ? bs58.encode(tx.signatures[0]) : null;
-    await beforeExecute?.(signature);
+    const lastValidBlockHeight = Number(order.lastValidBlockHeight);
+    if (beforeExecute) {
+      const simulation = await connection.simulateTransaction(tx, { sigVerify: false, commitment: "confirmed" });
+      if (simulation.value.err) throw Error("Settlement swap simulation rejected");
+      await beforeExecute(signature, Number.isSafeInteger(lastValidBlockHeight) && lastValidBlockHeight > 0 ? lastValidBlockHeight : null);
+    }
 
     // ─── Execute ───────────────────────────────────────────────
     const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {

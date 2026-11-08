@@ -23,6 +23,7 @@ import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { normalizeMint, swapToken, getWalletBalances } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
+import { reconcilePositionWrites, sendPositionWrite, simulateLegacy } from "../standalone/position-journal.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -221,6 +222,31 @@ export async function getPaperBinSnapshot(poolAddress, lower, upper, { verifyRan
   if (verifyRange) await assertRangeDoesNotRequireBinArrayInitialization(pool, lower, upper);
   const { bins } = await pool.getBinsBetweenLowerAndUpperBound(lower, upper);
   return new Map(bins.map(bin => [bin.binId, bin]));
+}
+
+function buildPosition(pool, user, positionPubKey, totalXAmount, totalYAmount, minBinId, maxBinId, strategyType) {
+  return pool.initializePositionAndAddLiquidityByStrategy({
+    positionPubKey, user, totalXAmount, totalYAmount,
+    strategy: { maxBinId, minBinId, strategyType }, slippage: 1,
+  });
+}
+
+export async function simulateEntryPosition({ poolAddress, binsBelow, capital }) {
+  const owner = config.standalone.walletAddress ? new PublicKey(config.standalone.walletAddress) : getWallet().publicKey;
+  const pool = await getPool(poolAddress);
+  const active = await pool.getActiveBin();
+  const lower = active.binId - binsBelow;
+  await assertRangeDoesNotRequireBinArrayInitialization(pool, lower, active.binId);
+  const { StrategyType } = await getDLMM();
+  const strategy = { spot: StrategyType.Spot, curve: StrategyType.Curve, bid_ask: StrategyType.BidAsk }[config.strategy.strategy];
+  if (strategy == null || !(capital > 0) || binsBelow > 69 || pool.lbPair.tokenYMint.toString() !== config.tokens.SOL) {
+    throw Error("Unsupported preflight plan");
+  }
+  const tx = await buildPosition(pool, owner, Keypair.generate().publicKey, new BN(0),
+    new BN(Math.floor(capital * 1e9)), lower, active.binId, strategy);
+  const connection = getConnection();
+  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+  return simulateLegacy(connection, tx, owner, blockhash);
 }
 
 // ─── Deploy Position ───────────────────────────────────────────
@@ -509,7 +535,7 @@ export async function deployPosition({
       for (let i = 0; i < createTxArray.length; i++) {
         const signers = i === 0 ? [wallet, newPosition] : [wallet];
         await before_submit?.();
-        const txHash = await sendAndConfirmTransaction(getConnection(), createTxArray[i], signers);
+        const txHash = await sendPositionWrite(getConnection(), createTxArray[i], signers, newPosition.publicKey.toString(), "entry");
         txHashes.push(txHash);
         log("deploy", `Create tx ${i + 1}/${createTxArray.length}: ${txHash}`);
       }
@@ -526,22 +552,16 @@ export async function deployPosition({
       const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
       for (let i = 0; i < addTxArray.length; i++) {
         await before_submit?.();
-        const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet]);
+        const txHash = await sendPositionWrite(getConnection(), addTxArray[i], [wallet], newPosition.publicKey.toString(), "entry");
         txHashes.push(txHash);
         log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
       }
     } else {
       // ── Standard Path (≤69 bins) ─────────────────────────────────
-      const tx = await pool.initializePositionAndAddLiquidityByStrategy({
-        positionPubKey: newPosition.publicKey,
-        user: wallet.publicKey,
-        totalXAmount: totalXLamports,
-        totalYAmount: totalYLamports,
-        strategy: { maxBinId, minBinId, strategyType },
-        slippage: 1, // SDK expects percent, not bps
-      });
+      const tx = await buildPosition(pool, wallet.publicKey, newPosition.publicKey,
+        totalXLamports, totalYLamports, minBinId, maxBinId, strategyType);
       await before_submit?.();
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
+      const txHash = await sendPositionWrite(getConnection(), tx, [wallet, newPosition], newPosition.publicKey.toString(), "entry");
       txHashes.push(txHash);
     }
 
@@ -1049,7 +1069,7 @@ export async function claimFees({ position_address }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
-export async function closePosition({ position_address, reason, onClosed }) {
+export async function closePosition({ position_address, reason, onClosing, onClosed }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
@@ -1060,6 +1080,8 @@ export async function closePosition({ position_address, reason, onClosed }) {
 
   try {
     log("close", `Closing position: ${position_address}`);
+    const previous = await reconcilePositionWrites(position_address);
+    if (previous.some(row => row.status === "pending")) throw Error("A position transaction is still pending");
     const wallet = getWallet();
     const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
     const poolMeta = await getPoolMetadata(poolAddress);
@@ -1070,6 +1092,8 @@ export async function closePosition({ position_address, reason, onClosed }) {
     const pool = await getPool(poolAddress);
 
     const positionPubKey = new PublicKey(position_address);
+    await onClosing?.({ mint: pool.lbPair.tokenXMint.toString(), wallet: wallet.publicKey.toString(),
+      pool: poolAddress, pool_name: tracked?.pool_name ?? poolMeta.name, deployed_at: tracked?.deployed_at });
     const claimTxHashes = [];
     const closeTxHashes = [];
 
@@ -1087,13 +1111,14 @@ export async function closePosition({ position_address, reason, onClosed }) {
         });
         if (claimTxs && claimTxs.length > 0) {
           for (const tx of claimTxs) {
-            const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+            const claimHash = await sendPositionWrite(getConnection(), tx, [wallet], position_address, "close");
             claimTxHashes.push(claimHash);
           }
           log("close", `Step 1 OK (claim only): ${claimTxHashes.join(", ")}`);
         }
       }
     } catch (e) {
+      if ((await reconcilePositionWrites(position_address)).some(row => row.status === "pending")) throw e;
       log("close_warn", `Step 1 (Claim) failed or nothing to claim: ${e.message}`);
     }
 
@@ -1126,7 +1151,7 @@ export async function closePosition({ position_address, reason, onClosed }) {
       });
 
       for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+        const txHash = await sendPositionWrite(getConnection(), tx, [wallet], position_address, "close");
         closeTxHashes.push(txHash);
       }
     } else {
@@ -1135,7 +1160,7 @@ export async function closePosition({ position_address, reason, onClosed }) {
         owner: wallet.publicKey,
         position: { publicKey: positionPubKey },
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), closeTx, [wallet]);
+      const txHash = await sendPositionWrite(getConnection(), closeTx, [wallet], position_address, "close");
       closeTxHashes.push(txHash);
     }
     const txHashes = [...claimTxHashes, ...closeTxHashes];

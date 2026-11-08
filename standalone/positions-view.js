@@ -22,9 +22,11 @@ function elapsed(start, end) {
 function historyPage(db, shadow, tab, requestedPage) {
   const where = shadow
     ? `kind = ? AND (json_extract(value, '$.variant') LIKE 'discovery/volatility/%' OR json_extract(value, '$.variant') LIKE 'convergence/%')`
-    : `kind IN ('live-close', 'decision') AND (kind = 'live-close' OR (
+    : `(kind = 'live-close' OR (kind = 'live-close-recovered' AND NOT EXISTS (
+        SELECT 1 FROM history p WHERE p.kind = 'live-close' AND p.id = h.id
+      )) OR (kind = 'decision' AND
         json_extract(value, '$.type') = 'close' AND json_extract(value, '$.position') IS NOT NULL
-        AND NOT EXISTS (SELECT 1 FROM history p WHERE p.kind = 'live-close' AND p.id = json_extract(h.value, '$.position'))
+        AND NOT EXISTS (SELECT 1 FROM history p WHERE p.kind IN ('live-close', 'live-close-recovered') AND p.id = json_extract(h.value, '$.position'))
       ))`;
   const args = shadow ? [tab === 'cancelled' ? 'paper-cancel' : 'paper-close'] : [];
   const total = db.prepare(`SELECT count(*) AS total FROM history h WHERE ${where}`).get(...args).total;
@@ -106,7 +108,8 @@ function liveLines(p, tab, now, solMode, tracked, settlement) {
   if (p.position) lines.push(`Position ${safe(p.position)}`);
   const closeTx = (p.close_txs ?? p.metrics?.close_txs)?.at(-1);
   if (closeTx) lines.push('Transaksi tutup', `Tx ${safe(closeTx)}`);
-  if (settlement) lines.push(`Settlement ${safe(settlement.status)} · ${stamp(settlement.updatedAt)}`);
+  if (settlement) lines.push(`Settlement ${safe(settlement.status)} · ${stamp(settlement.updatedAt)}`,
+    `PnL net aktual ${amount(settlement.netSol, 'SOL', true)}`);
   if (settlement?.signature) lines.push(`Tx ${safe(settlement.signature)}`);
   return lines;
 }
