@@ -170,8 +170,8 @@ test('position pages preserve mode separation, history past a reset, and unknown
     assert.match(history.text, /WIB/);
     const liveHistory = await view(live, 'closed');
     assert.match(liveHistory.text, /2 posisi/);
-    assert.match(liveHistory.text, /OTHER\/SOL\nPnL terealisasi —/);
-    assert.match(liveHistory.text, /LIVE\/SOL\nPnL terealisasi \+3\.00 USD/);
+    assert.match(liveHistory.text, /OTHER\/SOL\nPnL LP sebelum settlement —/);
+    assert.match(liveHistory.text, /LIVE\/SOL\nPnL LP sebelum settlement \+3\.00 USD/);
     assert.doesNotMatch(liveHistory.text, /SHADOW|MEME/);
     assert.match((await view(live, 'open')).text, /on-chain belum tersedia/);
   } finally {

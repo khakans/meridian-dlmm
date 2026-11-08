@@ -2,13 +2,19 @@ import { log } from "./logger.js";
 import bs58 from "bs58";
 
 export const slackPlainText = value => String(value).replace(/<\/?(?:b|i|code)>/gi, "");
+const reportHeadings = new Set(["Posisi & PnL", "Sinyal · 24 jam", "Screening Discovery · sejak restart", "Diagnostik"]);
 
 export function slackMessageBlocks(text) {
   return (text.match(/[\s\S]{1,2800}/gu) ?? []).map(part => {
     const elements = [];
     let formatted = false;
     for (const line of part.split("\n")) {
-      const match = /^(Wallet on-chain|Deposit address|Wallet address|Mint|Pool|Position|Tx)(?::| )\s*([1-9A-HJ-NP-Za-km-z]{32,88})$/.exec(line);
+      if (reportHeadings.has(line) || /^📊 Meridian • (LIVE|SHADOW)$/.test(line)) {
+        elements.push({ type: "text", text: line, style: { bold: true } }, { type: "text", text: "\n" });
+        formatted = true;
+        continue;
+      }
+      const match = /^(Wallet|Wallet on-chain|Deposit address|Wallet address|Mint|Pool|Position|Tx)(?::| )\s*([1-9A-HJ-NP-Za-km-z]{32,88})$/.exec(line);
       if (match) {
         const [, label, id] = match;
         const tx = label === "Tx";
@@ -16,11 +22,14 @@ export function slackMessageBlocks(text) {
           const explorer = label === "Pool" ? "Meteora" : "Solscan";
           const url = label === "Pool" ? `https://app.meteora.ag/dlmm/${id}`
             : `https://solscan.io/${tx ? "tx" : label === "Mint" ? "token" : "account"}/${id}`;
-          elements.push({ type: "text", text: `${label} · ` },
-            { type: "link", url, text: explorer },
-            { type: "text", text: "\n" },
-            { type: "text", text: id, style: { code: true } },
-            { type: "text", text: "\n" });
+          if (label === "Wallet") {
+            elements.push({ type: "text", text: "Wallet " },
+              { type: "text", text: `${id.slice(0, 4)}…${id.slice(-4)}`, style: { code: true } },
+              { type: "text", text: " · " }, { type: "link", url, text: explorer }, { type: "text", text: "\n" });
+          } else {
+            elements.push({ type: "text", text: `${label} · ` }, { type: "link", url, text: explorer },
+              { type: "text", text: "\n" }, { type: "text", text: id, style: { code: true } }, { type: "text", text: "\n" });
+          }
           formatted = true;
           continue;
         }

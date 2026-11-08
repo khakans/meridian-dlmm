@@ -83,7 +83,7 @@ function liveLines(p, tab, now, solMode, tracked, settlement) {
   const pct = open || p.kind === 'live-close' ? p.pnl_pct : null;
   const lines = [
     `• ${safe(p.pair ?? p.pool_name) || 'Pair belum tercatat'}`,
-    `PnL ${open ? 'terbuka' : 'terealisasi'} ${amount(pnl, unit, true)}${Number.isFinite(pct) ? ` (${amount(pct, '%', true)})` : ''}`,
+    `PnL ${open ? 'terbuka' : 'LP sebelum settlement'} ${amount(pnl, unit, true)}${Number.isFinite(pct) ? ` (${amount(pct, '%', true)})` : ''}`,
     `Dibuka ${!knownStart && approximate ? '≈ ' : ''}${stamp(start)} · Umur ${elapsed(start, end)}`,
   ];
   if (open) {

@@ -20,6 +20,15 @@ test("Slack formats only labelled complete public identifiers", () => {
   ]);
 });
 
+test("Slack lifecycle report keeps the full explorer link with a shortened wallet label", () => {
+  const wallet = bs58.encode(Buffer.alloc(32, 9));
+  const [block] = slackMessageBlocks(`📊 Meridian • LIVE\nWallet ${wallet}\n\nPosisi & PnL`);
+  const elements = block.elements[0].elements;
+  assert.equal(elements.find(item => item.style?.code).text, `${wallet.slice(0, 4)}…${wallet.slice(-4)}`);
+  assert.equal(elements.find(item => item.type === "link").url, `https://solscan.io/account/${wallet}`);
+  assert.deepEqual(elements.filter(item => item.style?.bold).map(item => item.text), ["📊 Meridian • LIVE", "Posisi & PnL"]);
+});
+
 test("Slack owner DM reuses every admin section and rejects stale, repeated and foreign actions", async t => {
   t.mock.method(globalThis, "fetch", async () => { throw new Error("Network disabled in Slack console test"); });
   const files = new Map();

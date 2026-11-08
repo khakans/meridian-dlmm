@@ -22,7 +22,6 @@ import { positionWrites, reconcilePositionWrites } from "./position-journal.js";
 import { readRpc } from "./rpc.js";
 import { withWalletLock } from "./transactions.js";
 import { paperDay } from "./paper-accounting.js";
-import { getPerformanceHistory } from "../performance.js";
 import { paperPnlLines, paperRealizedLine, signed, summarizePaper } from "./pnl-summary.js";
 import { openPositions, positionsPage, positionTarget } from "./positions-view.js";
 import { exposureStillPresent } from "./events.js";
@@ -574,14 +573,14 @@ async function lifecycleStatusLines(detailed = false) {
     getMyPositions({ silent: true }),
   ]);
   const lines = [
-    `Wallet on-chain ${wallet.wallet || book.wallet || "belum tersedia"}`,
-    `Saldo ${!wallet.error && Number.isFinite(wallet.sol) ? `${wallet.sol.toFixed(4)} SOL` : "belum tersedia"}`,
-    `Lifecycle entry · ${store.data.paused ? "STOPPED" : "RUNNING"}`,
+    `Saldo ${!wallet.error && Number.isFinite(wallet.sol) ? `${wallet.sol.toFixed(4)} SOL` : "belum tersedia"} · Entry otomatis ${store.data.paused ? "dijeda" : "aktif"}`,
+    `Monitor ${monitor?.healthy() ? "siap" : "belum siap"} · RPC wallet ${wallet.error ? "gagal" : "OK"}`,
+    `Wallet ${wallet.wallet || book.wallet || "belum tersedia"}`,
   ];
   const settlements = config.standalone.shadow ? [] : settlementRows();
   const unsettled = settlements.filter(r => !settlementComplete(r));
-  lines.push(`Kesehatan · monitor ${monitor?.healthy() ? "siap" : "belum siap"} · RPC wallet ${wallet.error ? "gagal" : "OK"}${unsettled.length ? ` · ${unsettled.length} settlement belum selesai` : ""}`);
   if (detailed) {
+    lines.push("", "Diagnostik");
     const check = await refreshPreflight();
     lines.push(`Preflight · pool ${check.pool} · quote keluar ${check.quote}`);
     lines.push(`Simulasi build entry · ${check.simulation}`);
@@ -592,18 +591,18 @@ async function lifecycleStatusLines(detailed = false) {
       lines.push(`• ${mint.slice(0, 8)} · ${d.current} wallet / ${config.standalone.windowSec}s · ${d.wider} / ${Math.max(300,config.standalone.windowSec)}s${d.spreadSec == null ? "" : ` · selisih ${d.spreadSec}s`} · ${d.reason}`);
     }
   }
+  lines.push("", "Posisi & PnL");
   if (book.error || !Array.isArray(book.positions)) {
     lines.push("Posisi dan PnL belum tersedia.");
   } else {
     const unit = config.management.solMode ? "SOL" : "USD";
     const known = book.positions.filter(p => Number.isFinite(p.pnl_usd) && !p.pnl_pct_suspicious);
     const pnl = known.reduce((sum, p) => sum + p.pnl_usd, 0);
-    lines.push(`Posisi on-chain ${book.positions.length}`);
-    lines.push(`PnL on-chain terbuka ${known.length ? `${signed(pnl)} ${unit}` : book.positions.length ? "belum tersedia" : "—"}${known.length < book.positions.length ? ` (${known.length}/${book.positions.length} terukur)` : ""}`);
+    lines.push(`${book.positions.length} posisi on-chain terbuka · PnL terbuka ${known.length ? `${signed(pnl)} ${unit}` : book.positions.length ? "belum tersedia" : "—"}${known.length < book.positions.length ? ` (${known.length}/${book.positions.length} terukur)` : ""}`);
     for (const p of book.positions.slice(0, 10)) {
-      const pct = !p.pnl_pct_suspicious && Number.isFinite(p.pnl_pct) ? `${p.pnl_pct.toFixed(2)}%` : "PnL belum tersedia";
-      const range = typeof p.in_range === "boolean" ? (p.in_range ? "in range" : "out of range") : "range belum tersedia";
-      lines.push(`• ${String(p.pair || p.position).slice(0, 80)} · ${pct} · ${range}`);
+      const pct = !p.pnl_pct_suspicious && Number.isFinite(p.pnl_pct) ? `${p.pnl_pct > 0 ? "+" : ""}${p.pnl_pct.toFixed(2)}%` : "PnL belum tersedia";
+      const range = typeof p.in_range === "boolean" ? (p.in_range ? "di dalam range" : "di luar range") : "range belum tersedia";
+      lines.push(`• ${String(p.pair || p.position).replace(/[<>&\r\n]/g, " ").slice(0, 80)} · ${pct} · ${range}`);
     }
     if (book.positions.length > 10) lines.push(`+${book.positions.length - 10} posisi lainnya`);
   }
@@ -627,18 +626,15 @@ async function lifecycleStatusLines(detailed = false) {
     const settled = settlements.filter(row => settlementComplete(row) && row.updatedAt >= from);
     const priced = settled.filter(row => Number.isFinite(row.netSol));
     const missing = settled.length - priced.length;
-    lines.push(`PnL net settlement ${priced.length ? signed(priced.reduce((total, row) => total + row.netSol, 0)) + " SOL" : "—"} · ${priced.length} terukur · ${unsettled.length} tertunda${missing ? ` · ${missing} tanpa data lengkap` : ""}`);
-    const closed = getPerformanceHistory({ hours: 24, limit: 10000 }).positions.filter(p =>
-      Date.parse(p.closed_at) >= from && Number.isFinite(p.pnl_usd) && p.pnl_source !== "unavailable");
-    const estimated = closed.filter(p => p.pnl_source === "cached").length;
-    lines.push(closed.length ? `PnL LP sebelum settlement · ${signed(closed.reduce((n,p) => n + p.pnl_usd, 0))} USD · ${closed.length} posisi${estimated ? ` (${estimated} estimasi)` : ""}` : "PnL LP ditutup · belum ada catatan");
+    lines.push(`PnL net setelah settlement ${priced.length ? signed(priced.reduce((total, row) => total + row.netSol, 0)) + " SOL" : "—"} · ${priced.length} terukur · ${unsettled.length} tertunda${missing ? ` · ${missing} tanpa data lengkap` : ""}`);
   }
   const signals = Object.values(store.data.signals).filter(signal => now - signal.createdAt < 86_400_000);
   const discovery = signals.filter(signal => signal.source === "discovery").length;
-  lines.push(`Entry 24 jam · Discovery ${discovery} kandidat · Convergence ${signals.length - discovery} sinyal`);
+  lines.push("", "Sinyal · 24 jam", `Discovery ${discovery} kandidat · Convergence ${signals.length - discovery} sinyal`);
   const walletMints = Object.values(store.data.convergenceDiagnostics ?? {}).filter(d => now - d.at < 86_400_000);
   const qualifyingMints = walletMints.filter(d => d.current > 0).length;
-  lines.push(`Convergence · ${Object.keys(store.data.wallets).length} wallet dipantau · ${qualifyingMints} mint dengan deposit yang lolos (24j) · trigger ${config.standalone.walletThreshold} wallet / ${config.standalone.windowSec}s`);
+  lines.push(`${Object.keys(store.data.wallets).length} wallet dipantau · ${qualifyingMints} mint dengan deposit yang lolos`,
+    `Trigger Convergence ${config.standalone.walletThreshold} wallet pada token yang sama dalam ${config.standalone.windowSec} detik`);
   if (config.standalone.shadow) {
     const paper = store.data.paper;
     const open = Object.values(paper?.open ?? {}).filter(p => p.mirror);
@@ -646,9 +642,16 @@ async function lifecycleStatusLines(detailed = false) {
     lines.push(`Mirror · ${open.length} terbuka · ${closed.length} selesai/24j · ${open.filter(p => p.exit).length} tunggu settlement`);
   }
   const { received, retries, waiting, passed, dropped, reasons } = discoveryStats;
-  lines.push(`Discovery sejak restart ${received} masuk · ${waiting} antre · ${retries} retry · ${passed} lolos · ${dropped} kedaluwarsa/tergeser`);
+  lines.push("", "Screening Discovery · sejak restart",
+    `${received} masuk · ${waiting} antre · ${retries} retry · ${passed} lolos · ${dropped} kedaluwarsa/tergeser`);
   const topReasons = Object.entries(reasons).sort((a, b) => b[1] - a[1]).slice(0, 3);
-  if (topReasons.length) lines.push(`Kendala ${topReasons.map(([reason, n]) => `${reason} ×${n}`).join(" · ")}`);
+  const reasonLabels = {
+    "botHoldersPercentage failed": "holder bot",
+    "volume outside limits or unknown": "volume",
+    "Token fees below threshold or unknown": "fee token",
+    "Token data is stale or has no timestamp": "data token kedaluwarsa",
+  };
+  if (topReasons.length) lines.push(`Penolakan terbanyak · ${topReasons.map(([reason, n]) => `${n} ${reasonLabels[reason] ?? reason}`).join(" · ")}`);
   if (detailed && config.standalone.shadow) {
     try {
       const saved = store.database.get("overnight");
