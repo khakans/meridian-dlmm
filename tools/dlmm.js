@@ -280,6 +280,7 @@ export async function deployPosition({
   before_submit,
   on_prepared,
   expected_active_bin,
+  assert_entry_active,
 }) {
   pool_address = normalizeMint(pool_address);
   if (typeof before_submit !== "function") throw new Error("Deploy requires a wallet-signal recheck (before_submit)");
@@ -564,7 +565,8 @@ export async function deployPosition({
       const tx = await buildPosition(pool, wallet.publicKey, newPosition.publicKey,
         totalXLamports, totalYLamports, minBinId, maxBinId, strategyType);
       await before_submit?.();
-      const txHash = await sendPositionWrite(getConnection(), tx, [wallet, newPosition], newPosition.publicKey.toString(), "entry");
+      const txHash = await sendPositionWrite(getConnection(), tx, [wallet, newPosition], newPosition.publicKey.toString(), "entry",
+        undefined, assert_entry_active);
       txHashes.push(txHash);
     }
 

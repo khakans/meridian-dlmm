@@ -169,6 +169,7 @@ async function refreshPreflight() {
 // ─── Signal pursuit ──────────────────────────────────────────────────────────
 
 function onSignal(signal) {
+  if (store.data.paused || signal.done) return;
   signalQueue.push(signal);
   void drainSignals();
 }
@@ -179,6 +180,7 @@ async function drainSignals() {
   try {
     while (signalQueue.length && !shuttingDown) {
       const signal = signalQueue.shift();
+      if (signal.done || store.data.paused) continue;
       try {
         await pursueSignal(signal);
       } catch (e) {
@@ -213,6 +215,7 @@ async function pursueSignal(signal) {
 // One entry attempt. Returns null when the signal is finished (entered,
 // terminal rejection, or fatal condition), or a reason string to retry.
 async function attemptEntry(signal) {
+  if (store.data.paused || signal.done) return null;
   const mint = signal.mint;
   if (!config.standalone.shadow && Object.values(store.data.attempts).some(a => a.status === "submitting" || a.status === "review_required")) {
     return "an earlier entry needs on-chain reconciliation";
@@ -332,7 +335,7 @@ async function attemptEntry(signal) {
     if (!Number.isSafeInteger(entry.binId) || (await getActiveBin({ pool_address: pool.pool_address })).binId !== entry.binId) {
       return "active bin changed after entry validation";
     }
-    if (shuttingDown || Date.now() >= signal.deadline) return "entry window expired";
+    if (shuttingDown || store.data.paused || signal.done || Date.now() >= signal.deadline) return "entry stopped or expired";
     paper.realized[model.variant] ??= 0;
     paper.open[model.id] = model;
     store.data.attempts[mint] = { at: Date.now(), mint, pool: pool.pool_address, status: "entered", amountSol: amountY };
@@ -363,6 +366,9 @@ async function attemptEntry(signal) {
     bins_above: binsAbove,
     expected_active_bin: entry.binId,
     strategy: config.strategy.strategy,
+    assert_entry_active: () => {
+      if (shuttingDown || store.data.paused || signal.done || Date.now() >= signal.deadline) throw Error("Entry stopped or expired before broadcast");
+    },
     before_submit: async (stage = "lp") => {
       // Always recheck before the pre-deploy swap AND before the first LP creation tx.
       // Subsequent chunks of a multi-tx LP creation skip recheck so a half-built position completes.
@@ -413,7 +419,7 @@ async function attemptEntry(signal) {
 // exposure, the market has not run away since screening, and spendable funds
 // cover the entry. Returns null when everything holds, else the reason.
 async function finalRecheck(signal, screened, simulatedSol = null) {
-  if (shuttingDown || Date.now() >= signal.deadline) return "entry window expired";
+  if (shuttingDown || store.data.paused || signal.done || Date.now() >= signal.deadline) return "entry stopped or expired";
   let present = 0;
   for (const e of signal.events) {
     try { if (await exposureStillPresent(e)) present++; } catch { /* unreadable position = not confirmed */ }
@@ -434,6 +440,7 @@ async function finalRecheck(signal, screened, simulatedSol = null) {
   const balances = simulatedSol == null ? await getWalletBalances({ force: true, nativeOnly: true }) : { sol: simulatedSol };
   if (balances.error || !Number.isFinite(balances.sol)) return "balance read unavailable";
   if (balances.sol < config.management.minSolToOpen + config.management.gasReserve) return "insufficient spendable SOL";
+  if (shuttingDown || store.data.paused || signal.done || Date.now() >= signal.deadline) return "entry stopped or expired";
   return null;
 }
 
@@ -556,6 +563,7 @@ async function lifecycleStatusLines(detailed = false) {
   const lines = [
     `Wallet on-chain ${wallet.wallet || book.wallet || "belum tersedia"}`,
     `Saldo ${!wallet.error && Number.isFinite(wallet.sol) ? `${wallet.sol.toFixed(4)} SOL` : "belum tersedia"}`,
+    `Lifecycle entry · ${store.data.paused ? "STOPPED" : "RUNNING"}`,
   ];
   const settlements = config.standalone.shadow ? [] : settlementRows();
   const unsettled = settlements.filter(r => !["swapped", "no_balance"].includes(r.status));
@@ -761,6 +769,20 @@ export async function startStandalone() {
   }
   const adminOptions = {
     monitor,
+    lifecyclePaused: () => Boolean(store.data.paused),
+    setLifecyclePaused(paused) {
+      if (store.data.paused === paused) return;
+      const now = Date.now();
+      const previous = store.data;
+      const signals = paused ? Object.fromEntries(Object.entries(previous.signals).map(([mint, signal]) =>
+        [mint, signal.done ? signal : { ...signal, done: true, reason: "lifecycle entry stopped", closedAt: now, cooldownUntil: now }])) : previous.signals;
+      // Persist the control and cancelled signals together, then invalidate in-memory work.
+      store.database.saveMonitor({ ...previous, signals, paused, entryResumedAt: paused ? previous.entryResumedAt : now }, store.historyIds);
+      for (const [mint, signal] of Object.entries(signals)) Object.assign(previous.signals[mint], signal);
+      previous.paused = paused;
+      if (paused) signalQueue.length = 0;
+      else previous.entryResumedAt = now;
+    },
     statusDetails: () => lifecycleStatusLines(true),
     positionDetails: (tab, page) => positionsPage({
       store, tab, page, readBook,
@@ -790,7 +812,7 @@ export async function startStandalone() {
       store.data.preflightCandidate = { mint, pool: screened.pool.pool_address, at: Date.now() };
       const now = Date.now();
       const prior = store.data.signals[mint];
-      if (!shuttingDown && (!prior || (prior.done && now >= prior.cooldownUntil))) {
+      if (!shuttingDown && !store.data.paused && (!prior || (prior.done && now >= prior.cooldownUntil))) {
         const signal = { mint, pool: screened.pool.pool_address, source: "discovery", sources, events: [],
           createdAt: now, deadline: now + config.standalone.screeningDeadlineSec * 1000, done: false };
         store.data.signals[mint] = signal;

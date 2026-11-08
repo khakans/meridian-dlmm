@@ -52,6 +52,9 @@ test('position signature survives a timeout and can be reconciled after reopenin
       },
     };
     assert.equal((await simulateLegacy(connection, tx, payer.publicKey, blockhash)).err, null);
+    await assert.rejects(sendPositionWrite(connection, tx, [payer], position, 'entry', db,
+      () => { throw Error('entry stopped'); }), /entry stopped/);
+    assert.deepEqual(positionWrites(position, db), []);
     await assert.rejects(sendPositionWrite(connection, tx, [payer], position, 'entry', db), /timeout after send/);
     db.db.close();
     db = openModeDatabase('live', dir);

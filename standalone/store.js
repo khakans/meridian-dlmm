@@ -80,7 +80,8 @@ export function acceptEvents(store, events, options, now = Date.now()) {
     };
     if (existing && (!existing.done || now < existing.cooldownUntil)) continue;
     // A completed signal cannot be reused after its cooldown.
-    const fresh = recent.filter(e => !existing || e.at > existing.closedAt);
+    if (store.data.paused) continue;
+    const fresh = recent.filter(e => e.at > (store.data.entryResumedAt ?? 0) && (!existing || e.at > existing.closedAt));
     if (fresh.length < options.walletThreshold) continue;
     const signal = { mint, createdAt: now, deadline: now + options.screeningDeadlineSec * 1000, nextCheck: now, events: fresh, done: false };
     store.data.signals[mint] = signal;

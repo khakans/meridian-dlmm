@@ -34,6 +34,7 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   let request = 0;
   let card;
   let restarts = 0;
+  let lifecycleIsPaused = false;
   const closedPositions = [];
   const target = { id: "paper-position-1", label: "MEME/SOL" };
   const otherTarget = { id: "paper-position-2", label: "OTHER/SOL" };
@@ -55,6 +56,8 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   const slack = createSlackConsole({
     client, channel: "D1", owner: "U1", team: "T1", appId: "A1",
     restart: async () => { restarts++; },
+    lifecyclePaused: () => lifecycleIsPaused,
+    setLifecyclePaused: value => { lifecycleIsPaused = value; },
     positionDetails: async (tab, page) => ({
       text: `Positions · ${tab} · Halaman ${page + 1}/2`,
       tab, page, pages: 2, tabs: ["open", "closed", "cancelled"],
@@ -90,6 +93,15 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   assert.equal(replies.length, 0);
   await slash("menu");
   const menuTs = card.ts;
+  await click(find("Stop Lifecycle"));
+  await click(find("Batal"));
+  assert.equal(lifecycleIsPaused, false);
+  await click(find("Stop Lifecycle"));
+  await click(find("Konfirmasi lifecycle"));
+  assert.equal(lifecycleIsPaused, true);
+  await click(find("Start Lifecycle"));
+  await click(find("Konfirmasi lifecycle"));
+  assert.equal(lifecycleIsPaused, false);
   await click(find("Positions"));
   assert.match(card.text, /open · Halaman 1/);
   await click(find("Berikutnya"));

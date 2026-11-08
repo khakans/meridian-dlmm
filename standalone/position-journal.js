@@ -18,7 +18,7 @@ export async function simulateLegacy(connection, tx, payer, blockhash) {
     { sigVerify: false, commitment: 'confirmed' })).value;
 }
 
-export async function sendPositionWrite(connection, tx, signers, position, stage, db = modeDatabase()) {
+export async function sendPositionWrite(connection, tx, signers, position, stage, db = modeDatabase(), assertActive) {
   if (db.mode !== 'live' || process.env.DRY_RUN === 'true') throw Error('Position submission requires Live');
   const validity = await connection.getLatestBlockhash('confirmed');
   const simulation = await simulateLegacy(connection, tx, signers[0].publicKey, validity.blockhash);
@@ -27,6 +27,7 @@ export async function sendPositionWrite(connection, tx, signers, position, stage
   const bytes = tx.serialize();
   const signature = bs58.encode(tx.signature);
   const row = { signature, stage, ...validity, at: Date.now(), status: 'pending' };
+  assertActive?.();
   save(position, row, db);
   const submitted = await connection.sendRawTransaction(bytes, { maxRetries: 2 });
   if (submitted !== signature) throw Error('Unexpected transaction signature');

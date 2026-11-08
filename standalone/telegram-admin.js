@@ -224,11 +224,14 @@ function fmtValue(setting, slack = false) {
   return `${v}${setting.unit && setting.unit !== "%" ? ` ${setting.unit}` : setting.unit === "%" ? "%" : ""}`;
 }
 
-function rootKeyboard() {
+function rootKeyboard(lifecyclePaused) {
   const mode = `🌑 Shadow: ${config.standalone.shadow ? "ON" : "OFF"}`;
   return [
     [{ text: "👛 Wallets", callback_data: "s:wallets" }, { text: "🖥 Status", callback_data: "s:status" }],
     [{ text: "📋 Positions", callback_data: "s:positions" }],
+    ...(lifecyclePaused == null ? [] : [[{
+      text: lifecyclePaused ? "▶️ Start Lifecycle" : "⏸ Stop Lifecycle", callback_data: "m:lifecycle",
+    }]]),
     ...SECTIONS.map(s => [{ text: s.title, callback_data: `s:${s.id}` }]),
     [{ text: "🔑 Bot key", callback_data: "s:key" }, { text: mode, callback_data: "m:shadow" }],
     [{ text: "♻️ Restart bot", callback_data: "m:restart" }],
@@ -280,7 +283,7 @@ export const _test = { SECTIONS, byKey, editHint, validate, sectionMenu, fmtValu
 
 export function createAdminConsole(transport, {
   monitor = null, activeSignals = null, restart, statusDetails, positionDetails, listCloseTargets, forceClosePositions,
-  resetPnl, slack = false,
+  resetPnl, lifecyclePaused, setLifecyclePaused, slack = false,
 } = {}) {
   const { sendMessage, sendMenu, editMenu } = transport;
   const answerCallbackQuery = transport.answerCallbackQuery ?? (async () => {});
@@ -311,7 +314,7 @@ export function createAdminConsole(transport, {
   }
 
   async function viewRoot(note = "") {
-    await render(note ? `${rootText()}\n\n${note}` : rootText(), rootKeyboard());
+    await render(note ? `${rootText()}\n\n${note}` : rootText(), rootKeyboard(lifecyclePaused?.()));
   }
 
   async function viewSection(sectionId, note = "") {
@@ -441,6 +444,19 @@ export function createAdminConsole(transport, {
     try {
       if (data === "x:cancel") { pending = null; return void await viewRoot(); }
       if (data === "s:root") { pending = null; return void await viewRoot(); }
+      if (data === "m:lifecycle" && lifecyclePaused && setLifecyclePaused) {
+        pending = { kind: "lifecycle", paused: !lifecyclePaused() };
+        return void await render(
+          `${pending.paused ? "Jeda entry otomatis?" : "Mulai entry otomatis?"}\nExit posisi terbuka, settlement, dan laporan tetap berjalan.`,
+          [[{ text: "Konfirmasi lifecycle", callback_data: "m:lifecycle-confirm" }, { text: "Batal", callback_data: "s:root" }]],
+        );
+      }
+      if (data === "m:lifecycle-confirm" && setLifecyclePaused && pending?.kind === "lifecycle") {
+        const { paused } = pending;
+        pending = null;
+        await setLifecyclePaused(paused);
+        return void await viewRoot(paused ? "Entry otomatis dijeda." : "Entry otomatis aktif untuk sinyal baru.");
+      }
       if (data.startsWith("s:")) { pending = null; return void await viewSection(data.slice(2)); }
       if (slack && forceClosePositions && data.startsWith("close:")) {
         if (data === "close:confirm") {
