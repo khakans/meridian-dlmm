@@ -1,3 +1,5 @@
+import { isActivePaperVariant } from './entry-plans.js';
+
 export const signed = value => `${value >= 0 ? "+" : ""}${value.toFixed(4)}`;
 
 export function summarizePaper(paper, from, to = Date.now()) {
@@ -49,5 +51,3 @@ export function paperPnlLines(summary, detailed) {
     return `PnL Shadow (${label}) · terbuka ${open} · terealisasi ${realized}`;
   });
 }
-import { isActivePaperVariant } from './entry-plans.js';
-

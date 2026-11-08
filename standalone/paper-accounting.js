@@ -1,3 +1,5 @@
+import { isActivePaperVariant } from './entry-plans.js';
+
 const Q = 1n << 64n;
 const integer = value => BigInt(value.toString());
 
@@ -121,5 +123,3 @@ export function recommendPaperVariant(results, now) {
   const winner = comparisons[0];
   return winner?.train > 0 && winner.test > 0 ? winner : null;
 }
-import { isActivePaperVariant } from './entry-plans.js';
-
