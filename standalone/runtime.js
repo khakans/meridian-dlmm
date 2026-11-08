@@ -17,7 +17,7 @@ import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
 import { isActivePaperVariant } from "./entry-plans.js";
 import { mirrorExitReason, prepareMirrorPosition, startPaper, validateExitQuote } from "./paper.js";
-import { advanceSettlement, dueSettlements, settlementRows } from "./settlement.js";
+import { advanceSettlement, dueSettlements, settlementComplete, settlementRows } from "./settlement.js";
 import { positionWrites, reconcilePositionWrites } from "./position-journal.js";
 import { readRpc } from "./rpc.js";
 import { withWalletLock } from "./transactions.js";
@@ -96,7 +96,7 @@ async function reconcileEntries() {
 
 function riskGate(positions, cash, shadow, now = Date.now()) {
   if (shadow ? positions.some(p => p.exit || p.manualExit || p.hardLowerExit) :
-    settlementRows().some(row => !["swapped", "no_balance"].includes(row.status))) {
+    settlementRows().some(row => !settlementComplete(row))) {
     return "position settlement pending";
   }
   const values = positions.map(p => shadow
@@ -131,8 +131,9 @@ function startSettlementWorker() {
       if (result?.status === "closing" && result.retryClose && !shuttingDown) {
         await executeTool("close_position", { position_address: result.id, reason: "resume interrupted close" });
       }
-      if (["swapped", "no_balance"].includes(result?.status)) {
-        await notify(`✅ LP settlement selesai\nPosition ${result.id}\nPnL net ${Number.isFinite(result.netSol) ? signed(result.netSol) + " SOL" : "belum tersedia"}${result.signature ? "\nTx: " + result.signature : ""}`);
+      if (result && settlementComplete(result)) {
+        const dust = result.status === "dust_remaining" ? `\nSisa token di wallet ≈ ${result.dustSol.toFixed(8)} SOL` : "";
+        await notify(`✅ LP settlement selesai\nPosition ${result.id}\nPnL net ${Number.isFinite(result.netSol) ? signed(result.netSol) + " SOL" : "belum tersedia"}${dust}${result.signature ? "\nTx: " + result.signature : ""}`);
       }
     } catch { log("settlement_warn", "Settlement retry unavailable"); }
     finally { settlementBusy = false; }
@@ -566,7 +567,7 @@ async function lifecycleStatusLines(detailed = false) {
     `Lifecycle entry · ${store.data.paused ? "STOPPED" : "RUNNING"}`,
   ];
   const settlements = config.standalone.shadow ? [] : settlementRows();
-  const unsettled = settlements.filter(r => !["swapped", "no_balance"].includes(r.status));
+  const unsettled = settlements.filter(r => !settlementComplete(r));
   lines.push(`Kesehatan · monitor ${monitor?.healthy() ? "siap" : "belum siap"} · RPC wallet ${wallet.error ? "gagal" : "OK"}${unsettled.length ? ` · ${unsettled.length} settlement belum selesai` : ""}`);
   if (detailed) {
     const check = await refreshPreflight();
@@ -611,7 +612,7 @@ async function lifecycleStatusLines(detailed = false) {
     const recovering = Object.values(store.data.attempts).filter(row => row.status === "submitting").length;
     const review = Object.values(store.data.attempts).filter(row => row.status === "review_required").length;
     if (recovering || review) lines.push(`Recovery entry · ${recovering} rekonsiliasi · ${review} perlu diperiksa`);
-    const settled = settlements.filter(row => ["swapped", "no_balance"].includes(row.status) && row.updatedAt >= from);
+    const settled = settlements.filter(row => settlementComplete(row) && row.updatedAt >= from);
     const priced = settled.filter(row => Number.isFinite(row.netSol));
     const missing = settled.length - priced.length;
     lines.push(`PnL net settlement ${priced.length ? signed(priced.reduce((total, row) => total + row.netSol, 0)) + " SOL" : "—"} · ${priced.length} terukur · ${unsettled.length} tertunda${missing ? ` · ${missing} tanpa data lengkap` : ""}`);

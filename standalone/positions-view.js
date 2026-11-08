@@ -110,6 +110,7 @@ function liveLines(p, tab, now, solMode, tracked, settlement) {
   if (closeTx) lines.push('Transaksi tutup', `Tx ${safe(closeTx)}`);
   if (settlement) lines.push(`Settlement ${safe(settlement.status)} · ${stamp(settlement.updatedAt)}`,
     `PnL net aktual ${amount(settlement.netSol, 'SOL', true)}`);
+  if (Number.isFinite(settlement?.dustSol)) lines.push(`Sisa token di wallet ≈ ${settlement.dustSol.toFixed(8)} SOL`);
   if (settlement?.signature) lines.push(`Tx ${safe(settlement.signature)}`);
   return lines;
 }

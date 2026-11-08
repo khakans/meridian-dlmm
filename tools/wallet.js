@@ -34,7 +34,7 @@ function getJupiterApiKey() {
   return config.jupiter.apiKey || process.env.JUPITER_API_KEY || DEFAULT_JUPITER_API_KEY;
 }
 
-export async function quoteTokenToSol(mint, rawAmount) {
+export async function quoteTokenToSol(mint, rawAmount, { expectedOutput = false } = {}) {
   const params = new URLSearchParams({ inputMint: mint, outputMint: config.tokens.SOL, amount: String(rawAmount) });
   const response = await fetch(`${JUPITER_SWAP_V2_API}/order?${params}`, {
     headers: { 'x-api-key': getJupiterApiKey() }, signal: AbortSignal.timeout(8000),
@@ -46,7 +46,18 @@ export async function quoteTokenToSol(mint, rawAmount) {
   if (quote.inputMint !== mint || quote.outputMint !== config.tokens.SOL ||
       quote.inAmount !== String(rawAmount) || !(minimum > 0 && minimum <= expected) ||
       !Number.isSafeInteger(minimum) || !Number.isSafeInteger(expected)) throw Error('No valid token/SOL exit quote');
-  return minimum / LAMPORTS_PER_SOL;
+  return (expectedOutput ? expected : minimum) / LAMPORTS_PER_SOL;
+}
+
+export const SETTLEMENT_SLIPPAGE_BPS = 100;
+
+export function meetsSettlementMinimum(order, inputMint, outputMint, amount, minimumOut) {
+  const expected = Number(order.outAmount);
+  const threshold = Number(order.otherAmountThreshold);
+  if (order.inputMint !== inputMint || order.outputMint !== outputMint || order.inAmount !== amount ||
+      !Number.isSafeInteger(expected) || !Number.isSafeInteger(threshold) || threshold <= 0 || threshold > expected) return false;
+  const floor = Math.floor(expected * (10_000 - SETTLEMENT_SLIPPAGE_BPS) / 10_000);
+  return threshold >= Math.max(floor, Math.floor(minimumOut * LAMPORTS_PER_SOL + 1e-6));
 }
 
 function getJupiterReferralParams() {
@@ -140,6 +151,7 @@ export async function swapToken({
       amount: amountStr,
       taker: wallet.publicKey.toString(),
     });
+    if (minimumOut != null) search.set("slippageBps", String(SETTLEMENT_SLIPPAGE_BPS));
     const referralParams = getJupiterReferralParams();
     if (referralParams) {
       search.set("referralAccount", referralParams.referralAccount);
@@ -161,9 +173,7 @@ export async function swapToken({
     if (order.errorCode || order.errorMessage) {
       throw new Error(`Swap V2 order error: ${order.errorMessage || order.errorCode}`);
     }
-    if (minimumOut != null && (order.inputMint !== input_mint || order.outputMint !== output_mint ||
-      order.inAmount !== amountStr || !Number.isSafeInteger(Number(order.otherAmountThreshold)) ||
-      Number(order.otherAmountThreshold) < Math.round(minimumOut * LAMPORTS_PER_SOL))) {
+    if (minimumOut != null && !meetsSettlementMinimum(order, input_mint, output_mint, amountStr, minimumOut)) {
       throw Error("Executable swap order does not meet quoted minimum");
     }
 

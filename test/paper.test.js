@@ -9,7 +9,8 @@ import { mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMir
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
 import { paperPnlLines, paperRealizedLine, summarizePaper } from '../standalone/pnl-summary.js';
 import { lowerRangeStop } from '../exit-rules.js';
-import { tokenDelta } from '../standalone/settlement.js';
+import { settlementComplete, tokenDelta } from '../standalone/settlement.js';
+import { meetsSettlementMinimum } from '../tools/wallet.js';
 import { positionsPage } from '../standalone/positions-view.js';
 import { netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
 
@@ -28,6 +29,17 @@ test('hard lower-range stop measures price beyond the lower bin, not position Pn
   assert.equal(lowerRangeStop(97, null, 100, 2), null);
 });
 import { emptyMonitor, openModeDatabase } from '../standalone/database.js';
+
+test('settlement bounds executable slippage and treats recorded dust as complete', () => {
+  const order = { inputMint: 'token', outputMint: 'sol', inAmount: '6052117', outAmount: '52524',
+    otherAmountThreshold: '51998' };
+  const minimum = 52506 * 0.99 / 1e9;
+  assert.equal(meetsSettlementMinimum(order, 'token', 'sol', '6052117', minimum), true);
+  assert.equal(meetsSettlementMinimum({ ...order, otherAmountThreshold: '51121' }, 'token', 'sol', '6052117', minimum), false);
+  assert.equal(meetsSettlementMinimum({ ...order, inAmount: '1' }, 'token', 'sol', '6052117', minimum), false);
+  assert.equal(settlementComplete({ status: 'dust_remaining' }), true);
+  assert.equal(settlementComplete({ status: 'awaiting_quote' }), false);
+});
 
 test('position signature survives a timeout and can be reconciled after reopening SQLite', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-journal-'));

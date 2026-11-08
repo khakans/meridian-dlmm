@@ -3,9 +3,12 @@ import { modeDatabase } from './database.js';
 import { readRpc } from './rpc.js';
 import { netWalletSol, reconcilePositionWrites } from './position-journal.js';
 import { PublicKey } from '@solana/web3.js';
-import { getWalletBalances, quoteTokenToSol, swapToken } from '../tools/wallet.js';
+import { getWalletBalances, quoteTokenToSol, SETTLEMENT_SLIPPAGE_BPS, swapToken } from '../tools/wallet.js';
 
 const active = new Set(['closing', 'awaiting_balance', 'awaiting_quote', 'submitted']);
+const terminal = new Set(['swapped', 'no_balance', 'dust_remaining']);
+export const settlementComplete = row => terminal.has(row.status);
+export const SETTLEMENT_DUST_SOL = 0.0001;
 export const settlementRows = () => Object.values(modeDatabase().get('settlements', {}));
 
 function save(row) {
@@ -21,7 +24,7 @@ function save(row) {
         deployed_at: row.deployed_at, close_txs: row.txs, close_reason: row.reason,
       });
     }
-    if (row.status === 'swapped' || row.status === 'no_balance') {
+    if (settlementComplete(row)) {
       db.append('live-settlement', row.id, row.updatedAt, row, row.netSol);
     }
   });
@@ -128,7 +131,11 @@ export async function advanceSettlement(row) {
     const surplus = BigInt(token?.raw_balance ?? 0) - BigInt(row.baseline);
     if (surplus < BigInt(row.raw) || !token) return retry('awaiting_balance', 'withdrawn tokens unavailable');
     // Check the exact amount attributable to the close before preparing a swap.
-    const minimumOut = await quoteTokenToSol(row.mint, row.raw);
+    const expectedOut = await quoteTokenToSol(row.mint, row.raw, { expectedOutput: true });
+    if (expectedOut <= SETTLEMENT_DUST_SOL) {
+      return await finalizeSettlement({ ...row, dustSol: expectedOut, reason: 'residual token below settlement minimum' }, 'dust_remaining');
+    }
+    const minimumOut = expectedOut * (1 - SETTLEMENT_SLIPPAGE_BPS / 10_000);
     const result = await swapToken({ input_mint: row.mint, output_mint: 'SOL',
       amount: Number(row.raw) / 10 ** token.decimals, raw_amount: row.raw, minimumOut,
       beforeExecute: (signature, lastValidBlockHeight) => {
@@ -140,7 +147,8 @@ export async function advanceSettlement(row) {
     }
     if (prepared) return prepared; // Resolve signature before any second submission.
     const status = Number(/\b(400|429)\b/.exec(result.error ?? '')?.[1]);
-    return retry('awaiting_quote', status === 429 ? 'rate limited' : status === 400 ? 'route unavailable' : 'swap preparation failed', status === 429 ? 120_000 : 60_000);
+    const reason = result.error?.includes('does not meet quoted minimum') ? 'order exceeds settlement slippage limit' : 'swap preparation failed';
+    return retry('awaiting_quote', status === 429 ? 'rate limited' : status === 400 ? 'route unavailable' : reason, status === 429 ? 120_000 : 60_000);
   } catch (error) {
     if (prepared) return prepared;
     const status = Number(/\b(400|429)\b/.exec(error.message)?.[1]);
