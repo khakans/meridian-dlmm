@@ -484,6 +484,9 @@ async function lifecycleStatusLines(detailed = false) {
   const now = Date.now();
   const resetAt = store.data.pnlResetAt?.[store.database.mode] ?? 0;
   const from = Math.max(now - 86_400_000, resetAt);
+  if (config.standalone.shadow) {
+    lines.push(...paperPnlLines(summarizePaper(store.data.paper, from, now), detailed));
+  }
   if (resetAt > now - 86_400_000) lines.push(`Periode PnL sejak reset ${new Date(resetAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })} WIB`);
   if (!config.standalone.shadow) {
     const closed = getPerformanceHistory({ hours: 24, limit: 10000 }).positions.filter(p =>
@@ -495,7 +498,6 @@ async function lifecycleStatusLines(detailed = false) {
   if (config.standalone.shadow && config.research.enabled) {
     lines.push(`Riset 24 jam ${research.length} kandidat · ${research.reduce((sum, item) => sum + item.plans.length, 0)} rencana entry`);
     const paper = store.data.paper;
-    lines.push(...paperPnlLines(summarizePaper(paper, from, now), detailed));
     const open = Object.values(paper?.open ?? {});
     const recent = (paper?.closed ?? []).filter(p => p.accountingVersion && Date.now() - p.closedAt < 86_400_000);
     const cancelled = (paper?.cancelled ?? []).filter(p => Date.now() - p.at < 86_400_000).length;

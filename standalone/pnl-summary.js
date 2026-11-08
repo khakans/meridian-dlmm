@@ -36,13 +36,16 @@ export function summarizePaper(paper, from, to = Date.now()) {
 }
 
 export function paperPnlLines(summary, detailed) {
-  const groups = detailed ? summary.variants.slice(0, 10)
-    : summary.variants.filter(g => ["convergence/baseline", "discovery/volatility/spot"].includes(g.variant));
+  const primary = ["convergence/baseline", "discovery/volatility/spot"];
+  const groups = [
+    ...primary.map(variant => summary.variants.find(g => g.variant === variant) ?? { variant }),
+    ...(detailed ? summary.variants.filter(g => !primary.includes(g.variant)).slice(0, 8) : []),
+  ];
   return groups.map(g => {
     const label = g.variant === "convergence/baseline" ? "Convergence" : g.variant.replace(/^discovery\/volatility\//, "Discovery ");
     const open = !g.open ? "—" : !g.marked ? "menunggu valuasi" :
       `${signed(g.openPnl)} SOL${g.marked < g.open ? ` (${g.marked}/${g.open})` : ""}`;
     const realized = g.closed || g.cancelled ? `${signed(g.realized)} SOL` : "—";
-    return `Paper ${label} · terbuka ${open} · terealisasi ${realized}`;
+    return `PnL Shadow (${label}) · terbuka ${open} · terealisasi ${realized}`;
   });
 }
