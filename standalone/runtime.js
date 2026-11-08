@@ -14,7 +14,7 @@ import { MonitorStore, finishSignal } from "./store.js";
 import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
-import { entryPlans } from "./entry-plans.js";
+import { entryPlans, isActivePaperVariant } from "./entry-plans.js";
 import { startPaper, validateExitQuote } from "./paper.js";
 import { paperDay, recommendPaperVariant } from "./paper-accounting.js";
 import { getPerformanceHistory } from "../performance.js";
@@ -438,7 +438,7 @@ async function recordResearch(mint, screened, sources, convergence = null) {
     store.save();
     return `Shadow research: ${current.plans.length} range/shape variants.`;
   }
-  const plans = convergence?.plans ?? await entryPlans(screened.pool);
+  const plans = convergence?.plans ?? entryPlans(screened.pool);
   if (shuttingDown || !config.standalone.shadow) return;
   const latest = records[key];
   records[key] = {
@@ -453,8 +453,7 @@ async function recordResearch(mint, screened, sources, convergence = null) {
   };
   store.save();
   log("research", `${mint} ${plans.length} shadow plans (${sources.join(", ")})`);
-  const fib = plans.find(plan => plan.range === "fibonacci");
-  return `Shadow research: ${plans.length} range/shape variants.${fib ? ` Fibonacci ≈ ${fib.widthBins} bins${fib.wideRange ? " (wide range)" : ""}; ${fib.entryZoneReached ? "upper level reached" : "waiting for upper level"}.` : " Fibonacci waiting for candle history."}`;
+  return `Shadow research: ${plans.length} range/shape variants.`;
 }
 
 async function lifecycleStatusLines(detailed = false) {
@@ -499,8 +498,8 @@ async function lifecycleStatusLines(detailed = false) {
     lines.push(`Riset 24 jam ${research.length} kandidat · ${research.reduce((sum, item) => sum + item.plans.length, 0)} rencana entry`);
     const paper = store.data.paper;
     const open = Object.values(paper?.open ?? {});
-    const recent = (paper?.closed ?? []).filter(p => p.accountingVersion && Date.now() - p.closedAt < 86_400_000);
-    const cancelled = (paper?.cancelled ?? []).filter(p => Date.now() - p.at < 86_400_000).length;
+    const recent = (paper?.closed ?? []).filter(p => p.accountingVersion && isActivePaperVariant(p.variant) && Date.now() - p.closedAt < 86_400_000);
+    const cancelled = (paper?.cancelled ?? []).filter(p => isActivePaperVariant(p.variant) && Date.now() - p.at < 86_400_000).length;
     const pending = open.filter(p => p.exit).length;
     lines.push(`Paper · ${open.filter(p => p.filledAt).length} terisi · ${open.filter(p => !p.filledAt).length} tunggu fill · ${recent.length} selesai/24j · ${cancelled} batal${pending ? ` · ${pending} tunggu quote` : ""}`);
     const rows = (paper?.nav?.["convergence/baseline"] ?? []).filter(r => r.day < paperDay(Date.now()) && r.complete && r.start > 0 && r.end != null).slice(-30);
@@ -519,7 +518,7 @@ async function lifecycleStatusLines(detailed = false) {
     try {
       const saved = store.database.get("overnight");
       lines.push(`Arsip semalam · ${saved.periodWib} · ${saved.uniqueClosedMints} mint selesai`);
-      for (const v of saved.variants.slice(0, 10)) lines.push(`• ${v.variant} · ${signed(v.realized)} SOL · ${v.closed} close`);
+      for (const v of saved.variants.filter(v => isActivePaperVariant(v.variant)).slice(0, 10)) lines.push(`• ${v.variant} · ${signed(v.realized)} SOL · ${v.closed} close`);
     } catch { /* Archive is optional. */ }
   }
   return lines;

@@ -101,7 +101,7 @@ test('paper exits wait for initial range and buffer losing exits while honoring 
   assert.equal(paperCloseRule(p, above, -0.2, lossAt + config.research.paperLossGraceMinutes * minute), 'pumped far above range');
 });
 
-test('quote-only bins convert inventory as price crosses and support absolute Fib ranges', () => {
+test('quote-only bins convert inventory as price crosses and reject retired ranges', () => {
   const active = { binId: 100, price: 1 };
   const range = paperBins({ range: 'volatility', binsBelow: 35 }, active, 100);
   assert.deepEqual(range, { lower: 65, upper: 99, ratio: 1.01 });
@@ -110,8 +110,7 @@ test('quote-only bins convert inventory as price crosses and support absolute Fi
   assert.ok(paperInventory(position, 80).sol < 1);
   assert.equal(paperInventory(position, 64).sol, 0);
   assert.ok(paperInventory(position, 64).tokens > 1);
-  assert.equal(paperBins({ range: 'fibonacci', lower: 0.5, upper: 1.2 }, active, 100), null);
-  assert.ok(paperBins({ range: 'fibonacci', lower: 0.5, upper: 0.8 }, active, 100).upper < 100);
+  assert.equal(paperBins({ range: 'retired', lower: 0.5, upper: 0.8 }, active, 100), null);
 });
 
 test('paper entry checks exit quote and persists an exit awaiting settlement', async () => {

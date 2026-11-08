@@ -4,16 +4,15 @@ import { log } from '../logger.js';
 import { getActiveBin, getPaperBinSnapshot } from '../tools/dlmm.js';
 import { quoteTokenToSol } from '../tools/wallet.js';
 import { markPaperBins, paperRiskBlocked, recordPaperNav, seedPaperBins } from './paper-accounting.js';
+import { isActivePaperVariant } from './entry-plans.js';
 
 const MINUTE = 60_000;
 const COST_SOL = 0.001; // Estimated round-trip network cost, excluding refundable rent.
 
 export function paperBins(plan, active, step) {
+  if (plan.range !== 'volatility') return null;
   const ratio = 1 + step / 10_000;
-  const offsets = plan.range === 'fibonacci'
-    ? [Math.ceil(Math.log(plan.lower / active.price) / Math.log(ratio)), Math.floor(Math.log(plan.upper / active.price) / Math.log(ratio))]
-    : [-plan.binsBelow, -1];
-  const [lower, upper] = offsets;
+  const [lower, upper] = [-plan.binsBelow, -1];
   if (!Number.isSafeInteger(lower) || !Number.isSafeInteger(upper) || upper >= 0 ||
       lower > upper || upper - lower >= 200) return null;
   return { lower: active.binId + lower, upper: active.binId + upper, ratio };
@@ -92,8 +91,8 @@ export function startPaper(store, notify, {
   paper.cancelled ??= [];
   paper.legacy ??= [];
   for (const p of Object.values(paper.open)) {
-    if (p.binSeed) continue;
-    paper.legacy.push({ ...p, archivedAt: Date.now() });
+    if (p.binSeed && p.range === 'volatility') continue;
+    paper.legacy.push({ ...p, archivedAt: Date.now(), archiveReason: p.binSeed ? 'retired strategy' : 'missing entry snapshot' });
     delete paper.open[p.id];
   }
   let stopped = false, busy = false;
@@ -161,8 +160,8 @@ export function startPaper(store, notify, {
       recordPaperNav(paper, Date.now(), config.research.paperBankrollSol);
       const openMints = new Set(Object.values(paper.open).map(p => `${p.source}:${p.mint}`));
       const recentClosed = new Set([
-        ...paper.closed.filter(p => now - p.closedAt < 6 * 60 * MINUTE).map(p => `${p.source}:${p.mint}`),
-        ...paper.cancelled.filter(p => now - p.at < 60 * MINUTE).map(p => `${p.source}:${p.mint}`),
+        ...paper.closed.filter(p => isActivePaperVariant(p.variant) && now - p.closedAt < 6 * 60 * MINUTE).map(p => `${p.source}:${p.mint}`),
+        ...paper.cancelled.filter(p => isActivePaperVariant(p.variant) && now - p.at < 60 * MINUTE).map(p => `${p.source}:${p.mint}`),
       ]);
       const candidateKey = c => `${c.source ?? 'discovery'}:${c.mint}`;
       const candidates = Object.values(store.data.research ?? {}).filter(c =>

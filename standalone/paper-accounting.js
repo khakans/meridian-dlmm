@@ -55,6 +55,7 @@ export function recordPaperNav(paper, now, bankroll) {
   paper.realized ??= {};
   const open = Object.values(paper.open).filter(p => p.binSeed);
   for (const [variant, realized] of Object.entries(paper.realized)) {
+    if (!isActivePaperVariant(variant)) continue;
     const positions = open.filter(p => p.variant === variant);
     const waiting = positions.some(p => !p.mark || now - p.mark.at > 180_000);
     const equity = waiting ? null : bankroll + realized + positions.reduce((n, p) => n + p.mark.pnl, 0);
@@ -120,3 +121,5 @@ export function recommendPaperVariant(results, now) {
   const winner = comparisons[0];
   return winner?.train > 0 && winner.test > 0 ? winner : null;
 }
+import { isActivePaperVariant } from './entry-plans.js';
+

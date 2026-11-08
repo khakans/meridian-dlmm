@@ -39,7 +39,7 @@ export function paperPnlLines(summary, detailed) {
   const primary = ["convergence/baseline", "discovery/volatility/spot"];
   const groups = [
     ...primary.map(variant => summary.variants.find(g => g.variant === variant) ?? { variant }),
-    ...(detailed ? summary.variants.filter(g => !primary.includes(g.variant)).slice(0, 8) : []),
+    ...(detailed ? summary.variants.filter(g => isActivePaperVariant(g.variant) && !primary.includes(g.variant)).slice(0, 8) : []),
   ];
   return groups.map(g => {
     const label = g.variant === "convergence/baseline" ? "Convergence" : g.variant.replace(/^discovery\/volatility\//, "Discovery ");
@@ -49,3 +49,5 @@ export function paperPnlLines(summary, detailed) {
     return `PnL Shadow (${label}) · terbuka ${open} · terealisasi ${realized}`;
   });
 }
+import { isActivePaperVariant } from './entry-plans.js';
+
