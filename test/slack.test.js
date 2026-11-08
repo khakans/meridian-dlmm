@@ -52,7 +52,7 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
     async postMessage(body) {
       const saved = { ...body, ok: true, ts: String(++ts) };
       replies.push(saved);
-      if (saved.blocks) card = saved;
+      if (saved.blocks?.some(block => block.type === "actions")) card = saved;
       return saved;
     },
     async update(body) {
@@ -61,10 +61,14 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
       replies.push(card);
       return card;
     },
+    async delete({ ts }) {
+      if (card?.ts === ts) card = undefined;
+      return { ok: true };
+    },
   } };
   const slack = createSlackConsole({
     client, channel: "D1", owner: "U1", team: "T1", appId: "A1",
-    restart: async () => { restarts++; },
+    restart: async (_send, beforeRestart) => { restarts++; await beforeRestart?.(); },
     lifecyclePaused: () => lifecycleIsPaused,
     setLifecyclePaused: value => { lifecycleIsPaused = value; },
     positionDetails: async (tab, page) => ({
@@ -87,7 +91,7 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   };
   const click = (button, overrides = {}) => slack.action({
     team: { id: "T1" }, user: { id: "U1" }, channel: { id: "D1" },
-    api_app_id: "A1", container: { type: "message", message_ts: card.ts },
+    api_app_id: "A1", container: { type: "message", message_ts: card?.ts },
     trigger_id: String(++request), ...overrides,
   }, button);
   const slash = (command, text = "") => slack.command({
@@ -103,14 +107,26 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   await slash("menu");
   const menuTs = card.ts;
   await click(find("Stop Lifecycle"));
+  assert.equal(card.ts, menuTs);
+  await slack.sendMessage("Laporan rutin");
+  await message("noop");
+  assert.notEqual(card.ts, menuTs);
+  assert.match(card.text, /Jeda entry otomatis/);
+  assert.equal(replies.at(-2).text, "Laporan rutin");
   await click(find("Batal"));
   assert.equal(lifecycleIsPaused, false);
   await click(find("Stop Lifecycle"));
   await click(find("Konfirmasi lifecycle"));
   assert.equal(lifecycleIsPaused, true);
+  assert.equal(card, undefined);
+  assert.match(replies.at(-1).text, /Entry otomatis dijeda/);
+  await slack.sendMessage("Laporan setelah menu selesai");
+  assert.equal(card, undefined);
+  await message("menu");
   await click(find("Start Lifecycle"));
   await click(find("Konfirmasi lifecycle"));
   assert.equal(lifecycleIsPaused, false);
+  await message("menu");
   await click(find("Positions"));
   assert.match(card.text, /open · Halaman 1/);
   await click(find("Berikutnya"));
@@ -118,11 +134,16 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   await click(find("Force Close"));
   assert.match(card.text, /OTHER\/SOL/);
   const confirmClose = find("Konfirmasi tutup");
+  const closeCardTs = card.ts;
   await click(confirmClose, { user: { id: "U2" } });
   assert.equal(closedPositions.length, 0);
   await click(confirmClose);
-  await click(confirmClose);
+  assert.equal(card, undefined);
+  assert.equal(replies.at(-1).text, "Test close result");
+  await click(confirmClose, { container: { type: "message", message_ts: closeCardTs } });
   assert.deepEqual(closedPositions, [[otherTarget]]);
+  await message("menu");
+  await click(find("Positions"));
   await click(find("Close All"));
   await click(find("Batal"));
   assert.equal(closedPositions.length, 1);
@@ -130,6 +151,8 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   assert.match(card.text, /Tutup 2 posisi/);
   await click(find("Konfirmasi tutup"));
   assert.deepEqual(closedPositions, [[otherTarget], [target, otherTarget]]);
+  await message("menu");
+  await click(find("Positions"));
   await click(find("Riwayat tutup"));
   assert.match(card.text, /closed · Halaman 1/);
   await click(find("Muat ulang"));
@@ -145,12 +168,15 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
     for (const setting of section.settings) {
       assert.ok(visible.some(label => label.startsWith(`${setting.label ?? setting.k}:`)), setting.k);
     }
+    const previousTs = card.ts;
     await message("menu");
-    assert.equal(card.ts, menuTs);
+    assert.notEqual(card.ts, previousTs);
   }
   await click(find("RPC & data"));
   await click(find("JUPITER_API_KEY"));
-  assert.match(card.text, /server .env/);
+  assert.match(replies.at(-1).text, /server .env/);
+  await message("menu");
+  await click(find("RPC & data"));
   await click(find("RPC_URL (default)"));
   await message("<https://rpc-new.example|https://rpc-new.example>");
   assert.match(files.get(repoPath(".env")), /RPC_URL=https:\/\/rpc-new.example/);
@@ -158,20 +184,24 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   await click(find("Bot key"));
   assert.ok(!buttons().some(b => b.text.text.includes("Export")));
   await click(find("Signing key setup"));
-  assert.match(card.text, /server .env/);
+  assert.match(replies.at(-1).text, /server .env/);
+  await message("menu");
+  await click(find("Bot key"));
   await click(find("Set read-only address"));
   await slash("cancel");
-  assert.match(card.text, /Cancelled/);
+  assert.match(replies.at(-1).text, /Cancelled/);
+  assert.equal(card, undefined);
   assert.ok(!files.has(repoPath("user-config.json")));
 
   const address = "11111111111111111111111111111111";
   await slash("addwallet", `${address} Watch`);
   await slash("wallets");
-  assert.match(card.text, /Watch/);
+  assert.match(replies.at(-1).text, /Watch/);
   await slash("removewallet", address);
-  assert.match(card.text, /Removed Watch/);
+  assert.match(replies.at(-1).text, /Removed Watch/);
   await slash("status");
-  assert.match(card.text, /Monitor:/);
+  assert.match(replies.at(-1).text, /Monitor:/);
+  assert.equal(card, undefined);
   await message("menu");
   await click(find("Shadow: ON"));
   await click(find("LIVE"));
@@ -183,12 +213,16 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   await click(confirm, { user: { id: "U2" } });
   assert.equal(restarts, 0);
   await click(confirm);
+  assert.equal(card, undefined);
   await click(confirm);
   assert.equal(restarts, 1);
-  const old = find("Cancel");
+  await message("menu");
+  const old = find("Tutup menu");
   await message("menu");
   await click(old);
   assert.match(replies.at(-1).text, /kedaluwarsa/);
+  await click(find("Tutup menu"));
+  assert.equal(card, undefined);
   assert.ok(!JSON.stringify(replies).includes("SECRET_SENTINEL"));
   slack.stop();
 });

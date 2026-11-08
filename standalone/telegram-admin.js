@@ -285,7 +285,7 @@ export function createAdminConsole(transport, {
   monitor = null, activeSignals = null, restart, statusDetails, positionDetails, listCloseTargets, forceClosePositions,
   resetPnl, lifecyclePaused, setLifecyclePaused, slack = false,
 } = {}) {
-  const { sendMessage, sendMenu, editMenu } = transport;
+  const { sendMessage, sendMenu, editMenu, deleteMenu } = transport;
   const answerCallbackQuery = transport.answerCallbackQuery ?? (async () => {});
   const adminContext = { monitor, activeSignals };
   let consoleMessageId = null;
@@ -314,10 +314,24 @@ export function createAdminConsole(transport, {
   }
 
   async function viewRoot(note = "") {
-    await render(note ? `${rootText()}\n\n${note}` : rootText(), rootKeyboard(lifecyclePaused?.()));
+    const keyboard = rootKeyboard(lifecyclePaused?.());
+    if (slack) keyboard.push([{ text: "Tutup menu", callback_data: "x:cancel" }]);
+    await render(note ? `${rootText()}\n\n${note}` : rootText(), keyboard);
   }
 
-  async function viewSection(sectionId, note = "") {
+  async function discardMenu() {
+    consoleMessageId = null;
+    lastRenderSig = null;
+    await deleteMenu();
+  }
+
+  async function finish(note, section) {
+    if (!slack) return section ? viewSection(section, note) : viewRoot(note);
+    await sendMessage(note);
+    await discardMenu();
+  }
+
+  async function viewSection(sectionId, note = "", textOnly = false) {
     const positions = /^positions(?::(open|closed|cancelled):(\d{1,9}))?$/.exec(sectionId);
     if (positions && positionDetails) {
       const view = await positionDetails(positions[1] ?? "open", Number(positions[2] ?? 0));
@@ -342,9 +356,11 @@ export function createAdminConsole(transport, {
     }
     if (sectionId === "wallets") {
       const { wallets } = listSmartWallets();
+      const text = `👛 <b>Monitored wallets</b> (${wallets.length})\n${wallets.map(w => `• <b>${w.name}</b>\nWallet address: <code>${w.address}</code>`).join("\n") || "none — add at least 2 to trigger entries"}${note ? `\n\n${note}` : ""}`;
+      if (textOnly) return void await sendMessage(text);
       const rows = wallets.map(w => [{ text: `🗑 ${w.name}`, callback_data: `w:rm:${w.address}` }]);
       return void await render(
-        `👛 <b>Monitored wallets</b> (${wallets.length})\n${wallets.map(w => `• <b>${w.name}</b>\nWallet address: <code>${w.address}</code>`).join("\n") || "none — add at least 2 to trigger entries"}${note ? `\n\n${note}` : ""}`,
+        text,
         [...rows, [{ text: "➕ Add wallet", callback_data: "w:add" }, { text: "← Back", callback_data: "s:root" }]],
       );
     }
@@ -442,7 +458,10 @@ export function createAdminConsole(transport, {
     if (cb.message?.message_id) consoleMessageId = cb.message.message_id;
     await answerCallbackQuery(cb.id).catch(() => {});
     try {
-      if (data === "x:cancel") { pending = null; return void await viewRoot(); }
+      if (data === "x:cancel") {
+        pending = null;
+        return void await (slack ? discardMenu() : viewRoot());
+      }
       if (data === "s:root") { pending = null; return void await viewRoot(); }
       if (data === "m:lifecycle" && lifecyclePaused && setLifecyclePaused) {
         pending = { kind: "lifecycle", paused: !lifecyclePaused() };
@@ -455,7 +474,7 @@ export function createAdminConsole(transport, {
         const { paused } = pending;
         pending = null;
         await setLifecyclePaused(paused);
-        return void await viewRoot(paused ? "Entry otomatis dijeda." : "Entry otomatis aktif untuk sinyal baru.");
+        return void await finish(paused ? "Entry otomatis dijeda." : "Entry otomatis aktif untuk sinyal baru.");
       }
       if (data.startsWith("s:")) { pending = null; return void await viewSection(data.slice(2)); }
       if (slack && forceClosePositions && data.startsWith("close:")) {
@@ -463,16 +482,15 @@ export function createAdminConsole(transport, {
           if (pending?.kind !== "force-close") return;
           const { targets, shadow } = pending;
           pending = null;
-          if (shadow !== config.standalone.shadow) return void await sendMessage("Mode berubah. Buka Positions lagi.");
+          if (shadow !== config.standalone.shadow) return void await finish("Mode berubah. Ketik menu untuk membuka Positions lagi.");
           await render("Permintaan close sedang diproses…", []);
-          await sendMessage(await forceClosePositions(targets));
-          return void await viewSection("positions");
+          return void await finish(await forceClosePositions(targets));
         }
         const selection = data.slice(6);
         const one = closePageTargets[Number(selection)];
         const targets = selection === "all" ? await listCloseTargets() : one ? [one] : [];
         if (!targets?.length) {
-          return void await sendMessage(targets ? "Posisi sudah tidak tersedia." : "Posisi on-chain gagal dibaca. Coba lagi.");
+          return void await finish(targets ? "Posisi sudah tidak tersedia." : "Posisi on-chain gagal dibaca. Ketik menu untuk coba lagi.");
         }
         const shadow = config.standalone.shadow;
         pending = { kind: "force-close", targets, shadow };
@@ -488,16 +506,17 @@ export function createAdminConsole(transport, {
         const setting = byKey.get(data.slice(2));
         if (!setting) return;
         const needs = applySetting(setting, !currentValue(setting));
-        return void await viewSection(SECTIONS.find(s => s.settings.includes(setting))?.id, `✅ Saved${needs ? " — ♻️ restart to apply" : ""}`);
+        const result = slack ? `${setting.label ?? setting.k} → ${fmtValue(setting, slack)}` : "Saved";
+        return void await finish(`✅ ${result}${needs ? " — ♻️ restart to apply" : ""}`, SECTIONS.find(s => s.settings.includes(setting))?.id);
       }
       if (slack && (data.startsWith("k:imp") || data.startsWith("k:exp"))) {
-        return void await viewSection("key", "Manage the signing key in the server .env. Restart to load a new key.");
+        return void await finish("Manage the signing key in the server .env. Restart to load a new key.");
       }
       if (data.startsWith("e:")) {
         const setting = byKey.get(data.slice(2));
         if (!setting) return;
         if (slack && setting.kind === "secret") {
-          return void await viewSection("rpc", "Update this API key in the server .env and restart.");
+          return void await finish("Update this API key in the server .env and restart.");
         }
         pending = { kind: "set", setting };
         return void await render(`✏️ <b>${setting.label ?? setting.k}</b>\nCurrent: <code>${fmtValue(setting, slack)}</code>\n\n${editHint(setting)}`, cancelKB());
@@ -509,9 +528,9 @@ export function createAdminConsole(transport, {
       if (data.startsWith("w:rm2:")) {
         const { wallets } = listSmartWallets();
         const w = wallets.find(w => w.address === data.slice(6));
-        if (!w) return void await viewSection("wallets", "⚠️ Wallet not found.");
+        if (!w) return void await finish("⚠️ Wallet not found.", "wallets");
         const res = removeSmartWallet({ address: w.address });
-        return void await viewSection("wallets", res.success ? `🗑 Removed ${w.name}` : `⚠️ ${res.error}`);
+        return void await finish(res.success ? `🗑 Removed ${w.name}` : `⚠️ ${res.error}`, "wallets");
       }
       if (data.startsWith("w:rm:")) {
         const { wallets } = listSmartWallets();
@@ -553,11 +572,15 @@ export function createAdminConsole(transport, {
         const next = data.endsWith(":shadow");
         if (!next && (envValue("DRY_RUN") !== "false" || !process.env.WALLET_PRIVATE_KEY ||
             (slack && process.env.SLACK_ALLOW_LIVE !== "true"))) {
-          return void await sendMessage("Live requires a local signing key and DRY_RUN=false on the server. Slack also requires SLACK_ALLOW_LIVE=true.");
+          const note = "Live requires a local signing key and DRY_RUN=false on the server. Slack also requires SLACK_ALLOW_LIVE=true.";
+          return void await (slack ? finish(note) : sendMessage(note));
         }
         if (!next) parseSecretKey(process.env.WALLET_PRIVATE_KEY);
         if (!restart) return void await sendMessage("Mode switching requires a supervised restart.");
-        return void await restart(sendMessage, () => writeUserConfig({ shadowMode: next }));
+        return void await restart(slack ? finish : sendMessage, async () => {
+          writeUserConfig({ shadowMode: next });
+          if (slack) await discardMenu();
+        });
       }
       if (data === "m:pnlreset" && resetPnl) {
         pending = { kind: "pnlreset", shadow: config.standalone.shadow };
@@ -568,7 +591,7 @@ export function createAdminConsole(transport, {
       if (data === "m:pnlreset2" && resetPnl && pending?.kind === "pnlreset" && pending.shadow === config.standalone.shadow) {
         pending = null;
         await resetPnl();
-        return void await viewSection("status", "Periode PnL baru dimulai.");
+        return void await finish("Periode PnL baru dimulai.", "status");
       }
       if (data === "m:restart") {
         return void await render("♻️ Restart the bot? (takes ~5s)", [
@@ -576,12 +599,12 @@ export function createAdminConsole(transport, {
         ]);
       }
       if (data === "m:restart2") {
-        if (restart) return void await restart(sendMessage);
+        if (restart) return void await (slack ? restart(finish, discardMenu) : restart(sendMessage));
         return void requestRestart();
       }
     } catch (e) {
       log(slack ? "slack_error" : "telegram_error", slack ? "Admin action failed" : `admin callback failed: ${e.message}`);
-      await viewRoot(slack ? "Pengaturan belum bisa diproses. Coba lagi." : `⚠️ ${e.message}`).catch(() => {});
+      await finish(slack ? "Permintaan belum bisa diproses. Ketik menu untuk coba lagi." : `⚠️ ${e.message}`).catch(() => {});
     }
   }
 
@@ -606,7 +629,7 @@ export function createAdminConsole(transport, {
           }
           const needs = applySetting(p.setting, value);
           const sectionId = SECTIONS.find(s => s.settings.includes(p.setting))?.id;
-          return void await viewSection(sectionId, `✅ <b>${p.setting.label ?? p.setting.k}</b> → <code>${fmtValue(p.setting, slack)}</code>${needs ? "\n♻️ Applies after restart" : ""}`);
+          return void await finish(`✅ <b>${p.setting.label ?? p.setting.k}</b> → <code>${fmtValue(p.setting, slack)}</code>${needs ? "\n♻️ Applies after restart" : ""}`, sectionId);
         }
         if (p.kind === "waddr") {
           if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text.trim())) {
@@ -619,7 +642,7 @@ export function createAdminConsole(transport, {
         if (p.kind === "wname") {
           const name = text.trim().slice(0, 40) || "wallet";
           const res = addSmartWallet({ address: p.address, name });
-          return void await viewSection("wallets", res.success ? `✅ Added <b>${name}</b>\n<code>${p.address}</code>` : `⚠️ ${res.error}`);
+          return void await finish(res.success ? `✅ Added <b>${name}</b>\n<code>${p.address}</code>` : `⚠️ ${res.error}`, "wallets");
         }
         if (p.kind === "pkimport") {
           const kp = parseSecretKey(text);
@@ -628,10 +651,10 @@ export function createAdminConsole(transport, {
           return void await viewSection("key", `✅ Key imported — wallet <code>${kp.publicKey.toString()}</code>\nSigning is active now (survives restarts).`);
         }
         if (p.kind === "walletaddr") {
-          if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text.trim())) return void await render("⚠️ Not a valid address — send again, or tap Cancel:", cancelKB());
+          if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text.trim())) throw new Error("Not a valid address");
           writeUserConfig({ walletAddress: text.trim() });
           config.standalone.walletAddress = text.trim();
-          return void await viewSection("key", `✅ Read-only address set: <code>${text.trim()}</code>`);
+          return void await finish(`✅ Read-only address set: <code>${text.trim()}</code>`, "key");
         }
       } catch (e) {
         pending = p;
@@ -640,10 +663,11 @@ export function createAdminConsole(transport, {
     }
 
     const [cmd, ...args] = text.trim().split(/\s+/);
-    if (cmd === "/cancel") { pending = null; return void await viewRoot("Cancelled."); }
+    if (cmd === "/cancel") { pending = null; return void await finish("Cancelled."); }
     if (cmd === "/start" || cmd === "/help" || cmd === "/menu") {
       // An explicit /menu must be visible: reuse the console only when it is fresh.
-      if (consoleMessageId != null && Date.now() - lastRenderAt > STALE_CONSOLE_MS) {
+      if (slack) await discardMenu();
+      else if (consoleMessageId != null && Date.now() - lastRenderAt > STALE_CONSOLE_MS) {
         consoleMessageId = null;
         lastRenderSig = null;
       }
@@ -651,17 +675,17 @@ export function createAdminConsole(transport, {
         ? "DM commands: menu · status · wallets · addwallet ADDRESS NAME · removewallet ADDRESS · cancel"
         : "Commands: /addwallet <address> <name> · /removewallet <address> · /wallets · /status · /cancel");
     }
-    if (cmd === "/status") return void await viewSection("status");
-    if (cmd === "/wallets") return void await viewSection("wallets");
+    if (cmd === "/status") return void await (slack ? sendMessage(await statusText()) : viewSection("status"));
+    if (cmd === "/wallets") return void await viewSection("wallets", "", slack);
     if (cmd === "/addwallet") {
       const address = args[0];
       const name = args.slice(1).join(" ").slice(0, 40) || "wallet";
       const res = addSmartWallet({ address: address ?? "", name });
-      return void await viewSection("wallets", res.success ? `✅ Added <b>${name}</b> <code>${address}</code>` : `⚠️ ${res.error}`);
+      return void await finish(res.success ? `✅ Added <b>${name}</b> <code>${address}</code>` : `⚠️ ${res.error}`, "wallets");
     }
     if (cmd === "/removewallet") {
       const res = removeSmartWallet({ address: args[0] ?? "" });
-      return void await viewSection("wallets", res.success ? `🗑 Removed ${res.removed}` : `⚠️ ${res.error}`);
+      return void await finish(res.success ? `🗑 Removed ${res.removed}` : `⚠️ ${res.error}`, "wallets");
     }
   }
 

@@ -839,7 +839,7 @@ export async function startStandalone() {
         await send("Meridian sedang memproses pekerjaan. Coba restart lagi setelah selesai.");
         return;
       }
-      beforeRestart?.();
+      await beforeRestart?.();
       await shutdown("Admin restart", 1);
     },
   };

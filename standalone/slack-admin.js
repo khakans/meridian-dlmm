@@ -23,7 +23,7 @@ export function createSlackConsole({ client, channel, team, owner, appId, ...adm
     return client.chat.postMessage({ channel, text, blocks, mrkdwn: false, unfurl_links: false, unfurl_media: false });
   };
 
-  async function render(view, page, ts) {
+  async function render(view, page, ts, expires = Date.now() + MENU_TTL) {
     const nonce = randomUUID();
     const paragraphs = plain(view.text).match(/[\s\S]{1,2800}/gu) ?? ["Meridian"];
     const rows = view.keyboard ?? [];
@@ -46,20 +46,59 @@ export function createSlackConsole({ client, channel, team, owner, appId, ...adm
       blocks.push({ type: "actions", elements });
     }
     const message = { channel, text, blocks, mrkdwn: false };
-    card = undefined;
     const response = ts
       ? await client.chat.update({ ...message, ts })
       : await client.chat.postMessage({ ...message, unfurl_links: false, unfurl_media: false });
     if (!response.ok || !response.ts) throw new Error("Slack card delivery failed");
-    card = { view, ts: response.ts, expires: Date.now() + MENU_TTL, actions };
+    card = { view, page, ts: response.ts, expires, actions };
     return { ok: true, result: { message_id: response.ts } };
+  }
+
+  async function removeCard(ts) {
+    try {
+      const result = await client.chat.delete({ channel, ts });
+      if (result.ok || result.error === "message_not_found") return;
+    } catch (error) {
+      if (error.data?.error === "message_not_found") return;
+    }
+    await client.chat.update({ channel, ts, text: "Menu ditutup.", blocks: [] }).catch(() => {
+      log("slack_error", "Could not remove inactive Meridian menu");
+    });
   }
 
   const onUpdate = createAdminConsole({
     sendMessage,
     sendMenu: (text, keyboard) => render({ text, keyboard }, 0),
-    editMenu: (ts, text, keyboard) => render({ text, keyboard }, 0, ts),
+    editMenu: async (_ts, text, keyboard) => {
+      if (!card) return null;
+      const previous = card;
+      try {
+        return await render({ text, keyboard }, 0, previous.ts);
+      } catch (error) {
+        card = undefined;
+        await removeCard(previous.ts);
+        throw error;
+      }
+    },
+    deleteMenu: async () => {
+      const previous = card;
+      card = undefined;
+      if (previous) await removeCard(previous.ts);
+    },
   }, { ...adminOptions, slack: true });
+
+  async function sendNotification(value) {
+    const result = await sendMessage(value);
+    if (card && !closed) {
+      queue = queue.then(async () => {
+        const previous = card;
+        if (closed || !previous || previous.expires <= Date.now() || Number(previous.ts) >= Number(result.ts)) return;
+        await render(previous.view, previous.page, undefined, previous.expires);
+        await removeCard(previous.ts);
+      }).catch(() => log("slack_error", "Could not move Meridian menu below notification"));
+    }
+    return result;
+  }
 
   function enqueue(id, fn) {
     if (closed || !id || received.has(id)) return;
@@ -89,7 +128,7 @@ export function createSlackConsole({ client, channel, team, owner, appId, ...adm
   }
 
   return {
-    sendMessage,
+    sendMessage: sendNotification,
     stop() { closed = true; },
     message(body, event) {
       if (!authorized(body.team_id, event.user, event.channel, body.api_app_id) ||
