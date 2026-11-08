@@ -757,13 +757,6 @@ export async function startStandalone() {
   log("runtime", `Standalone starting — ${config.standalone.shadow ? "SHADOW MODE (proposals recorded, nothing submitted)" : "LIVE MODE"} | threshold=${config.standalone.walletThreshold} wallets / ${config.standalone.windowSec}s window | screening deadline=${config.standalone.screeningDeadlineSec}s`);
 
   if (config.standalone.shadow) stopPaper = startPaper(store, notify, { admitResearch: false });
-  await monitor.start();
-  if (!monitor.healthy()) {
-    log("runtime_warn", "Monitor baseline incomplete — wallets without a portfolio baseline produce no signals until reconciliation succeeds");
-  }
-  for (const s of Object.values(store.data.signals)) {
-    if (!s.done && s.deadline > Date.now()) onSignal(s);
-  }
 
   // Entries come only from signals; exits run on their own cadences.
   if (!config.standalone.shadow) {
@@ -846,6 +839,15 @@ export async function startStandalone() {
   stopAdmin = startAdmin(adminOptions);
   slackAdmin = await startSlackAdmin(adminOptions);
   setNotificationMirror(slackAdmin?.sendMessage ?? null);
+
+  // Keep the admin console and position management available during RPC backfill.
+  await monitor.start();
+  if (!monitor.healthy()) {
+    log("runtime_warn", "Monitor baseline incomplete — wallets without a portfolio baseline produce no signals until reconciliation succeeds");
+  }
+  for (const s of Object.values(store.data.signals)) {
+    if (!s.done && s.deadline > Date.now()) onSignal(s);
+  }
   stopDiscovery = startDiscovery({
     gmgnKey: process.env.GMGN_API_KEY?.trim(),
     heliusKey: process.env.HELIUS_API_KEY?.trim(),
