@@ -316,7 +316,7 @@ export function createAdminConsole(transport, {
       const { wallets } = listSmartWallets();
       const rows = wallets.map(w => [{ text: `🗑 ${w.name}`, callback_data: `w:rm:${w.address}` }]);
       return void await render(
-        `👛 <b>Monitored wallets</b> (${wallets.length})\n${wallets.map(w => `• <b>${w.name}</b>\n<code>${w.address}</code>`).join("\n") || "none — add at least 2 to trigger entries"}${note ? `\n\n${note}` : ""}`,
+        `👛 <b>Monitored wallets</b> (${wallets.length})\n${wallets.map(w => `• <b>${w.name}</b>\nWallet address: <code>${w.address}</code>`).join("\n") || "none — add at least 2 to trigger entries"}${note ? `\n\n${note}` : ""}`,
         [...rows, [{ text: "➕ Add wallet", callback_data: "w:add" }, { text: "← Back", callback_data: "s:root" }]],
       );
     }
@@ -338,7 +338,7 @@ export function createAdminConsole(transport, {
         } catch { /* balance is best-effort */ }
       }
       return void await render(
-        `🔑 <b>Bot wallet</b>\n\n📥 <b>Deposit address:</b>\n<code>${deposit ?? "—"}</code>${balanceLine}\n\nSigning key: ${keyState}\nRead-only override: <code>${config.standalone.walletAddress || "not set"}</code>${note ? `\n\n${note}` : ""}`,
+        `🔑 <b>Bot wallet</b>\n\nDeposit address: <code>${deposit ?? "—"}</code>${balanceLine}\n\nSigning key: ${keyState}\nRead-only override: <code>${config.standalone.walletAddress || "not set"}</code>${note ? `\n\n${note}` : ""}`,
         [
           [{ text: slack ? "Signing key setup" : "📥 Import private key", callback_data: "k:imp" }],
           [...(slack ? [] : [{ text: "📤 Export private key", callback_data: "k:exp" }]), { text: "📍 Set read-only address", callback_data: "k:addr" }],

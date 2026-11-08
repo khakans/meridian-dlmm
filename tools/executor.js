@@ -325,7 +325,8 @@ async function executeToolUnlocked(name, args) {
         }
         notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8),
           pnlUsd: result.pnl_usd, pnlPct: result.pnl_pct, settlement: result.settlement,
-          solReceived: result.sol_received }).catch(() => {});
+          solReceived: result.sol_received, position: result.position ?? args.position_address,
+          tx: result.close_txs?.at(-1) }).catch(() => {});
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
         await swapBaseToSolWithRetry(result.base_mint, "after claim", result.pool || args.pool_address);
       }

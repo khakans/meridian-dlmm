@@ -187,12 +187,11 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
     priceStr +
     coverageStr +
     poolStr +
-    `Position: <code>${position?.slice(0, 8)}...</code>\n` +
-    `Tx: <code>${tx?.slice(0, 16)}...</code>`
+    [position && `Position: <code>${position}</code>`, tx && `Tx: <code>${tx}</code>`].filter(Boolean).join("\n")
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct, settlement, solReceived }) {
+export async function notifyClose({ pair, pnlUsd, pnlPct, settlement, solReceived, position, tx }) {
   const pnl = Number.isFinite(pnlUsd) && Number.isFinite(pnlPct)
     ? `${pnlUsd >= 0 ? "+" : ""}${pnlUsd.toFixed(4)} ${config.management.solMode ? "SOL" : "USD"} (${pnlPct.toFixed(2)}%)`
     : "unavailable";
@@ -204,7 +203,8 @@ export async function notifyClose({ pair, pnlUsd, pnlPct, settlement, solReceive
     settlement_unconfirmed: "Token conversion unconfirmed. Check wallet balance.",
   }[settlement];
   await sendHTML(
-    `🔒 <b>Closed LP</b> ${pair}\nPosition PnL: ${pnl}${status ? `\n${status}` : ""}`
+    [`🔒 <b>Closed LP</b> ${pair}\nPosition PnL: ${pnl}`, status,
+      position && `Position: <code>${position}</code>`, tx && `Tx: <code>${tx}</code>`].filter(Boolean).join("\n")
   );
 }
 
@@ -212,7 +212,7 @@ export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOu
   await sendHTML(
     `🔄 <b>Swapped</b> ${inputSymbol} → ${outputSymbol}\n` +
     `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\n` +
-    `Tx: <code>${tx?.slice(0, 16)}...</code>`
+    (tx ? `Tx: <code>${tx}</code>` : "")
   );
 }
 

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import bolt from "@slack/bolt";
 import { log } from "../logger.js";
-import { slackPlainText as plain } from "../slack-notify.js";
+import { slackMessageBlocks, slackPlainText as plain } from "../slack-notify.js";
 import { ADMIN_COMMANDS, createAdminConsole } from "./telegram-admin.js";
 
 const { App } = bolt;
@@ -18,9 +18,8 @@ export function createSlackConsole({ client, channel, team, owner, appId, ...adm
   const received = new Map();
   const sendMessage = value => {
     const text = plain(value).slice(0, 4000);
-    const blocks = text.includes("\n")
-      ? text.match(/[\s\S]{1,2800}/gu).map(part => ({ type: "section", text: plainText(part) }))
-      : undefined;
+    const formatted = slackMessageBlocks(text);
+    const blocks = text.includes("\n") || formatted[0]?.type === "rich_text" ? formatted : undefined;
     return client.chat.postMessage({ channel, text, blocks, mrkdwn: false, unfurl_links: false, unfurl_media: false });
   };
 
@@ -36,7 +35,7 @@ export function createSlackConsole({ client, channel, team, owner, appId, ...adm
       return { type: "button", action_id: `meridian_${actions.size}`, text: plainText(plain(label).slice(0, 70) || "Open"), value };
     };
     const text = paragraphs[page] ?? paragraphs[0];
-    const blocks = [{ type: "section", text: plainText(text) }];
+    const blocks = slackMessageBlocks(text);
     for (const row of rows.slice(page * 20, (page + 1) * 20)) {
       blocks.push({ type: "actions", elements: row.map(b => button(b.text, { data: b.callback_data })) });
     }

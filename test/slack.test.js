@@ -5,6 +5,20 @@ import { createSlackConsole } from "../standalone/slack-admin.js";
 import { _test } from "../standalone/telegram-admin.js";
 import { notifyClose, notifyDeploy, notifySwap, sendNotification, setNotificationMirror } from "../telegram.js";
 import { repoPath } from "../repo-root.js";
+import { slackMessageBlocks } from "../slack-notify.js";
+import bs58 from "bs58";
+
+test("Slack formats only labelled complete public identifiers", () => {
+  const id = bs58.encode(Buffer.alloc(32, 9));
+  const sig = bs58.encode(Buffer.alloc(64, 7));
+  const blocks = slackMessageBlocks(`Wallet on-chain ${id}\nMint ${id}\nPool ${id}\nTx: ${sig}\nPrivate key: ${sig}`);
+  const elements = blocks[0].elements[0].elements;
+  assert.deepEqual(elements.filter(e => e.style?.code).map(e => e.text), [id, id, id, sig]);
+  assert.deepEqual(elements.filter(e => e.type === "link").map(e => e.url), [
+    `https://solscan.io/account/${id}`, `https://solscan.io/token/${id}`,
+    `https://app.meteora.ag/dlmm/${id}`, `https://solscan.io/tx/${sig}`,
+  ]);
+});
 
 test("Slack owner DM reuses every admin section and rejects stale, repeated and foreign actions", async t => {
   t.mock.method(globalThis, "fetch", async () => { throw new Error("Network disabled in Slack console test"); });

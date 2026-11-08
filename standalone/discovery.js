@@ -176,7 +176,7 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config
           stats.passed++;
           try {
             const research = await onMatch?.(mint, result, [...sources]);
-            if (!stopped) await notify(`🔎 Meridian watchlist\n${mint}\nPool ${result.pool.pool_address}\nSource ${[...sources].join(', ')}${research ? `\n${research}` : ''}`);
+            if (!stopped) await notify(`🔎 Meridian watchlist\nMint ${mint}\nPool ${result.pool.pool_address}\nSource ${[...sources].join(', ')}${research ? `\n${research}` : ''}`);
           } catch { log('discovery_warn', `${mint} post-screen processing unavailable`); }
         }
       }

@@ -1,6 +1,38 @@
 import { log } from "./logger.js";
+import bs58 from "bs58";
 
 export const slackPlainText = value => String(value).replace(/<\/?(?:b|i|code)>/gi, "");
+
+export function slackMessageBlocks(text) {
+  return (text.match(/[\s\S]{1,2800}/gu) ?? []).map(part => {
+    const elements = [];
+    let formatted = false;
+    for (const line of part.split("\n")) {
+      const match = /^(Wallet on-chain|Deposit address|Wallet address|Mint|Pool|Position|Tx)(?::| )\s*([1-9A-HJ-NP-Za-km-z]{32,88})$/.exec(line);
+      if (match) {
+        const [, label, id] = match;
+        const tx = label === "Tx";
+        if (bs58.decode(id).length === (tx ? 64 : 32)) {
+          const explorer = label === "Pool" ? "Meteora" : "Solscan";
+          const url = label === "Pool" ? `https://app.meteora.ag/dlmm/${id}`
+            : `https://solscan.io/${tx ? "tx" : label === "Mint" ? "token" : "account"}/${id}`;
+          elements.push({ type: "text", text: `${label} · ` },
+            { type: "link", url, text: explorer },
+            { type: "text", text: "\n" },
+            { type: "text", text: id, style: { code: true } },
+            { type: "text", text: "\n" });
+          formatted = true;
+          continue;
+        }
+      }
+      elements.push({ type: "text", text: `${line}\n` });
+    }
+    if (!formatted) return { type: "section", text: { type: "plain_text", text: part } };
+    elements.at(-1).text = elements.at(-1).text.slice(0, -1);
+    if (!elements.at(-1).text) elements.pop();
+    return { type: "rich_text", elements: [{ type: "rich_text_section", elements }] };
+  });
+}
 
 let ownerChannel;
 
@@ -30,8 +62,9 @@ export async function sendSlackNotification(text) {
       return channel.id;
     })();
     const channel = await ownerChannel;
+    const body = slackPlainText(text).slice(0, 4000);
     await call("chat.postMessage", {
-      channel, text: slackPlainText(text).slice(0, 4000), mrkdwn: false,
+      channel, text: body, blocks: slackMessageBlocks(body), mrkdwn: false,
       unfurl_links: false, unfurl_media: false,
     });
   } catch {
