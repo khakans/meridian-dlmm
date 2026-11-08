@@ -103,6 +103,8 @@ export async function swapToken({
   input_mint,
   output_mint,
   amount,
+  raw_amount,
+  beforeExecute,
 }) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
@@ -126,7 +128,9 @@ export async function swapToken({
       const mintInfo = await connection.getParsedAccountInfo(new PublicKey(input_mint));
       decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
     }
-    const amountStr = Math.floor(amount * Math.pow(10, decimals)).toString();
+    const amountStr = typeof beforeExecute === "function" && raw_amount != null
+      ? raw_amount : Math.floor(amount * Math.pow(10, decimals)).toString();
+    if (!/^\d+$/.test(amountStr) || BigInt(amountStr) <= 0n) throw new Error("Invalid swap amount");
 
     // ─── Get Swap V2 order (unsigned tx + requestId) ───────────
     const search = new URLSearchParams({
@@ -145,6 +149,7 @@ export async function swapToken({
 
     const orderRes = await fetch(orderUrl, {
       headers: jupiterApiKey ? { "x-api-key": jupiterApiKey } : {},
+      signal: AbortSignal.timeout(10_000),
     });
     if (!orderRes.ok) {
       const body = await orderRes.text();
@@ -162,6 +167,8 @@ export async function swapToken({
     const tx = VersionedTransaction.deserialize(Buffer.from(unsignedTx, "base64"));
     tx.sign([wallet]);
     const signedTx = Buffer.from(tx.serialize()).toString("base64");
+    const signature = tx.signatures[0]?.some(Boolean) ? bs58.encode(tx.signatures[0]) : null;
+    await beforeExecute?.(signature);
 
     // ─── Execute ───────────────────────────────────────────────
     const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
@@ -171,6 +178,7 @@ export async function swapToken({
         ...(jupiterApiKey ? { "x-api-key": jupiterApiKey } : {}),
       },
       body: JSON.stringify({ signedTransaction: signedTx, requestId }),
+      signal: AbortSignal.timeout(15_000),
     });
     if (!execRes.ok) {
       throw new Error(`Swap V2 execute failed: ${execRes.status} ${await execRes.text()}`);

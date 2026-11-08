@@ -188,29 +188,48 @@ export function startPaper(store, notify, {
               maxHoldMinutes: plan.maxHoldMinutes, rangeWaitMinutes: plan.rangeWaitMinutes,
               variant: plan.variant ?? `discovery/${plan.range}/${plan.shape}${index === 1 && plan.shape === 'spot' ? '-wide' : ''}` }] : [];
           });
+          if (source === 'discovery' && config.research.paperSizingExperiment) {
+            const spot = plans.filter(p => p.shape === 'spot').sort((a,b) => a.lower - b.lower)[0];
+            if (spot) plans.push(
+              { ...spot, variant: 'discovery/volatility/sizing-0.14', capital: 0.14, bankroll: 1 },
+              { ...spot, variant: 'discovery/volatility/sizing-0.30', capital: 0.30, bankroll: 1 },
+            );
+          }
           if (!plans.length) continue;
           const worstPrice = Math.min(...plans.map(plan => price * plan.ratio ** (plan.lower - active.binId)));
           const expectedQuote = capital * price / worstPrice;
           const exitQuote = await sellQuote(c.mint, rawTokens(capital / worstPrice, c.decimals));
           if (stopped || !config.standalone.shadow) return;
-          if (exitQuote == null || exitQuote < expectedQuote * config.research.paperMinExitRatio) {
+          const normalQuoteOk = exitQuote != null && exitQuote >= expectedQuote * config.research.paperMinExitRatio;
+          if (!normalQuoteOk) {
             if (c.paperRejectedAt == null) paper.skipped++;
             c.paperRejectedAt = now;
-            continue;
+            if (!plans.some(plan => plan.bankroll)) continue;
           }
           const entryBins = await readSnapshot(c.pool, Math.min(...plans.map(p => p.lower)), Math.max(...plans.map(p => p.upper)));
           if (!entryBins || stopped || !config.standalone.shadow) continue;
           let admitted = 0;
           for (const [index, plan] of plans.entries()) {
+            const positionCapital = plan.capital ?? capital;
+            if (!plan.bankroll && !normalQuoteOk) continue;
+            if (plan.bankroll && Object.values(paper.open).some(p => p.variant === plan.variant)) continue;
             if (paperRiskBlocked(paper, plan.variant, now, config.research.paperDailyLossLimitPct, config.research.paperDrawdownLimitPct)) continue;
+            if (plan.bankroll) {
+              const floor = price * plan.ratio ** (plan.lower - active.binId);
+              const raw = rawTokens(positionCapital / floor, c.decimals);
+              const quoteSol = await sellQuote(c.mint, raw);
+              if (stopped || !config.standalone.shadow) return;
+              if (quoteSol == null || quoteSol < positionCapital * price / floor * config.research.paperMinExitRatio) continue;
+            }
             const reserved = Object.values(paper.open).filter(p => p.variant === plan.variant).reduce((n, p) => n + p.capital + COST_SOL, 0);
-            const available = config.research.paperBankrollSol + (paper.realized[plan.variant] ?? 0) - reserved;
-            if (available < capital + COST_SOL) continue;
+            const available = (plan.bankroll ?? config.research.paperBankrollSol) + (paper.realized[plan.variant] ?? 0) - reserved;
+            if (available < positionCapital + COST_SOL) continue;
             const id = `${source}:${c.mint}:${c.at}:${index}`;
             const position = { ...plan, id, mint: c.mint, pool: c.pool, decimals: c.decimals, source,
-              openedAt: now, entryBin: active.binId, entryPrice: price, capital, mark: { at: now, pnl: -COST_SOL } };
+              openedAt: now, entryBin: active.binId, entryPrice: price, capital: positionCapital, mark: { at: now, pnl: -COST_SOL } };
             position.binSeed = seedPaperBins(position, entryBins);
             paper.realized[plan.variant] ??= 0;
+            if (plan.bankroll) (paper.bankrolls ??= {})[plan.variant] = plan.bankroll;
             paper.open[id] = position;
             admitted++;
           }

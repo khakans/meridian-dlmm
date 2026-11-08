@@ -8,6 +8,15 @@ import { paperBins, paperCloseRule, paperInventory, startPaper } from '../standa
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
 import { summarizePaper } from '../standalone/pnl-summary.js';
 import { lowerRangeStop } from '../exit-rules.js';
+import { tokenDelta } from '../standalone/settlement.js';
+
+test('settlement only attributes the closed mint balance change to the specified wallet', () => {
+  const token = (owner, mint, amount) => ({ owner, mint, uiTokenAmount: { amount } });
+  const meta = { preTokenBalances: [token('wallet', 'mint', '100')],
+    postTokenBalances: [token('wallet', 'mint', '160'), token('other', 'mint', '999'), token('wallet', 'other', '42')] };
+  assert.equal(tokenDelta(meta, 'mint', 'wallet'), 60n);
+  assert.equal(tokenDelta({ ...meta, postTokenBalances: [token(undefined, 'mint', '160')] }, 'mint', 'wallet'), null);
+});
 
 test('hard lower-range stop measures price beyond the lower bin, not position PnL', () => {
   assert.equal(lowerRangeStop(100, 100, 100, 2), null);

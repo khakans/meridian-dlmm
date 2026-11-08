@@ -24,6 +24,9 @@ export class MonitorStore {
     this.data.pnlResetAt = pnlResetAt;
   }
   prune(now = Date.now()) {
+    for (const [mint, item] of Object.entries(this.data.convergenceDiagnostics ?? {})) {
+      if (now - item.at > 86_400_000) delete this.data.convergenceDiagnostics[mint];
+    }
     for (const [mint, item] of Object.entries(this.data.research ?? {})) {
       if (now - item.at > 24 * 3600_000) delete this.data.research[mint];
     }
@@ -64,6 +67,15 @@ export function acceptEvents(store, events, options, now = Date.now()) {
   for (const mint of new Set(events.map(e => e.mint))) {
     const existing = store.data.signals[mint];
     const recent = qualifyingEvents(store.data.events, mint, options, now);
+    const wider = qualifyingEvents(store.data.events, mint, { ...options, windowSec: Math.max(options.windowSec, 300) }, now);
+    const times = wider.map(e => e.at);
+    store.data.convergenceDiagnostics ??= {};
+    store.data.convergenceDiagnostics[mint] = {
+      at: now, current: recent.length, wider: wider.length,
+      spreadSec: times.length > 1 ? Math.round((Math.max(...times) - Math.min(...times)) / 1000) : null,
+      reason: existing && (!existing.done || now < existing.cooldownUntil) ? 'active or cooldown' :
+        recent.length >= options.walletThreshold ? 'threshold reached' : 'waiting for distinct wallets',
+    };
     if (existing && (!existing.done || now < existing.cooldownUntil)) continue;
     // A completed signal cannot be reused after its cooldown.
     const fresh = recent.filter(e => !existing || e.at > existing.closedAt);
@@ -79,5 +91,6 @@ export function acceptEvents(store, events, options, now = Date.now()) {
 export function finishSignal(store, signal, reason, options = {}, now = Date.now()) {
   const cooldownSec = options?.cooldownSec ?? 300;
   Object.assign(signal, { done: true, reason, closedAt: now, cooldownUntil: now + cooldownSec * 1000 });
+  if (store.data.convergenceDiagnostics?.[signal.mint]) store.data.convergenceDiagnostics[signal.mint].reason = reason;
   store.save();
 }

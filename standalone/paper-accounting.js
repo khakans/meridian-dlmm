@@ -60,7 +60,8 @@ export function recordPaperNav(paper, now, bankroll) {
     if (!isActivePaperVariant(variant)) continue;
     const positions = open.filter(p => p.variant === variant);
     const waiting = positions.some(p => !p.mark || now - p.mark.at > 180_000);
-    const equity = waiting ? null : bankroll + realized + positions.reduce((n, p) => n + p.mark.pnl, 0);
+    const initial = paper.bankrolls?.[variant] ?? bankroll;
+    const equity = waiting ? null : initial + realized + positions.reduce((n, p) => n + p.mark.pnl, 0);
     const rows = paper.nav[variant] ??= [];
     let row = rows.at(-1);
     if (row?.day !== day) {
@@ -77,7 +78,7 @@ export function recordPaperNav(paper, now, bankroll) {
     else {
       row.low = Math.min(row.low ?? equity, equity);
       paper.peak ??= {};
-      paper.peak[variant] = Math.max(paper.peak[variant] ?? bankroll, equity);
+      paper.peak[variant] = Math.max(paper.peak[variant] ?? initial, equity);
       row.drawdown = Math.max(row.drawdown ?? 0, 1 - equity / paper.peak[variant]);
     }
     if (rows.length > 90) rows.splice(0, rows.length - 90);

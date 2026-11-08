@@ -1041,7 +1041,7 @@ export async function claimFees({ position_address }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
-export async function closePosition({ position_address, reason }) {
+export async function closePosition({ position_address, reason, onClosed }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
@@ -1165,6 +1165,7 @@ export async function closePosition({ position_address, reason }) {
       };
     }
 
+    await onClosed?.({ mint: pool.lbPair.tokenXMint.toString(), wallet: wallet.publicKey.toString(), txs: txHashes });
     recordClose(position_address, reason || "agent decision");
 
     // Record performance for learning

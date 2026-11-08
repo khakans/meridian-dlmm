@@ -201,6 +201,7 @@ export async function notifyClose({ pair, pnlUsd, pnlPct, settlement, solReceive
     dust_remaining: "Token dust remains in wallet",
     skipped: "Token conversion skipped",
     settlement_unconfirmed: "Token conversion unconfirmed. Check wallet balance.",
+    awaiting_balance: "LP closed. Token conversion queued.",
   }[settlement];
   await sendHTML(
     [`🔒 <b>Closed LP</b> ${pair}\nPosition PnL: ${pnl}`, status,

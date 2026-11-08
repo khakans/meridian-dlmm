@@ -37,6 +37,7 @@
   "researchMinTvl": 5000,
   "researchMinTokenAgeHours": 0,
   "paperCapitalSol": 0.55,
+  "paperSizingExperiment": false,
   "paperBankrollSol": 2,
   "paperDailyLossLimitPct": 5,
   "paperDrawdownLimitPct": 15,

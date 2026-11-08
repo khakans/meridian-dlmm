@@ -16,6 +16,8 @@ import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
 import { entryPlans, isActivePaperVariant } from "./entry-plans.js";
 import { startPaper, validateExitQuote } from "./paper.js";
+import { advanceSettlement, dueSettlements, settlementRows } from "./settlement.js";
+import { withWalletLock } from "./transactions.js";
 import { paperDay, recommendPaperVariant } from "./paper-accounting.js";
 import { getPerformanceHistory } from "../performance.js";
 import { paperPnlLines, signed, summarizePaper } from "./pnl-summary.js";
@@ -47,6 +49,48 @@ let pursuing = false;
 const timers = {};
 const signalQueue = [];
 const discoveryStats = { received: 0, retries: 0, waiting: 0, passed: 0, dropped: 0, reasons: Object.create(null) };
+let preflight = null;
+let settlementBusy = false;
+
+function startSettlementWorker() {
+  if (config.standalone.shadow) return;
+  timers.settlement = setInterval(async () => {
+    if (shuttingDown || settlementBusy) return;
+    const next = dueSettlements()[0];
+    if (!next) return;
+    settlementBusy = true;
+    try {
+      const result = await withWalletLock(() => {
+        const fresh = dueSettlements().find(r => r.id === next.id);
+        return fresh && !shuttingDown ? advanceSettlement(fresh) : null;
+      }, 1);
+      if (result?.status === "swapped") await notify(`✅ LP settlement selesai\nPosition ${result.id}\nTx: ${result.signature}`);
+    } catch { log("settlement_warn", "Settlement retry unavailable"); }
+    finally { settlementBusy = false; }
+  }, 10_000);
+}
+
+async function refreshPreflight() {
+  if (preflight && Date.now() - preflight.at < 60_000) return preflight;
+  const sample = [store.data.preflightCandidate, ...Object.values(store.data.research ?? {})].filter(c => c && Date.now() - c.at < 300_000)
+    .sort((a,b) => b.at - a.at)[0];
+  const result = { at: Date.now(), pool: "belum ada sampel segar", quote: "belum diuji" };
+  if (sample) {
+    try {
+      const screened = await screenMint(sample.mint, { poolAddress: sample.pool });
+      result.pool = screened.pass ? "lolos screening ulang" : screened.reason;
+      if (screened.pass) {
+        try {
+          await validateExitQuote({ mint: sample.mint, pool: sample.pool, decimals: screened.decimals,
+            binStep: Number(screened.pool.dlmm_params?.bin_step), binsBelow: computeBinsBelow(screened.pool.volatility),
+            capital: config.risk.maxDeployAmount });
+          result.quote = "lolos ukuran maksimum";
+        } catch { result.quote = "tidak lolos atau provider gagal"; }
+      }
+    } catch { result.pool = "data tidak tersedia"; }
+  }
+  return preflight = result;
+}
 
 function shadowScreeningThresholds() {
   if (!config.standalone.shadow || !config.research.enabled) return undefined;
@@ -491,6 +535,20 @@ async function lifecycleStatusLines(detailed = false) {
     `Wallet on-chain ${wallet.wallet || book.wallet || "belum tersedia"}`,
     `Saldo ${!wallet.error && Number.isFinite(wallet.sol) ? `${wallet.sol.toFixed(4)} SOL` : "belum tersedia"}`,
   ];
+  const settlements = config.standalone.shadow ? [] : settlementRows();
+  const unsettled = settlements.filter(r => !["swapped", "no_balance"].includes(r.status));
+  lines.push(`Kesehatan · monitor ${monitor?.healthy() ? "siap" : "belum siap"} · RPC wallet ${wallet.error ? "gagal" : "OK"}${unsettled.length ? ` · ${unsettled.length} settlement belum selesai` : ""}`);
+  if (detailed) {
+    const check = await refreshPreflight();
+    lines.push(`Preflight · pool ${check.pool} · quote keluar ${check.quote}`);
+    lines.push("Simulasi close berurutan · belum diverifikasi");
+    if (unsettled.length) for (const row of unsettled.slice(0, 4)) {
+      lines.push(`• Settlement ${row.id.slice(0, 8)} · ${row.status}${row.reason ? ` · ${row.reason}` : ""}`);
+    }
+    for (const [mint, d] of Object.entries(store.data.convergenceDiagnostics ?? {}).sort((a,b) => b[1].at-a[1].at).slice(0, 4)) {
+      lines.push(`• ${mint.slice(0, 8)} · ${d.current} wallet / ${config.standalone.windowSec}s · ${d.wider} / ${Math.max(300,config.standalone.windowSec)}s${d.spreadSec == null ? "" : ` · selisih ${d.spreadSec}s`} · ${d.reason}`);
+    }
+  }
   if (book.error || !Array.isArray(book.positions)) {
     lines.push("Posisi dan PnL belum tersedia.");
   } else {
@@ -533,6 +591,12 @@ async function lifecycleStatusLines(detailed = false) {
     const rec = recommendPaperVariant([...(paper?.closed ?? []), ...(paper?.cancelled ?? [])].sort((a,b) => a.openedAt-b.openedAt), Date.now());
     lines.push(rows.length ? `Baseline · ${(average * 100).toFixed(2)}% rata-rata/hari · ${rows.length}/30 hari valid` : "Baseline · belum ada hari valid");
     if (rec) lines.push(`Uji parameter · ${rec.variant.split("/").at(-1)} unggul ${rec.test.toFixed(4)} SOL/token pada ${rec.testMints} token validasi`);
+    if (detailed && config.research.paperSizingExperiment) for (const size of ["0.14", "0.30"]) {
+      const nav = (paper?.nav?.[`discovery/volatility/sizing-${size}`] ?? [])
+        .filter(r => r.complete && r.day < paperDay(now) && r.start > 0 && r.end != null);
+      const returns = nav.map(r => (r.end / r.start - 1) * 100);
+      lines.push(returns.length ? `Sizing ${size} SOL · rata-rata ${(returns.reduce((a,b) => a+b,0)/returns.length).toFixed(2)}% · target ≥5% ${returns.filter(r => r >= 5).length}/${returns.length} hari · drawdown ${(Math.max(...nav.map(r=>r.drawdown??0))*100).toFixed(2)}%` : `Sizing ${size} SOL · belum ada hari valid`);
+    }
     const tracked = Object.keys(store.data.wallets).length;
     if (tracked < config.standalone.walletThreshold) lines.push(`Convergence · ${tracked}/${config.standalone.walletThreshold} wallet siap`);
   }
@@ -635,6 +699,7 @@ export async function startStandalone() {
     void manageOnce();
   }
   startPnlPoller();
+  startSettlementWorker();
   startHeartbeat();
   startChronosKeepalive();
   const adminOptions = {
@@ -643,7 +708,7 @@ export async function startStandalone() {
     resetPnl: () => store.resetPnl(),
     activeSignals: () => Object.values(store.data.signals).filter(s => !s.done).length,
     restart: async (send, beforeRestart) => {
-      if (pursuing || manageBusy || pollBusy) {
+      if (pursuing || manageBusy || pollBusy || settlementBusy) {
         await send("Meridian sedang memproses pekerjaan. Coba restart lagi setelah selesai.");
         return;
       }
@@ -659,7 +724,11 @@ export async function startStandalone() {
     heliusKey: process.env.HELIUS_API_KEY?.trim(),
     notify,
     thresholds: shadowScreeningThresholds(),
-    onMatch: recordResearch,
+    onMatch: (mint, screened, sources) => {
+      store.data.preflightCandidate = { mint, pool: screened.pool.pool_address, at: Date.now() };
+      store.save();
+      return recordResearch(mint, screened, sources);
+    },
     stats: discoveryStats,
   });
   if (config.standalone.shadow && config.research.enabled) stopPaper = startPaper(store, notify);

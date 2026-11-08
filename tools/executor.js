@@ -1,6 +1,7 @@
 import { deployPosition, getMyPositions, claimFees, closePosition } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { withWalletLock } from "../standalone/transactions.js";
+import { beginSettlement } from "../standalone/settlement.js";
 import { invalidateBalances } from "../standalone/balances.js";
 import { config, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { addPoolNote } from "../pool-memory.js";
@@ -286,7 +287,15 @@ async function executeToolUnlocked(name, args) {
     const preClose = name === "close_position" && !args.skip_swap && process.env.DRY_RUN !== "true"
       ? await getWalletBalances({ force: true }).catch(() => null)
       : null;
-    const result = await fn(args);
+    let settlement;
+    const result = await fn(name === "close_position" && !args.skip_swap ? {
+      ...args,
+      onClosed: ({ mint, wallet, txs }) => {
+        const baseline = !preClose?.error && preClose?.wallet === wallet
+          ? preClose.tokens.find(t => t.mint === mint)?.raw_balance ?? "0" : null;
+        settlement = beginSettlement({ id: args.position_address, mint, wallet, baseline, txs });
+      },
+    } : args);
     const duration = Date.now() - startTime;
     const success = result?.success !== false && !result?.error;
 
@@ -310,19 +319,7 @@ async function executeToolUnlocked(name, args) {
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
         // Auto-swap base token back to SOL unless user said to hold (retried).
-        result.settlement = args.skip_swap ? "skipped" : "settlement_unconfirmed";
-        if (!args.skip_swap && result.base_mint && !preClose?.error && Array.isArray(preClose?.tokens)) {
-          const original = preClose.tokens.find(t => t.mint === result.base_mint);
-          const { swapped, result: swapResult, status } = await swapBaseToSolWithRetry(result.base_mint, "after close",
-            result.pool || args.pool_address, BigInt(original?.raw_balance ?? 0));
-          result.settlement = status;
-          if (swapped) {
-            // Tell the model the swap already happened so it doesn't call swap_token again
-            result.auto_swapped = true;
-            result.auto_swap_note = `Base token already auto-swapped back to SOL (${result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
-            if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
-          }
-        }
+        result.settlement = args.skip_swap ? "skipped" : settlement?.status ?? "settlement_unconfirmed";
         notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8),
           pnlUsd: result.pnl_usd, pnlPct: result.pnl_pct, settlement: result.settlement,
           solReceived: result.sol_received, position: result.position ?? args.position_address,

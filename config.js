@@ -102,6 +102,7 @@ export const config = {
     minTvl: numericConfig(u.researchMinTvl) ?? 5_000,
     minTokenAgeHours: numericConfig(u.researchMinTokenAgeHours) ?? 0,
     paperCapitalSol: numericConfig(u.paperCapitalSol) ?? 0.55,
+    paperSizingExperiment: u.paperSizingExperiment === true,
     paperBankrollSol: Math.max(0.1, numericConfig(u.paperBankrollSol) ?? 2),
     paperDailyLossLimitPct: Math.min(100, Math.max(0.1, numericConfig(u.paperDailyLossLimitPct) ?? 5)),
     paperDrawdownLimitPct: Math.min(100, Math.max(0.1, numericConfig(u.paperDrawdownLimitPct) ?? 15)),
