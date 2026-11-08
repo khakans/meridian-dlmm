@@ -277,7 +277,7 @@ const restartRow = () => [{ text: "♻️ Restart now", callback_data: "m:restar
 export const _test = { SECTIONS, byKey, editHint, validate, sectionMenu, fmtValue };
 
 export function createAdminConsole(transport, {
-  monitor = null, activeSignals = null, restart, slack = false,
+  monitor = null, activeSignals = null, restart, statusDetails, resetPnl, slack = false,
 } = {}) {
   const { sendMessage, sendMenu, editMenu } = transport;
   const answerCallbackQuery = transport.answerCallbackQuery ?? (async () => {});
@@ -346,7 +346,10 @@ export function createAdminConsole(transport, {
       );
     }
     if (sectionId === "status") {
-      return void await render(await statusText(), [[{ text: "🔄 Refresh", callback_data: "s:status" }, { text: "← Back", callback_data: "s:root" }]]);
+      return void await render(`${await statusText()}${note ? `\n\n${note}` : ""}`, [
+        [{ text: "🔄 Refresh", callback_data: "s:status" }, { text: "← Back", callback_data: "s:root" }],
+        ...(resetPnl ? [[{ text: "Reset PnL", callback_data: "m:pnlreset" }]] : []),
+      ]);
     }
     const section = SECTIONS.find(s => s.id === sectionId);
     if (!section) return void await viewRoot();
@@ -372,6 +375,7 @@ export function createAdminConsole(transport, {
       `Signals active: ${adminContext.activeSignals?.() ?? 0}`,
     ];
     try {
+      if (statusDetails) return [...lines, "", ...await statusDetails()].join("\n");
       const { getMyPositions } = await import("../tools/dlmm.js");
       const positions = await getMyPositions({ force: true, silent: true });
       lines.push(`Positions: ${positions.total_positions}${positions.positions.length ? ` (${positions.positions.map(p => `${p.pair ?? "?"} ${p.pnl_pct ?? "?"}%`).join(", ")})` : ""}`);
@@ -489,6 +493,17 @@ export function createAdminConsole(transport, {
         if (next) process.env.DRY_RUN = "true";
         else if (envValue("DRY_RUN") !== "true") delete process.env.DRY_RUN;
         return void await viewRoot();
+      }
+      if (data === "m:pnlreset" && resetPnl) {
+        pending = { kind: "pnlreset", shadow: config.standalone.shadow };
+        return void await render("Mulai periode PnL terealisasi baru untuk mode ini? Riwayat, posisi terbuka, dan batas risiko tetap tersimpan.", [
+          [{ text: "Konfirmasi reset", callback_data: "m:pnlreset2" }, { text: "Batal", callback_data: "s:status" }],
+        ]);
+      }
+      if (data === "m:pnlreset2" && resetPnl && pending?.kind === "pnlreset" && pending.shadow === config.standalone.shadow) {
+        pending = null;
+        await resetPnl();
+        return void await viewSection("status", "Periode PnL baru dimulai.");
       }
       if (data === "m:restart") {
         return void await render("♻️ Restart the bot? (takes ~5s)", [

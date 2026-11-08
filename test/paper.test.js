@@ -3,6 +3,24 @@ import { test } from 'node:test';
 import { config } from '../config.js';
 import { paperBins, paperCloseRule, paperInventory, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
+import { summarizePaper } from '../standalone/pnl-summary.js';
+
+test('paper status separates variants, ignores stale marks and applies the realized reset cutoff', () => {
+  const now = 1_800_000_000_000;
+  const paper = {
+    open: { a: { binSeed: [], variant: 'spot', mark: { at: now - 10, pnl: 0.1 } },
+      b: { binSeed: [], variant: 'curve', mark: { at: now - 200_000, pnl: 0.2 } } },
+    closed: [{ accountingVersion: 1, variant: 'spot', mint: 'x', closedAt: now - 20, pnl: 0.03 },
+      { accountingVersion: 1, variant: 'curve', mint: 'x', closedAt: now - 30, pnl: 0.05 }],
+    cancelled: [{ accountingVersion: 1, variant: 'spot', closedAt: now - 5, pnl: -0.001 }],
+  };
+  const { variants, uniqueClosedMints } = summarizePaper(paper, now - 25, now);
+  assert.equal(uniqueClosedMints, 1);
+  assert.equal(variants[0].marked, 0);
+  assert.equal(variants[0].closed, 0);
+  assert.equal(variants[1].openPnl, 0.1);
+  assert.equal(variants[1].realized, 0.028999999999999998);
+});
 
 test('paper mark credits only fee growth after admission and rejects backwards counters', () => {
   const q = 1n << 64n;

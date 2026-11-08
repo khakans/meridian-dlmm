@@ -9,6 +9,7 @@ node_modules/
 
 # User config (contains RPC URL, wallet key, API keys)
 user-config.json
+pnl-overnight.json
 
 # GMGN fee-source config (contains API key)
 gmgn-config.json

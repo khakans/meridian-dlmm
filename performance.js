@@ -144,6 +144,7 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
       strategy: r.strategy,
       pnl_usd: r.pnl_usd,
       pnl_pct: r.pnl_pct,
+      pnl_source: r.pnl_source,
       fees_earned_usd: r.fees_earned_usd,
       range_efficiency: r.range_efficiency,
       minutes_held: r.minutes_held,

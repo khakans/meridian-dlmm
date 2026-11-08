@@ -17,6 +17,8 @@ import { startDiscovery } from "./discovery.js";
 import { entryPlans } from "./entry-plans.js";
 import { startPaper, validateExitQuote } from "./paper.js";
 import { paperDay, recommendPaperVariant } from "./paper-accounting.js";
+import { getPerformanceHistory } from "../performance.js";
+import { paperPnlLines, signed, summarizePaper } from "./pnl-summary.js";
 import { exposureStillPresent } from "./events.js";
 import { getMyPositions } from "../tools/dlmm.js";
 import { executeTool } from "../tools/executor.js";
@@ -454,6 +456,72 @@ async function recordResearch(mint, screened, sources, convergence = null) {
   return `Shadow research: ${plans.length} range/shape variants.${fib ? ` Fibonacci ≈ ${fib.widthBins} bins${fib.wideRange ? " (wide range)" : ""}; ${fib.entryZoneReached ? "upper level reached" : "waiting for upper level"}.` : " Fibonacci waiting for candle history."}`;
 }
 
+async function lifecycleStatusLines(detailed = false) {
+  const [wallet, book] = await Promise.all([
+    getWalletBalances({ force: true, nativeOnly: true }),
+    getMyPositions({ silent: true }),
+  ]);
+  const lines = [
+    `Wallet on-chain ${wallet.wallet || book.wallet || "belum tersedia"}`,
+    `Saldo ${!wallet.error && Number.isFinite(wallet.sol) ? `${wallet.sol.toFixed(4)} SOL` : "belum tersedia"}`,
+  ];
+  if (book.error || !Array.isArray(book.positions)) {
+    lines.push("Posisi dan PnL belum tersedia.");
+  } else {
+    const unit = config.management.solMode ? "SOL" : "USD";
+    const known = book.positions.filter(p => Number.isFinite(p.pnl_usd) && !p.pnl_pct_suspicious);
+    const pnl = known.reduce((sum, p) => sum + p.pnl_usd, 0);
+    lines.push(`Posisi on-chain ${book.positions.length}`);
+    lines.push(`PnL on-chain terbuka ${known.length ? `${signed(pnl)} ${unit}` : book.positions.length ? "belum tersedia" : "—"}${known.length < book.positions.length ? ` (${known.length}/${book.positions.length} terukur)` : ""}`);
+    for (const p of book.positions.slice(0, 10)) {
+      const pct = !p.pnl_pct_suspicious && Number.isFinite(p.pnl_pct) ? `${p.pnl_pct.toFixed(2)}%` : "PnL belum tersedia";
+      const range = typeof p.in_range === "boolean" ? (p.in_range ? "in range" : "out of range") : "range belum tersedia";
+      lines.push(`• ${String(p.pair || p.position).slice(0, 80)} · ${pct} · ${range}`);
+    }
+    if (book.positions.length > 10) lines.push(`+${book.positions.length - 10} posisi lainnya`);
+  }
+  const now = Date.now();
+  const resetAt = store.data.pnlResetAt?.[config.standalone.shadow ? "shadow" : "live"] ?? 0;
+  const from = Math.max(now - 86_400_000, resetAt);
+  if (resetAt > now - 86_400_000) lines.push(`Periode PnL sejak reset ${new Date(resetAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })} WIB`);
+  if (!config.standalone.shadow) {
+    const closed = getPerformanceHistory({ hours: 24, limit: 10000 }).positions.filter(p =>
+      Date.parse(p.closed_at) >= from && Number.isFinite(p.pnl_usd) && p.pnl_source !== "unavailable");
+    const estimated = closed.filter(p => p.pnl_source === "cached").length;
+    lines.push(closed.length ? `PnL LP ditutup · ${signed(closed.reduce((n,p) => n + p.pnl_usd, 0))} USD · ${closed.length} posisi${estimated ? ` (${estimated} estimasi)` : ""}` : "PnL LP ditutup · belum ada catatan");
+  }
+  const research = Object.values(store.data.research ?? {}).filter(item => now - item.at < 86_400_000);
+  if (config.standalone.shadow && config.research.enabled) {
+    lines.push(`Riset 24 jam ${research.length} kandidat · ${research.reduce((sum, item) => sum + item.plans.length, 0)} rencana entry`);
+    const paper = store.data.paper;
+    lines.push(...paperPnlLines(summarizePaper(paper, from, now), detailed));
+    const open = Object.values(paper?.open ?? {});
+    const recent = (paper?.closed ?? []).filter(p => p.accountingVersion && Date.now() - p.closedAt < 86_400_000);
+    const cancelled = (paper?.cancelled ?? []).filter(p => Date.now() - p.at < 86_400_000).length;
+    const pending = open.filter(p => p.exit).length;
+    lines.push(`Paper · ${open.filter(p => p.filledAt).length} terisi · ${open.filter(p => !p.filledAt).length} tunggu fill · ${recent.length} selesai/24j · ${cancelled} batal${pending ? ` · ${pending} tunggu quote` : ""}`);
+    const rows = (paper?.nav?.["convergence/baseline"] ?? []).filter(r => r.day < paperDay(Date.now()) && r.complete && r.start > 0 && r.end != null).slice(-30);
+    const average = rows.reduce((sum, r) => sum + (r.end / r.start - 1), 0) / rows.length;
+    const rec = recommendPaperVariant([...(paper?.closed ?? []), ...(paper?.cancelled ?? [])].sort((a,b) => a.openedAt-b.openedAt), Date.now());
+    lines.push(rows.length ? `Baseline · ${(average * 100).toFixed(2)}% rata-rata/hari · ${rows.length}/30 hari valid` : "Baseline · belum ada hari valid");
+    if (rec) lines.push(`Uji parameter · ${rec.variant.split("/").at(-1)} unggul ${rec.test.toFixed(4)} SOL/token pada ${rec.testMints} token validasi`);
+    const tracked = Object.keys(store.data.wallets).length;
+    if (tracked < config.standalone.walletThreshold) lines.push(`Convergence · ${tracked}/${config.standalone.walletThreshold} wallet siap`);
+  }
+  const { received, retries, waiting, passed, dropped, reasons } = discoveryStats;
+  lines.push(`Discovery sejak restart ${received} masuk · ${waiting} antre · ${retries} retry · ${passed} lolos · ${dropped} kedaluwarsa/tergeser`);
+  const topReasons = Object.entries(reasons).sort((a, b) => b[1] - a[1]).slice(0, 3);
+  if (topReasons.length) lines.push(`Kendala ${topReasons.map(([reason, n]) => `${reason} ×${n}`).join(" · ")}`);
+  if (detailed) {
+    try {
+      const saved = JSON.parse(fs.readFileSync(repoPath("pnl-overnight.json"), "utf8"));
+      lines.push(`Arsip semalam · ${saved.periodWib} · ${saved.uniqueClosedMints} mint selesai`);
+      for (const v of saved.variants.slice(0, 10)) lines.push(`• ${v.variant} · ${signed(v.realized)} SOL · ${v.closed} close`);
+    } catch { /* Archive is optional. */ }
+  }
+  return lines;
+}
+
 function startLifecycleReports() {
   const minutes = config.lifecycleReportMinutes;
   if (!(minutes >= 1 && minutes <= 1440)) return;
@@ -462,51 +530,7 @@ function startLifecycleReports() {
     if (busy || shuttingDown) return;
     busy = true;
     try {
-      const [wallet, book] = await Promise.all([
-        getWalletBalances({ force: true, nativeOnly: true }),
-        getMyPositions(),
-      ]);
-      const lines = [
-        `📊 Meridian • ${config.standalone.shadow ? "SHADOW" : "LIVE"}`,
-        `Wallet ${wallet.wallet || book.wallet || "belum tersedia"}`,
-        `Saldo ${!wallet.error && Number.isFinite(wallet.sol) ? `${wallet.sol.toFixed(4)} SOL` : "belum tersedia"}`,
-      ];
-      if (book.error || !Array.isArray(book.positions)) {
-        lines.push("Posisi dan PnL belum tersedia.");
-      } else {
-        const unit = config.management.solMode ? "SOL" : "USD";
-        const known = book.positions.filter(p => Number.isFinite(p.pnl_usd) && !p.pnl_pct_suspicious);
-        const pnl = known.reduce((sum, p) => sum + p.pnl_usd, 0);
-        lines.push(`Posisi terbuka ${book.positions.length}`);
-        lines.push(`PnL terbuka ${known.length || !book.positions.length ? `${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} ${unit}` : "belum tersedia"}${known.length < book.positions.length ? ` (${known.length}/${book.positions.length} terukur)` : ""}`);
-        for (const p of book.positions.slice(0, 10)) {
-          const pct = !p.pnl_pct_suspicious && Number.isFinite(p.pnl_pct) ? `${p.pnl_pct.toFixed(2)}%` : "PnL belum tersedia";
-          const range = typeof p.in_range === "boolean" ? (p.in_range ? "in range" : "out of range") : "range belum tersedia";
-          lines.push(`• ${String(p.pair || p.position).slice(0, 80)} · ${pct} · ${range}`);
-        }
-        if (book.positions.length > 10) lines.push(`+${book.positions.length - 10} posisi lainnya`);
-      }
-      const research = Object.values(store.data.research ?? {}).filter(item => Date.now() - item.at < 86_400_000);
-      if (config.standalone.shadow && config.research.enabled) {
-        lines.push(`Riset 24 jam ${research.length} kandidat · ${research.reduce((sum, item) => sum + item.plans.length, 0)} rencana entry`);
-        const paper = store.data.paper;
-        const open = Object.values(paper?.open ?? {});
-        const recent = (paper?.closed ?? []).filter(p => p.accountingVersion && Date.now() - p.closedAt < 86_400_000);
-        const cancelled = (paper?.cancelled ?? []).filter(p => Date.now() - p.at < 86_400_000).length;
-        const pending = open.filter(p => p.exit).length;
-        lines.push(`Paper · ${open.filter(p => p.filledAt).length} terisi · ${open.filter(p => !p.filledAt).length} tunggu fill · ${recent.length} selesai/24j · ${cancelled} batal${pending ? ` · ${pending} tunggu quote` : ""}`);
-        const rows = (paper?.nav?.["convergence/baseline"] ?? []).filter(r => r.day < paperDay(Date.now()) && r.complete && r.start > 0 && r.end != null).slice(-30);
-        const average = rows.reduce((sum, r) => sum + (r.end / r.start - 1), 0) / rows.length;
-        const rec = recommendPaperVariant([...(paper?.closed ?? []), ...(paper?.cancelled ?? [])].sort((a,b) => a.openedAt-b.openedAt), Date.now());
-        lines.push(rows.length ? `Baseline · ${(average * 100).toFixed(2)}% rata-rata/hari · ${rows.length}/30 hari valid` : "Baseline · belum ada hari valid");
-        if (rec) lines.push(`Uji parameter · ${rec.variant.split("/").at(-1)} unggul ${rec.test.toFixed(4)} SOL/token pada ${rec.testMints} token validasi`);
-        const tracked = Object.keys(store.data.wallets).length;
-        if (tracked < config.standalone.walletThreshold) lines.push(`Convergence · ${tracked}/${config.standalone.walletThreshold} wallet siap`);
-      }
-      const { received, retries, waiting, passed, dropped, reasons } = discoveryStats;
-      lines.push(`Discovery sejak restart ${received} masuk · ${waiting} antre · ${retries} retry · ${passed} lolos · ${dropped} kedaluwarsa/tergeser`);
-      const topReasons = Object.entries(reasons).sort((a, b) => b[1] - a[1]).slice(0, 3);
-      if (topReasons.length) lines.push(`Kendala ${topReasons.map(([reason, n]) => `${reason} ×${n}`).join(" · ")}`);
+      const lines = [`📊 Meridian • ${config.standalone.shadow ? "SHADOW" : "LIVE"}`, ...await lifecycleStatusLines()];
       if (!shuttingDown) {
         await notify(lines.join("\n"));
         log("lifecycle", "Wallet, position and PnL report generated");
@@ -584,6 +608,12 @@ export async function startStandalone() {
   void manageOnce();
   const adminOptions = {
     monitor,
+    statusDetails: () => lifecycleStatusLines(true),
+    resetPnl: () => {
+      store.data.pnlResetAt ??= {};
+      store.data.pnlResetAt[config.standalone.shadow ? "shadow" : "live"] = Date.now();
+      store.save();
+    },
     activeSignals: () => Object.values(store.data.signals).filter(s => !s.done).length,
   };
   stopAdmin = startAdmin(adminOptions);
