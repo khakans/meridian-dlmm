@@ -145,12 +145,14 @@ export function startPaper(store, notify, {
             if (reason && p.exitTicks >= Math.max(1, config.pnl.confirmTicks)) p.exit = { at: now, reason, inventory };
           }
           if (p.exit && !p.filledAt) {
-            paper.cancelled.push({ id: p.id, mint: p.mint, source: p.source, variant: p.variant, at: now, closedAt: now,
+            paper.cancelled.push({ id: p.id, mint: p.mint, pool: p.pool, pair: p.pair, capital: p.capital,
+              lower: p.lower, upper: p.upper, entryBin: p.entryBin, source: p.source, variant: p.variant, at: now, closedAt: now,
               openedAt: p.openedAt, reason: p.exit.reason, costSol: COST_SOL, pnl: -COST_SOL, outcome: 'cancelled', accountingVersion: 1 });
             paper.realized[p.variant] -= COST_SOL;
             delete paper.open[p.id];
           } else if (p.exit && pnl != null) {
-            paper.closed.push({ id: p.id, mint: p.mint, shape: p.shape, range: p.range, variant: p.variant, openedAt: p.openedAt,
+            paper.closed.push({ id: p.id, mint: p.mint, pool: p.pool, pair: p.pair, capital: p.capital,
+              lower: p.lower, upper: p.upper, entryBin: p.entryBin, shape: p.shape, range: p.range, variant: p.variant, openedAt: p.openedAt,
               closedAt: Date.now(), filledAt: p.filledAt, pnl, reason: p.exit.reason, solInventory: inventory.sol, quotedSol: proceeds,
               feeSol: inventory.feeSol, feeTokens: inventory.feeTokens, costSol: COST_SOL,
               source: p.source, outcome: 'settled', accountingVersion: 1 });
@@ -225,7 +227,7 @@ export function startPaper(store, notify, {
             const available = (plan.bankroll ?? config.research.paperBankrollSol) + (paper.realized[plan.variant] ?? 0) - reserved;
             if (available < positionCapital + COST_SOL) continue;
             const id = `${source}:${c.mint}:${c.at}:${index}`;
-            const position = { ...plan, id, mint: c.mint, pool: c.pool, decimals: c.decimals, source,
+            const position = { ...plan, id, mint: c.mint, pool: c.pool, pair: c.pair, decimals: c.decimals, source,
               openedAt: now, entryBin: active.binId, entryPrice: price, capital: positionCapital, mark: { at: now, pnl: -COST_SOL } };
             position.binSeed = seedPaperBins(position, entryBins);
             paper.realized[plan.variant] ??= 0;

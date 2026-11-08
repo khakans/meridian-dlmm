@@ -9,6 +9,7 @@ import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalo
 import { summarizePaper } from '../standalone/pnl-summary.js';
 import { lowerRangeStop } from '../exit-rules.js';
 import { tokenDelta } from '../standalone/settlement.js';
+import { positionsPage } from '../standalone/positions-view.js';
 
 test('settlement only attributes the closed mint balance change to the specified wallet', () => {
   const token = (owner, mint, amount) => ({ owner, mint, uiTokenAmount: { amount } });
@@ -25,6 +26,42 @@ test('hard lower-range stop measures price beyond the lower bin, not position Pn
   assert.equal(lowerRangeStop(97, null, 100, 2), null);
 });
 import { emptyMonitor, openModeDatabase } from '../standalone/database.js';
+
+test('position pages preserve mode separation, history past a reset, and unknown PnL', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-positions-'));
+  const shadow = openModeDatabase('shadow', dir);
+  const live = openModeDatabase('live', dir);
+  try {
+    const now = Date.UTC(2026, 10, 8);
+    const paper = { variant: 'discovery/volatility/spot', pair: 'MEME/SOL', capital: 0.1,
+      openedAt: now - 600_000, closedAt: now - 300_000, pnl: 0.025, accountingVersion: 1 };
+    for (let i = 0; i < 3; i++) shadow.append('paper-close', i, paper.closedAt + i, paper);
+    shadow.append('paper-close', 'retired', now, { ...paper, variant: 'discovery/fibonacci/spot' });
+    live.append('live-close', 'priced', now - 60_000, { position: 'priced', pool_name: 'LIVE/SOL', pnl_usd: 3 });
+    live.append('decision', 'duplicate', now, { type: 'close', position: 'priced' });
+    live.append('decision', 'unknown', now, { type: 'close', position: 'unknown', pool_name: 'OTHER/SOL' });
+    const data = { pnlResetAt: { shadow: now }, paper: { open: { stale: { ...paper, mark: { at: now - 181_000, pnl: 0.08 } } } } };
+    const view = (database, tab, page = 0) => positionsPage({
+      store: { database, data }, tab, page, now, getSettlements: () => [],
+      readBook: async () => ({ error: 'offline' }),
+    });
+    assert.match((await view(shadow, 'open')).text, /PnL terbuka —/);
+    const history = await view(shadow, 'closed', 1);
+    assert.match(history.text, /3 posisi · Halaman 2\/2/);
+    assert.match(history.text, /MEME\/SOL.*\n.*\+0\.0250 SOL.*\+25\.00%/);
+    assert.match(history.text, /WIB/);
+    const liveHistory = await view(live, 'closed');
+    assert.match(liveHistory.text, /2 posisi/);
+    assert.match(liveHistory.text, /OTHER\/SOL\nPnL terealisasi —/);
+    assert.match(liveHistory.text, /LIVE\/SOL\nPnL terealisasi \+3\.00 USD/);
+    assert.doesNotMatch(liveHistory.text, /SHADOW|MEME/);
+    assert.match((await view(live, 'open')).text, /on-chain belum tersedia/);
+  } finally {
+    shadow.db.close();
+    live.db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('SQLite migrates paper and live data separately and persists paper history once', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-sqlite-'));

@@ -956,6 +956,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           fee_per_tvl_24h:    binData
             ? Math.round(parseFloat(binData.feePerTvl24h || 0) * 100) / 100
             : null,
+          opened_at:          binData?.createdAt ? binData.createdAt * 1000 : tracked?.deployed_at ?? null,
           age_minutes:        binData?.createdAt ? Math.floor((Date.now() - binData.createdAt * 1000) / 60000) : ageFromState,
           minutes_out_of_range: minutesOutOfRange(positionAddress),
           instruction:        tracked?.instruction ?? null,
@@ -1288,6 +1289,8 @@ export async function closePosition({ position_address, reason, onClosed }) {
         fee_tvl_ratio: tracked.fee_tvl_ratio || null,
         organic_score: tracked.organic_score || null,
         amount_sol: tracked.amount_sol,
+        deployed_at: tracked.deployed_at,
+        close_txs: closeTxHashes,
         fees_earned_usd: feesUsd,
         final_value_usd: finalValueUsd,
         initial_value_usd: initialUsd,
@@ -1320,6 +1323,9 @@ export async function closePosition({ position_address, reason, onClosed }) {
           pnl_pct: pnlPct,
           fees_usd: feesUsd,
           minutes_held: minutesHeld,
+          base_mint: closeBaseMint,
+          deployed_at: tracked.deployed_at,
+          close_txs: closeTxHashes,
         },
       });
 
@@ -1346,7 +1352,7 @@ export async function closePosition({ position_address, reason, onClosed }) {
       position: position_address,
       summary: "Closed position",
       reason: reason || "agent decision",
-      metrics: {},
+      metrics: { base_mint: pool.lbPair.tokenXMint.toString(), close_txs: closeTxHashes },
     });
 
     return {

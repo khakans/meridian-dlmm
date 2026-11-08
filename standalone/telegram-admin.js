@@ -228,6 +228,7 @@ function rootKeyboard() {
   const mode = `🌑 Shadow: ${config.standalone.shadow ? "ON" : "OFF"}`;
   return [
     [{ text: "👛 Wallets", callback_data: "s:wallets" }, { text: "🖥 Status", callback_data: "s:status" }],
+    [{ text: "📋 Positions", callback_data: "s:positions" }],
     ...SECTIONS.map(s => [{ text: s.title, callback_data: `s:${s.id}` }]),
     [{ text: "🔑 Bot key", callback_data: "s:key" }, { text: mode, callback_data: "m:shadow" }],
     [{ text: "♻️ Restart bot", callback_data: "m:restart" }],
@@ -278,7 +279,7 @@ const restartRow = () => [{ text: "♻️ Restart now", callback_data: "m:restar
 export const _test = { SECTIONS, byKey, editHint, validate, sectionMenu, fmtValue };
 
 export function createAdminConsole(transport, {
-  monitor = null, activeSignals = null, restart, statusDetails, resetPnl, slack = false,
+  monitor = null, activeSignals = null, restart, statusDetails, positionDetails, resetPnl, slack = false,
 } = {}) {
   const { sendMessage, sendMenu, editMenu } = transport;
   const answerCallbackQuery = transport.answerCallbackQuery ?? (async () => {});
@@ -312,6 +313,20 @@ export function createAdminConsole(transport, {
   }
 
   async function viewSection(sectionId, note = "") {
+    const positions = /^positions(?::(open|closed|cancelled):(\d{1,9}))?$/.exec(sectionId);
+    if (positions && positionDetails) {
+      const view = await positionDetails(positions[1] ?? "open", Number(positions[2] ?? 0));
+      const button = (text, tab, page = 0) => ({ text, callback_data: `s:positions:${tab}:${page}` });
+      const labels = { open: "Terbuka", closed: "Riwayat tutup", cancelled: "Batal" };
+      const navigation = [];
+      if (view.page > 0) navigation.push(button("← Sebelumnya", view.tab, view.page - 1));
+      if (view.page + 1 < view.pages) navigation.push(button("Berikutnya →", view.tab, view.page + 1));
+      return void await render(view.text, [
+        view.tabs.map(tab => button(labels[tab], tab)),
+        ...(navigation.length ? [navigation] : []),
+        [button("↻ Muat ulang", view.tab, view.page), { text: "← Back", callback_data: "s:root" }],
+      ]);
+    }
     if (sectionId === "wallets") {
       const { wallets } = listSmartWallets();
       const rows = wallets.map(w => [{ text: `🗑 ${w.name}`, callback_data: `w:rm:${w.address}` }]);

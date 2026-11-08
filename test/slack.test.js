@@ -52,6 +52,10 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   const slack = createSlackConsole({
     client, channel: "D1", owner: "U1", team: "T1", appId: "A1",
     restart: async () => { restarts++; },
+    positionDetails: async (tab, page) => ({
+      text: `Positions · ${tab} · Halaman ${page + 1}/2`,
+      tab, page, pages: 2, tabs: ["open", "closed", "cancelled"],
+    }),
   });
   const message = (text, event = {}, body = {}) => slack.message(
     { team_id: "T1", api_app_id: "A1", event_id: String(++request), ...body },
@@ -80,6 +84,15 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   assert.equal(replies.length, 0);
   await slash("menu");
   const menuTs = card.ts;
+  await click(find("Positions"));
+  assert.match(card.text, /open · Halaman 1/);
+  await click(find("Berikutnya"));
+  assert.match(card.text, /open · Halaman 2/);
+  await click(find("Riwayat tutup"));
+  assert.match(card.text, /closed · Halaman 1/);
+  await click(find("Muat ulang"));
+  assert.match(card.text, /closed · Halaman 1/);
+  await click(find("Back"));
   for (const section of _test.SECTIONS) {
     await click(find(section.title));
     let visible = buttons().map(b => b.text.text);

@@ -21,6 +21,7 @@ import { withWalletLock } from "./transactions.js";
 import { paperDay, recommendPaperVariant } from "./paper-accounting.js";
 import { getPerformanceHistory } from "../performance.js";
 import { paperPnlLines, signed, summarizePaper } from "./pnl-summary.js";
+import { positionsPage } from "./positions-view.js";
 import { exposureStillPresent } from "./events.js";
 import { getActiveBin, getMyPositions } from "../tools/dlmm.js";
 import { executeTool } from "../tools/executor.js";
@@ -512,7 +513,7 @@ async function recordResearch(mint, screened, sources, convergence = null) {
   if (shuttingDown || !config.standalone.shadow) return;
   const latest = records[key];
   records[key] = {
-    at: Date.now(), mint, pool: screened.pool.pool_address,
+    at: Date.now(), mint, pool: screened.pool.pool_address, pair: screened.pool.name,
     source: convergence ? "convergence" : "discovery",
     capital: convergence?.capital,
     marketCap: screened.token.mcap,
@@ -705,6 +706,10 @@ export async function startStandalone() {
   const adminOptions = {
     monitor,
     statusDetails: () => lifecycleStatusLines(true),
+    positionDetails: (tab, page) => positionsPage({
+      store, tab, page, readBook: () => getMyPositions({ force: true, silent: true }),
+      getTracked: getTrackedPosition, getSettlements: settlementRows, solMode: config.management.solMode,
+    }),
     resetPnl: () => store.resetPnl(),
     activeSignals: () => Object.values(store.data.signals).filter(s => !s.done).length,
     restart: async (send, beforeRestart) => {
