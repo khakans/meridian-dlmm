@@ -42,14 +42,20 @@ function paperLines(p, tab, now, research) {
   const lines = [`• ${safe(pair) || 'Pair belum tercatat'} · ${safe(p.variant)}`];
   const open = tab === 'open';
   const end = open ? now : p.closedAt ?? p.historyAt;
-  const fresh = Number.isFinite(p.mark?.pnl) && p.mark.at <= now && now - p.mark.at <= MARK_MAX_AGE;
-  const pnl = open ? (fresh ? p.mark.pnl : null) : p.accountingVersion ? p.pnl : null;
+  const fresh = mark => Number.isFinite(mark?.pnl) && mark.at <= now && now - mark.at <= MARK_MAX_AGE;
+  const indicative = open && fresh(p.indicativeMark);
+  const mark = indicative ? p.indicativeMark : p.mark;
+  const pnl = open ? mark?.pnl : p.accountingVersion ? p.pnl : null;
+  const markLabel = indicative ? 'estimasi harga bin, tanpa quote jual'
+    : p.markIssue || !fresh(mark) ? 'nilai terakhir, belum diperbarui'
+    : mark.at === p.openedAt ? 'estimasi biaya awal' : 'quote jual';
   const pct = Number.isFinite(pnl) && p.capital > 0 ? pnl / p.capital * 100 : null;
   const status = open ? (p.exit ? 'Menunggu quote keluar' : p.filledAt ? 'Terisi' : 'Menunggu fill')
     : tab === 'closed' ? 'Ditutup' : 'Batal sebelum fill';
   lines.push(`Status ${status} · PnL ${open ? 'terbuka' : 'terealisasi'} ${amount(pnl, 'SOL', true)}${pct == null ? '' : ` (${amount(pct, '%', true)})`}`);
   if (!open && !p.accountingVersion) lines.push('PnL historis belum memakai pencatatan net.');
-  if (open) lines.push(`Mark ${stamp(p.mark?.at)}${fresh ? '' : ' · data belum tersedia atau kedaluwarsa'}`);
+  if (open) lines.push(`Mark ${stamp(mark?.at)} · ${mark ? markLabel : 'belum ada valuasi'}`,
+    ...(p.markIssue && !indicative ? [safe(p.markIssue)] : []));
   lines.push(`Dibuka ${stamp(p.openedAt)} · Umur ${elapsed(p.openedAt, end)}`);
   if (p.filledAt) lines.push(`Fill ${stamp(p.filledAt)}`);
   if (!open) lines.push(`Selesai ${stamp(end)}`);

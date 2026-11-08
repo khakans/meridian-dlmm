@@ -45,7 +45,13 @@ test('position pages preserve mode separation, history past a reset, and unknown
       store: { database, data }, tab, page, now, getSettlements: () => [],
       readBook: async () => ({ error: 'offline' }),
     });
-    assert.match((await view(shadow, 'open')).text, /PnL terbuka —/);
+    const lastMark = await view(shadow, 'open');
+    assert.match(lastMark.text, /PnL terbuka \+0\.0800 SOL/);
+    assert.match(lastMark.text, /nilai terakhir, belum diperbarui/);
+    data.paper.open.stale.indicativeMark = { at: now, pnl: 0.01 };
+    const indicative = await view(shadow, 'open');
+    assert.match(indicative.text, /PnL terbuka \+0\.0100 SOL/);
+    assert.match(indicative.text, /estimasi harga bin, tanpa quote jual/);
     const history = await view(shadow, 'closed', 1);
     assert.match(history.text, /3 posisi · Halaman 2\/2/);
     assert.match(history.text, /MEME\/SOL.*\n.*\+0\.0250 SOL.*\+25\.00%/);
@@ -206,8 +212,13 @@ test('paper entry checks exit quote and manual close persists while settlement i
     const [position] = Object.values(store.data.paper.open);
     assert.ok(position);
     active = { binId: 20, price: 0.3 };
-    position.manualExit = 'manual force close';
     quoteAvailable = false;
+    const lastMark = position.mark;
+    await run();
+    assert.equal(position.mark, lastMark);
+    assert.equal(position.markIssue, 'Quote jual belum tersedia');
+    assert.ok(Number.isFinite(position.indicativeMark?.pnl));
+    position.manualExit = 'manual force close';
     await run();
     assert.ok(position.exit?.inventory.tokens > 0);
     assert.equal(position.exit.reason, 'manual force close');

@@ -59,7 +59,7 @@ export function recordPaperNav(paper, now, bankroll) {
   for (const [variant, realized] of Object.entries(paper.realized)) {
     if (!isActivePaperVariant(variant)) continue;
     const positions = open.filter(p => p.variant === variant);
-    const waiting = positions.some(p => !p.mark || now - p.mark.at > 180_000);
+    const waiting = positions.some(p => p.markIssue || !p.mark || now - p.mark.at > 180_000);
     const initial = paper.bankrolls?.[variant] ?? bankroll;
     const equity = waiting ? null : initial + realized + positions.reduce((n, p) => n + p.mark.pnl, 0);
     const rows = paper.nav[variant] ??= [];

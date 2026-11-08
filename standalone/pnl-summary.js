@@ -13,7 +13,7 @@ export function summarizePaper(paper, from, to = Date.now()) {
     if (!p.binSeed || !p.variant) continue;
     const g = get(p.variant);
     g.open++;
-    if (Number.isFinite(p.mark?.pnl) && p.mark.at <= to && to - p.mark.at <= 180_000) {
+    if (!p.markIssue && Number.isFinite(p.mark?.pnl) && p.mark.at <= to && to - p.mark.at <= 180_000) {
       g.marked++;
       g.openPnl += p.mark.pnl;
     }

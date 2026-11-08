@@ -122,24 +122,44 @@ export function startPaper(store, notify, {
         if (!snapshots.has(key)) snapshots.set(key, snapshot(pool, lower, upper).catch(() => null));
         return snapshots.get(key);
       };
+      const markUnavailable = (p, reason, indicativeMark = null) => {
+        p.markIssue = reason;
+        p.indicativeMark = indicativeMark;
+      };
       for (const p of Object.values(paper.open)) {
         if (stopped || !config.standalone.shadow) return;
         try {
           if (p.manualExit && !p.exit) p.manualExitCheckedAt = now;
           const active = p.exit ? null : await readActive(p.pool);
-          if (!p.exit && !validActive(active)) { p.mark = null; continue; }
+          if (!p.exit && !validActive(active)) {
+            markUnavailable(p, 'Bin aktif belum tersedia');
+            continue;
+          }
           if (!p.exit) p.hardLowerExit ??= lowerRangeStop(active.binId, p.lower,
             active.binStep ?? (p.ratio - 1) * 10_000, config.management.outOfRangeBelowStopPct);
           const bins = p.exit ? null : await readSnapshot(p.pool, p.lower, p.upper);
           const inventory = p.exit?.inventory ?? (bins && markPaperBins(p, active.binId, bins));
-          if (!inventory) { p.mark = null; continue; }
+          if (!inventory) {
+            markUnavailable(p, bins ? 'Inventori bin belum bisa dinilai' : 'Snapshot bin belum tersedia');
+            continue;
+          }
           if (!p.filledAt && (inventory.tokens > 0 || inventory.feeEvidence)) p.filledAt = now;
           const forcedExit = p.hardLowerExit ?? p.manualExit;
           if (!p.exit && forcedExit) p.exit = { at: now, reason: forcedExit, inventory };
-          const proceeds = await sellQuote(p.mint, rawTokens(inventory.tokens + inventory.feeTokens, p.decimals));
+          const tokenAmount = inventory.tokens + inventory.feeTokens;
+          const proceeds = await sellQuote(p.mint, rawTokens(tokenAmount, p.decimals));
           if (stopped || !config.standalone.shadow) return;
-          const pnl = proceeds == null ? null : inventory.sol + inventory.feeSol + proceeds - p.capital - COST_SOL;
-          p.mark = pnl == null ? null : { at: Date.now(), pnl };
+          const net = inventory.sol + inventory.feeSol + proceeds - p.capital - COST_SOL;
+          const pnl = proceeds != null && Number.isFinite(net) ? net : null;
+          if (pnl != null) {
+            p.mark = { at: Date.now(), pnl };
+            p.markIssue = null;
+            p.indicativeMark = null;
+          } else {
+            const indicative = validActive(active)
+              ? inventory.sol + inventory.feeSol + tokenAmount * Number(active.price) - p.capital - COST_SOL : null;
+            markUnavailable(p, 'Quote jual belum tersedia', Number.isFinite(indicative) ? { at: Date.now(), pnl: indicative } : null);
+          }
           if (!p.exit) {
             const reason = paperCloseRule(p, active, pnl == null ? null : pnl / p.capital * 100, now);
             p.exitTicks = reason && reason === p.exitSignal ? (p.exitTicks ?? 0) + 1 : Number(Boolean(reason));
@@ -162,7 +182,7 @@ export function startPaper(store, notify, {
             delete paper.open[p.id];
             closed.push(`• ${p.mint.slice(0, 8)} · ${p.variant ?? `${p.range}/${p.shape}`} · ${pnl.toFixed(4)} SOL · ${p.exit.reason}`);
           }
-        } catch { p.mark = null; }
+        } catch { markUnavailable(p, 'Valuasi belum bisa dihitung'); }
       }
       recordPaperNav(paper, Date.now(), config.research.paperBankrollSol);
       const openMints = new Set(Object.values(paper.open).map(p => `${p.source}:${p.mint}`));
