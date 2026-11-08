@@ -4,9 +4,12 @@ import {
   LAMPORTS_PER_SOL,
   VersionedTransaction,
   Keypair,
+  Transaction,
 } from "@solana/web3.js";
+import { createCloseAccountInstruction, getAssociatedTokenAddressSync, unpackAccount } from "@solana/spl-token";
 import bs58 from "bs58";
-import { rpcBalances, priceBalances } from "../standalone/balances.js";
+import { rpcBalances, priceBalances, TOKEN_PROGRAMS } from "../standalone/balances.js";
+import { sendPositionWrite } from "../standalone/position-journal.js";
 import { log } from "../logger.js";
 import { config } from "../config.js";
 
@@ -24,6 +27,22 @@ function getWallet() {
     _wallet = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY));
   }
   return _wallet;
+}
+
+export async function reclaimEmptyPositionAta(position, address, mint, owner) {
+  const wallet = getWallet();
+  if (wallet.publicKey.toBase58() !== owner) throw Error("Settlement wallet mismatch");
+  const connection = getConnection();
+  const ata = new PublicKey(address);
+  const mintKey = new PublicKey(mint);
+  const info = await connection.getAccountInfo(ata, "confirmed");
+  if (!info || !TOKEN_PROGRAMS.includes(info.owner.toBase58()) ||
+      !ata.equals(getAssociatedTokenAddressSync(mintKey, wallet.publicKey, false, info.owner))) return false;
+  const account = unpackAccount(ata, info, info.owner);
+  if (account.amount !== 0n || account.isNative || !account.mint.equals(mintKey) ||
+      !account.owner.equals(wallet.publicKey) || (account.closeAuthority && !account.closeAuthority.equals(wallet.publicKey))) return false;
+  const tx = new Transaction().add(createCloseAccountInstruction(ata, wallet.publicKey, wallet.publicKey, [], info.owner));
+  return sendPositionWrite(connection, tx, [wallet], position, "rent");
 }
 
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";

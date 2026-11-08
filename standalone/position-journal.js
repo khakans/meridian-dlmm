@@ -96,3 +96,20 @@ export function netWalletSol(transactions, owner) {
   const total = deltas.reduce((sum, delta) => sum + delta, 0);
   return Number.isSafeInteger(total) ? total / 1e9 : null;
 }
+
+export async function estimateEntryOverheadSol(position, owner, capital) {
+  const entries = positionWrites(position).filter(row => row.stage === 'entry' && row.status === 'confirmed');
+  if (!entries.length || !owner || !(capital > 0)) return null;
+  const txs = await Promise.all(entries.map(row => readRpc('monitor', c =>
+    c.getTransaction(row.signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 }))));
+  const walletDelta = netWalletSol(txs, owner);
+  const positionDelta = netWalletSol(txs, position);
+  if (walletDelta == null || positionDelta == null || positionDelta < 0) return null;
+  return Math.max(0, -walletDelta - positionDelta - capital);
+}
+
+export function estimateNetExitPct(grossPct, capital, entryOverheadSol) {
+  if (!Number.isFinite(grossPct) || !(capital > 0) || !Number.isFinite(entryOverheadSol) || entryOverheadSol < 0) return null;
+  const exitFeeReserveSol = 0.00003;
+  return grossPct - (entryOverheadSol + exitFeeReserveSol) / capital * 100;
+}

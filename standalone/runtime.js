@@ -18,7 +18,7 @@ import { startDiscovery } from "./discovery.js";
 import { isActivePaperVariant } from "./entry-plans.js";
 import { mirrorExitReason, prepareMirrorPosition, startPaper, validateExitQuote } from "./paper.js";
 import { advanceSettlement, dueSettlements, settlementComplete, settlementRows } from "./settlement.js";
-import { isRetryableEntryError, positionWrites, reconcilePositionWrites } from "./position-journal.js";
+import { estimateEntryOverheadSol, estimateNetExitPct, isRetryableEntryError, positionWrites, reconcilePositionWrites } from "./position-journal.js";
 import { readRpc } from "./rpc.js";
 import { withWalletLock } from "./transactions.js";
 import { paperDay } from "./paper-accounting.js";
@@ -149,6 +149,7 @@ function startSettlementWorker() {
           lines.push(`Sisa token ≈ ${result.dustSol.toFixed(8)} SOL · masih di wallet, di luar PnL net posisi`);
         }
         if (result.signature) lines.push(`Tx: ${result.signature}`);
+        if (result.rentReclaimTx) lines.push("Rent akun token kosong dikembalikan ke wallet", `Tx: ${result.rentReclaimTx}`);
         await notify(lines.join("\n"));
       }
     } catch { log("settlement_warn", "Settlement retry unavailable"); }
@@ -550,7 +551,14 @@ function startPnlPoller() {
         };
         state.lower = p.lower_bin;
         state.upper = p.upper_bin;
-        const pnlPct = Number.isFinite(p.strategy_pnl_pct) ? p.strategy_pnl_pct : null;
+        const capital = trackedPosition?.amount_sol;
+        if (state.entryOverheadSol == null && Number.isFinite(p.strategy_pnl_pct) && capital > 0) {
+          state.entryOverheadSol = await estimateEntryOverheadSol(p.position, live.wallet, capital).catch(() => null);
+        }
+        // Keep the gross stop-loss as a backstop when entry metadata is unavailable.
+        const gross = Number.isFinite(p.strategy_pnl_pct) ? p.strategy_pnl_pct : null;
+        const pnlPct = estimateNetExitPct(gross, capital, state.entryOverheadSol) ??
+          (gross != null && gross <= config.management.stopLossPct ? gross : null);
         const reason = state.closeReason ?? mirrorExitReason(state, { binId: p.active_bin }, pnlPct, now);
         if (!reason) continue;
         state.closeReason = reason;

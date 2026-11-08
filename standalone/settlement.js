@@ -3,7 +3,7 @@ import { modeDatabase } from './database.js';
 import { readRpc } from './rpc.js';
 import { netWalletSol, reconcilePositionWrites } from './position-journal.js';
 import { PublicKey } from '@solana/web3.js';
-import { getWalletBalances, quoteTokenToSol, SETTLEMENT_SLIPPAGE_BPS, swapToken } from '../tools/wallet.js';
+import { getWalletBalances, quoteTokenToSol, reclaimEmptyPositionAta, SETTLEMENT_SLIPPAGE_BPS, swapToken } from '../tools/wallet.js';
 
 const active = new Set(['closing', 'awaiting_balance', 'awaiting_quote', 'submitted']);
 const terminal = new Set(['swapped', 'no_balance', 'dust_remaining']);
@@ -59,18 +59,52 @@ export function tokenDelta(meta, mint, owner) {
 const readTransaction = signature => readRpc('monitor', c => c.getTransaction(signature,
   { maxSupportedTransactionVersion: 0, commitment: 'finalized' }));
 
+export function entryCreatedTokenAccounts(txs, mint, owner) {
+  const addresses = new Set();
+  for (const tx of txs) {
+    if (!tx?.meta || tx.meta.err) continue;
+    const message = tx.transaction.message;
+    const keys = [...(message.staticAccountKeys ?? message.accountKeys),
+      ...(tx.meta.loadedAddresses?.writable ?? []), ...(tx.meta.loadedAddresses?.readonly ?? [])];
+    for (const token of tx.meta.postTokenBalances ?? []) {
+      const i = token.accountIndex;
+      if (token.owner === owner && token.mint === mint &&
+          tx.meta.preBalances[i] === 0 && tx.meta.postBalances[i] > 0 && keys[i]) addresses.add(String(keys[i]));
+    }
+  }
+  return [...addresses];
+}
+
 async function finalizeSettlement(row, status) {
   const journal = await reconcilePositionWrites(row.id);
   const entry = journal.filter(item => item.stage === 'entry' && item.status === 'confirmed');
   const close = [...new Set([...(row.txs ?? []),
     ...journal.filter(item => item.stage === 'close' && item.status === 'confirmed').map(item => item.signature)])];
   const failed = journal.filter(item => item.status === 'failed').map(item => item.signature);
-  const signatureList = [...new Set([...entry.map(item => item.signature), ...close, ...failed, ...(row.failedSwapSignatures ?? []),
+  const reclaim = journal.filter(item => item.stage === 'rent');
+  if (reclaim.some(item => item.status === 'pending')) return update(row, row.status, { nextAt: Date.now() + 15_000 });
+  const reclaimed = reclaim.filter(item => item.status === 'confirmed').map(item => item.signature);
+  const signatureList = [...new Set([...entry.map(item => item.signature), ...close, ...failed, ...reclaimed, ...(row.failedSwapSignatures ?? []),
     ...(status === 'swapped' ? [row.signature] : [])])];
   const txs = await Promise.all(signatureList.map(readTransaction));
   if (txs.some(tx => !tx?.meta)) return update(row, row.status, { nextAt: Date.now() + 30_000 });
+  // Dust can still be held by the account. Only an empty, position-created ATA may be closed.
+  if (status !== 'dust_remaining' && !reclaim.length) {
+    const candidates = entryCreatedTokenAccounts(txs.slice(0, entry.length), row.mint, row.wallet);
+    if (candidates.length === 1) {
+      try {
+        if (await reclaimEmptyPositionAta(row.id, candidates[0], row.mint, row.wallet)) {
+          return update(row, row.status, { nextAt: Date.now() + 15_000 });
+        }
+      } catch {
+        if ((await reconcilePositionWrites(row.id)).some(item => item.stage === 'rent')) {
+          return update(row, row.status, { nextAt: Date.now() + 15_000 });
+        }
+      }
+    }
+  }
   const netSol = entry.length && close.length ? netWalletSol(txs, row.wallet) : null;
-  return update(row, status, { netSol, netSolSource: netSol == null ? 'entry or wallet metadata unavailable' : 'wallet transaction deltas' });
+  return update(row, status, { netSol, rentReclaimTx: reclaimed[0], netSolSource: netSol == null ? 'entry or wallet metadata unavailable' : 'wallet transaction deltas' });
 }
 
 export async function advanceSettlement(row) {

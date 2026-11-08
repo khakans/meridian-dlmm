@@ -9,10 +9,10 @@ import { mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMir
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
 import { paperPnlLines, paperRealizedLine, summarizePaper } from '../standalone/pnl-summary.js';
 import { lowerRangeStop } from '../exit-rules.js';
-import { settlementComplete, tokenDelta } from '../standalone/settlement.js';
+import { entryCreatedTokenAccounts, settlementComplete, tokenDelta } from '../standalone/settlement.js';
 import { meetsSettlementMinimum } from '../tools/wallet.js';
 import { positionsPage } from '../standalone/positions-view.js';
-import { isRetryableEntryError, netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
+import { estimateNetExitPct, isRetryableEntryError, netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
 import { DLMM_PROGRAM, recoverablePositionRent } from '../standalone/events.js';
 
 test('settlement only attributes the closed mint balance change to the specified wallet', () => {
@@ -30,6 +30,21 @@ test('hard lower-range stop measures price beyond the lower bin, not position Pn
   assert.equal(lowerRangeStop(97, null, 100, 2), null);
 });
 import { emptyMonitor, openModeDatabase } from '../standalone/database.js';
+
+test('settlement only considers new token accounts from the matching entry wallet and mint', () => {
+  const tx = { transaction: { message: { staticAccountKeys: ['wallet', 'new', 'existing', 'other'] } },
+    meta: { preBalances: [10, 0, 5, 0], postBalances: [5, 5, 5, 5],
+      postTokenBalances: [{ owner: 'wallet', mint: 'mint', accountIndex: 1 },
+        { owner: 'wallet', mint: 'mint', accountIndex: 2 }, { owner: 'other', mint: 'mint', accountIndex: 3 }] } };
+  assert.deepEqual(entryCreatedTokenAccounts([tx], 'mint', 'wallet'), ['new']);
+  assert.deepEqual(entryCreatedTokenAccounts([tx], 'different', 'wallet'), []);
+});
+
+test('positive gross SOL return can become negative after known entry overhead', () => {
+  assert.ok(estimateNetExitPct(0.2, 0.18, 0.0015) < 0);
+  assert.ok(estimateNetExitPct(2, 0.18, 0.0015) > 0);
+  assert.equal(estimateNetExitPct(2, 0.18, null), null);
+});
 
 test('LP rent only counts a valid position owned by the trading wallet', async () => {
   const positions = [{ position: Keypair.generate().publicKey.toBase58(), pool: 'pool' }];
