@@ -581,6 +581,9 @@ async function lifecycleStatusLines(detailed = false) {
   if (config.standalone.shadow && config.research.enabled) {
     const research = Object.values(store.data.research ?? {}).filter(item => now - item.at < 86_400_000);
     lines.push(`Riset 24 jam ${research.length} kandidat · ${research.reduce((sum, item) => sum + item.plans.length, 0)} rencana entry`);
+    const convergenceCount = research.filter(item => item.source === "convergence").length;
+    const { walletThreshold, windowSec } = config.standalone;
+    lines.push(`Convergence 24 jam · ${convergenceCount} kandidat · syarat ${walletThreshold} wallet berbeda / ${windowSec}s`);
     const paper = store.data.paper;
     const open = Object.values(paper?.open ?? {});
     const recent = (paper?.closed ?? []).filter(p => p.accountingVersion && isActivePaperVariant(p.variant) && Date.now() - p.closedAt < 86_400_000);

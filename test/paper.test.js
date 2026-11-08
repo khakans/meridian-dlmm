@@ -6,7 +6,7 @@ import path from 'node:path';
 import { config } from '../config.js';
 import { paperBins, paperCloseRule, paperInventory, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
-import { summarizePaper } from '../standalone/pnl-summary.js';
+import { paperPnlLines, summarizePaper } from '../standalone/pnl-summary.js';
 import { lowerRangeStop } from '../exit-rules.js';
 import { tokenDelta } from '../standalone/settlement.js';
 import { positionsPage } from '../standalone/positions-view.js';
@@ -26,6 +26,14 @@ test('hard lower-range stop measures price beyond the lower bin, not position Pn
   assert.equal(lowerRangeStop(97, null, 100, 2), null);
 });
 import { emptyMonitor, openModeDatabase } from '../standalone/database.js';
+
+test('Convergence baseline distinguishes no positions, missing valuation, and measured zero', () => {
+  const line = variants => paperPnlLines({ variants }, false)[1];
+  assert.match(line([]), /Convergence baseline.*terbuka 0 posisi · terealisasi belum ada posisi selesai/);
+  const group = { variant: 'convergence/baseline', open: 1, marked: 0 };
+  assert.match(line([group]), /menunggu valuasi \(1 posisi\)/);
+  assert.match(line([{ ...group, marked: 1, openPnl: 0, closed: 1, realized: 0 }]), /terbuka \+0\.0000 SOL · terealisasi \+0\.0000 SOL/);
+});
 
 test('position pages preserve mode separation, history past a reset, and unknown PnL', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-positions-'));

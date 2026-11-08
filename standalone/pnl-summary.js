@@ -48,10 +48,10 @@ export function paperPnlLines(summary, detailed) {
     ...(detailed ? active.filter(g => !primary.includes(g.variant)).slice(0, 8) : []),
   ];
   const lines = groups.map(g => {
-    const label = g.variant === "convergence/baseline" ? "Convergence" : g.variant.replace(/^discovery\/volatility\//, "Discovery ");
-    const open = !g.open ? "—" : !g.marked ? "menunggu valuasi" :
+    const label = g.variant === "convergence/baseline" ? "Convergence baseline" : g.variant.replace(/^discovery\/volatility\//, "Discovery ");
+    const open = !g.open ? "0 posisi" : !g.marked ? `menunggu valuasi (${g.open} posisi)` :
       `${signed(g.openPnl)} SOL${g.marked < g.open ? ` (${g.marked}/${g.open})` : ""}`;
-    const realized = g.closed || g.cancelled ? `${signed(g.realized)} SOL` : "—";
+    const realized = g.closed || g.cancelled ? `${signed(g.realized)} SOL` : "belum ada posisi selesai";
     return `PnL Shadow (${label}) · terbuka ${open} · terealisasi ${realized}`;
   });
   return [all, ...lines];
