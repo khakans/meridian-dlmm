@@ -6,7 +6,7 @@ import path from 'node:path';
 import { config } from '../config.js';
 import { mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMirrorPosition, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
-import { paperPnlLines, summarizePaper } from '../standalone/pnl-summary.js';
+import { paperPnlLines, paperRealizedLine, summarizePaper } from '../standalone/pnl-summary.js';
 import { lowerRangeStop } from '../exit-rules.js';
 import { tokenDelta } from '../standalone/settlement.js';
 import { positionsPage } from '../standalone/positions-view.js';
@@ -26,6 +26,17 @@ test('hard lower-range stop measures price beyond the lower bin, not position Pn
   assert.equal(lowerRangeStop(97, null, 100, 2), null);
 });
 import { emptyMonitor, openModeDatabase } from '../standalone/database.js';
+
+test('Shadow All includes historical bankrolls while Mirror reports separately', () => {
+  const closed = [
+    { variant: 'discovery/volatility/spot', closedAt: 200, pnl: 0.7, accountingVersion: 1 },
+    { variant: 'discovery/volatility/mirror', closedAt: 250, pnl: 0.004, accountingVersion: 1, mirror: true },
+  ];
+  assert.equal(paperRealizedLine(summarizePaper({ closed }, 100, 300), 'All'), 'PnL Shadow (All) · terealisasi +0.7040 SOL');
+  assert.equal(paperPnlLines(summarizePaper({ closed: closed.filter(p => p.mirror) }, 100, 300), false,
+    'discovery/volatility/mirror', 'Mirror')[0], 'PnL Shadow (Mirror) · terealisasi +0.0040 SOL');
+  assert.equal(paperRealizedLine(summarizePaper({ closed }, 225, 300), 'All'), 'PnL Shadow (All) · terealisasi +0.0040 SOL');
+});
 
 test('Convergence baseline distinguishes no positions, missing valuation, and measured zero', () => {
   const line = variants => paperPnlLines({ variants }, false)[1];

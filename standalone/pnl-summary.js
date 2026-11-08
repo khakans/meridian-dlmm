@@ -37,12 +37,15 @@ export function summarizePaper(paper, from, to = Date.now()) {
   return { uniqueClosedMints: mints.size, variants: [...groups.values()].sort((a,b) => a.variant.localeCompare(b.variant)) };
 }
 
-export function paperPnlLines(summary, detailed, discoveryVariant = "discovery/volatility/spot") {
+export function paperRealizedLine(summary, label) {
+  const settled = summary.variants.filter(g => isActivePaperVariant(g.variant) && (g.closed || g.cancelled));
+  const total = settled.reduce((sum, g) => sum + g.realized, 0);
+  return `PnL Shadow (${label}) · terealisasi ${settled.length ? `${signed(total)} SOL` : "—"}`;
+}
+
+export function paperPnlLines(summary, detailed, discoveryVariant = "discovery/volatility/spot", totalLabel = "All") {
   const primary = ["convergence/baseline", discoveryVariant];
   const active = summary.variants.filter(g => isActivePaperVariant(g.variant));
-  const settled = active.filter(g => g.closed || g.cancelled);
-  const total = settled.reduce((sum, g) => sum + g.realized, 0);
-  const all = `PnL Shadow (All) · terealisasi ${settled.length ? `${signed(total)} SOL` : "—"}`;
   const groups = [
     ...primary.map(variant => active.find(g => g.variant === variant) ?? { variant }),
     ...(detailed ? active.filter(g => !primary.includes(g.variant)).slice(0, 8) : []),
@@ -54,5 +57,5 @@ export function paperPnlLines(summary, detailed, discoveryVariant = "discovery/v
     const realized = g.closed || g.cancelled ? `${signed(g.realized)} SOL` : "belum ada posisi selesai";
     return `PnL Shadow (${label}) · terbuka ${open} · terealisasi ${realized}`;
   });
-  return [all, ...lines];
+  return [paperRealizedLine(summary, totalLabel), ...lines];
 }

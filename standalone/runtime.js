@@ -20,7 +20,7 @@ import { advanceSettlement, dueSettlements, settlementRows } from "./settlement.
 import { withWalletLock } from "./transactions.js";
 import { paperDay } from "./paper-accounting.js";
 import { getPerformanceHistory } from "../performance.js";
-import { paperPnlLines, signed, summarizePaper } from "./pnl-summary.js";
+import { paperPnlLines, paperRealizedLine, signed, summarizePaper } from "./pnl-summary.js";
 import { openPositions, positionsPage, positionTarget } from "./positions-view.js";
 import { exposureStillPresent } from "./events.js";
 import { getActiveBin, getMyPositions } from "../tools/dlmm.js";
@@ -532,7 +532,8 @@ async function lifecycleStatusLines(detailed = false) {
     const paper = store.data.paper;
     const mirror = { open: Object.fromEntries(Object.entries(paper?.open ?? {}).filter(([, p]) => p.mirror)),
       closed: (paper?.closed ?? []).filter(p => p.mirror) };
-    lines.push(...paperPnlLines(summarizePaper(mirror, from, now), detailed, "discovery/volatility/mirror"));
+    lines.push(paperRealizedLine(summarizePaper(paper, from, now), "All"),
+      ...paperPnlLines(summarizePaper(mirror, from, now), detailed, "discovery/volatility/mirror", "Mirror"));
     const legacy = Object.values(paper?.open ?? {}).filter(p => !p.mirror).length;
     if (legacy) lines.push(`Eksperimen lama · ${legacy} posisi terbuka di riwayat paper`);
   }
