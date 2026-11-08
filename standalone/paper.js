@@ -61,7 +61,7 @@ export function prepareMirrorPosition({ source, mint, pool, pair, decimals, binS
   const variant = source === 'convergence' ? 'convergence/baseline' : 'discovery/volatility/mirror';
   const p = { id, mint, pool, pair, decimals, capital, source, shape, variant, mirror: true, range: 'volatility',
     lower: entry.binId - binsBelow, upper: entry.binId, entryBin: entry.binId, entryPrice: Number(entry.price),
-    ratio: 1 + binStep / 10_000, openedAt: now, filledAt: now, mark: { at: now, pnl: -COST_SOL } };
+    ratio: 1 + binStep / 10_000, openedAt: now, filledAt: now, rangeReached: true, mark: { at: now, pnl: -COST_SOL } };
   p.binSeed = seedPaperBins(p, entry.bins);
   return p;
 }
