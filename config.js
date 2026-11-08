@@ -123,6 +123,7 @@ export const config = {
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
     outOfRangeAboveWaitMinutes: u.outOfRangeAboveWaitMinutes ?? u.outOfRangeWaitMinutes ?? 60,
     outOfRangeBelowWaitMinutes: u.outOfRangeBelowWaitMinutes ?? 240,
+    outOfRangeBelowStopPct: Math.max(0, Math.min(99, numericConfig(u.outOfRangeBelowStopPct) ?? 0)),
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     repeatDeployCooldownEnabled: u.repeatDeployCooldownEnabled ?? true,

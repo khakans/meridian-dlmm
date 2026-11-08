@@ -100,6 +100,7 @@ const SECTIONS = [
       { k: "outOfRangeWaitMinutes", path: ["management", "outOfRangeWaitMinutes"], type: "int", min: 0, max: 10_000, unit: "min" },
       { k: "outOfRangeAboveWaitMinutes", path: ["management", "outOfRangeAboveWaitMinutes"], type: "int", min: 0, max: 10_000, unit: "min" },
       { k: "outOfRangeBelowWaitMinutes", path: ["management", "outOfRangeBelowWaitMinutes"], type: "int", min: 0, max: 10_000, unit: "min" },
+      { k: "outOfRangeBelowStopPct", path: ["management", "outOfRangeBelowStopPct"], type: "float", min: 0, max: 99, unit: "% below range (0 = use timer)" },
       { k: "minClaimAmount", path: ["management", "minClaimAmount"], type: "float", min: 0, max: 1000, unit: "$" },
       { k: "minFeePerTvl24h", path: ["management", "minFeePerTvl24h"], type: "float", min: 0, max: 1000, unit: "%" },
       { k: "oorCooldownTriggerCount", path: ["management", "oorCooldownTriggerCount"], type: "int", min: 1, max: 100 },

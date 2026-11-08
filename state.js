@@ -303,6 +303,17 @@ export function getTrackedPosition(position_address) {
   return state.positions[position_address] || null;
 }
 
+export function latchLowerRangeExit(positionAddress, reason) {
+  const state = load();
+  const position = state.positions[positionAddress];
+  if (!position || position.closed) return null;
+  if (!position.hard_lower_exit) {
+    position.hard_lower_exit = reason;
+    save(state);
+  }
+  return position.hard_lower_exit;
+}
+
 /**
  * Summarize state for the agent system prompt.
  */
@@ -430,7 +441,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       oorLimit = (mgmtConfig.outOfRangeBelowWaitMinutes ?? 240) + 90;
     }
     const dirLabel = isAbove ? "ABOVE" : isBelow ? "BELOW" : "OOR";
-    if (minutesOOR >= oorLimit) {
+    if (!(isBelow && mgmtConfig.outOfRangeBelowStopPct > 0) && minutesOOR >= oorLimit) {
       return {
         action: "OUT_OF_RANGE",
         reason: `Out of range (${dirLabel}) for ${minutesOOR}m (limit: ${oorLimit}m)`,

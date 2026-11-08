@@ -74,6 +74,7 @@
   "trailingTriggerPct": 3,
   "trailingDropPct": 1.5,
   "outOfRangeBinsToClose": 10,
+  "outOfRangeBelowStopPct": 2,
   "outOfRangeWaitMinutes": 30,
   "oorCooldownTriggerCount": 3,
   "oorCooldownHours": 12,

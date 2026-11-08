@@ -4,6 +4,13 @@ import { config } from "./config.js";
 import { log } from "./logger.js";
 import { getTrackedPosition } from "./state.js";
 
+export function lowerRangeStop(activeBin, lowerBin, binStep, threshold) {
+  if (!(threshold > 0) || !(binStep > 0) || !Number.isSafeInteger(activeBin) ||
+      !Number.isSafeInteger(lowerBin) || activeBin >= lowerBin) return null;
+  const drop = -100 * Math.expm1((activeBin - lowerBin) * Math.log1p(binStep / 10_000));
+  return drop >= threshold ? `Below-range hard exit (${drop.toFixed(2)}% below lower bound)` : null;
+}
+
 /**
  * Rule-based close decision for a position (stop loss, take profit, range
  * exhaustion, low yield). Returns { action: "CLOSE", rule, reason } or null.
@@ -63,6 +70,7 @@ export function getDeterministicCloseRule(position, managementConfig, chronosCtx
     return { action: "CLOSE", rule: 4, reason: `OOR above (${oorAboveLimit}m)` };
   }
   if (
+    !(managementConfig.outOfRangeBelowStopPct > 0) &&
     position.active_bin != null &&
     position.lower_bin != null &&
     position.active_bin < position.lower_bin &&

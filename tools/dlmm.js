@@ -210,6 +210,7 @@ export async function getActiveBin({ pool_address }) {
 
   return {
     binId: activeBin.binId,
+    binStep: pool.lbPair.binStep,
     price: pool.fromPricePerLamport(Number(activeBin.price)),
     pricePerLamport: activeBin.price.toString(),
   };

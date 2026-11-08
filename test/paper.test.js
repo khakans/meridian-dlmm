@@ -7,6 +7,14 @@ import { config } from '../config.js';
 import { paperBins, paperCloseRule, paperInventory, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
 import { summarizePaper } from '../standalone/pnl-summary.js';
+import { lowerRangeStop } from '../exit-rules.js';
+
+test('hard lower-range stop measures price beyond the lower bin, not position PnL', () => {
+  assert.equal(lowerRangeStop(100, 100, 100, 2), null);
+  assert.equal(lowerRangeStop(98, 100, 100, 2), null);
+  assert.match(lowerRangeStop(97, 100, 100, 2), /2\.94% below lower bound/);
+  assert.equal(lowerRangeStop(97, null, 100, 2), null);
+});
 import { emptyMonitor, openModeDatabase } from '../standalone/database.js';
 
 test('SQLite migrates paper and live data separately and persists paper history once', () => {

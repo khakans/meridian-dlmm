@@ -20,12 +20,13 @@ import { paperDay, recommendPaperVariant } from "./paper-accounting.js";
 import { getPerformanceHistory } from "../performance.js";
 import { paperPnlLines, signed, summarizePaper } from "./pnl-summary.js";
 import { exposureStillPresent } from "./events.js";
-import { getMyPositions } from "../tools/dlmm.js";
+import { getActiveBin, getMyPositions } from "../tools/dlmm.js";
 import { executeTool } from "../tools/executor.js";
 import { getWalletBalances } from "../tools/wallet.js";
 import { getTrackedPosition, getTrackedPositions, confirmPeak, updatePnlAndCheckExits, registerExitSignal, syncOpenPositions } from "../state.js";
+import { latchLowerRangeExit } from "../state.js";
 import { recordPositionSnapshot } from "../pool-memory.js";
-import { getDeterministicCloseRule, computeBinsBelow } from "../exit-rules.js";
+import { getDeterministicCloseRule, computeBinsBelow, lowerRangeStop } from "../exit-rules.js";
 import { startAdmin } from "./telegram-admin.js";
 import { startSlackAdmin } from "./slack-admin.js";
 import { analyzePoolWithChronos, getCachedChronosAnalysis, startChronosKeepalive, stopChronosKeepalive } from "./chronos.js";
@@ -378,10 +379,35 @@ function startPnlPoller() {
   const pollMs = Math.max(1, Number(config.pnl.pollIntervalSec ?? 3)) * 1000;
   const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
   timers.pnl = setInterval(async () => {
-    if (manageBusy || pollBusy || shuttingDown) return;
-    if (getTrackedPositions(true).length === 0) return;
+    if (pollBusy || shuttingDown) return;
+    const tracked = getTrackedPositions(true);
+    if (tracked.length === 0) return;
     pollBusy = true;
     try {
+      if (config.management.outOfRangeBelowStopPct > 0) {
+        const pools = new Map();
+        const breaches = await Promise.all(tracked.map(async p => {
+          if (p.hard_lower_exit) return { p, reason: p.hard_lower_exit };
+          if (!p.pool || !Number.isSafeInteger(p.bin_range?.min)) return null;
+          if (!pools.has(p.pool)) pools.set(p.pool, getActiveBin({ pool_address: p.pool }).catch(() => null));
+          const active = await pools.get(p.pool);
+          const reason = lowerRangeStop(active?.binId, p.bin_range.min, active?.binStep, config.management.outOfRangeBelowStopPct);
+          if (!reason || shuttingDown) return null;
+          const latched = latchLowerRangeExit(p.position, reason);
+          return latched ? { p, reason: latched } : null;
+        }));
+        for (const breach of breaches.filter(Boolean)) {
+          if (shuttingDown || manageBusy) return;
+          manageBusy = true;
+          try {
+            const { p, reason } = breach;
+            const res = await executeTool("close_position", { position_address: p.position, reason }).catch(e => ({ error: e.message }));
+            log("poll", `${p.position.slice(0, 8)}: ${reason} — ${res?.error || res?.reason || (res?.success ? "closed" : "unconfirmed")}`);
+          } finally { manageBusy = false; }
+        }
+        if (breaches.some(Boolean)) return;
+      }
+      if (manageBusy || shuttingDown) return;
       const live = await getMyPositions({ force: true, silent: true }).catch(() => null);
       if (!live?.positions?.length) return;
       for (const p of live.positions) {

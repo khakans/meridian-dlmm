@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { getDeterministicCloseRule } from '../exit-rules.js';
+import { getDeterministicCloseRule, lowerRangeStop } from '../exit-rules.js';
 import { log } from '../logger.js';
 import { getActiveBin, getPaperBinSnapshot } from '../tools/dlmm.js';
 import { quoteTokenToSol } from '../tools/wallet.js';
@@ -127,10 +127,13 @@ export function startPaper(store, notify, {
         try {
           const active = p.exit ? null : await readActive(p.pool);
           if (!p.exit && !validActive(active)) { p.mark = null; continue; }
+          if (!p.exit) p.hardLowerExit ??= lowerRangeStop(active.binId, p.lower,
+            active.binStep ?? (p.ratio - 1) * 10_000, config.management.outOfRangeBelowStopPct);
           const bins = p.exit ? null : await readSnapshot(p.pool, p.lower, p.upper);
           const inventory = p.exit?.inventory ?? (bins && markPaperBins(p, active.binId, bins));
           if (!inventory) { p.mark = null; continue; }
           if (!p.filledAt && (inventory.tokens > 0 || inventory.feeEvidence)) p.filledAt = now;
+          if (!p.exit && p.hardLowerExit) p.exit = { at: now, reason: p.hardLowerExit, inventory };
           const proceeds = await sellQuote(p.mint, rawTokens(inventory.tokens + inventory.feeTokens, p.decimals));
           if (stopped || !config.standalone.shadow) return;
           const pnl = proceeds == null ? null : inventory.sol + inventory.feeSol + proceeds - p.capital - COST_SOL;
@@ -229,6 +232,27 @@ export function startPaper(store, notify, {
     finally { busy = false; }
   }
   const timer = schedule(tick, MINUTE);
+  let watching = false;
+  const fastTimer = setInterval(async () => {
+    if (watching || stopped || !config.standalone.shadow || !(config.management.outOfRangeBelowStopPct > 0)) return;
+    watching = true;
+    try {
+      const reads = new Map();
+      let breached = false;
+      await Promise.all(Object.values(paper.open).map(async p => {
+        if (p.exit || p.hardLowerExit) return;
+        if (!reads.has(p.pool)) reads.set(p.pool, getBin({ pool_address: p.pool }).catch(() => null));
+        const active = await reads.get(p.pool);
+        if (!active || stopped || !config.standalone.shadow || paper.open[p.id] !== p || p.exit) return;
+        const reason = lowerRangeStop(active.binId, p.lower, active.binStep ?? (p.ratio - 1) * 10_000,
+          config.management.outOfRangeBelowStopPct);
+        if (reason) { p.hardLowerExit = reason; breached = true; }
+      }));
+      if (breached) store.save();
+      if (breached || Object.values(paper.open).some(p => p.hardLowerExit && !p.exit)) void tick();
+    } catch { log('paper_warn', 'Fast lower-range check unavailable'); }
+    finally { watching = false; }
+  }, Math.max(1, config.pnl.pollIntervalSec) * 1000);
   void tick();
-  return () => { stopped = true; clearInterval(timer); };
+  return () => { stopped = true; clearInterval(timer); clearInterval(fastTimer); };
 }
