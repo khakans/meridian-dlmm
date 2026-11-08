@@ -5,13 +5,11 @@
  * (via recordPerformance in performance.js). Agent can query before deploying.
  */
 
-import fs from "fs";
+import { modeDatabase } from "./standalone/database.js";
 import { log } from "./logger.js";
 import { config } from "./config.js";
 
-import { repoPath } from "./repo-root.js";
 
-const POOL_MEMORY_FILE = repoPath("pool-memory.json");
 const MAX_NOTE_LENGTH = 280;
 
 function sanitizeStoredNote(text, maxLen = MAX_NOTE_LENGTH) {
@@ -26,16 +24,11 @@ function sanitizeStoredNote(text, maxLen = MAX_NOTE_LENGTH) {
 }
 
 function load() {
-  if (!fs.existsSync(POOL_MEMORY_FILE)) return {};
-  try {
-    return JSON.parse(fs.readFileSync(POOL_MEMORY_FILE, "utf8"));
-  } catch {
-    return {};
-  }
+  return modeDatabase().get("pool-memory", {});
 }
 
 function save(data) {
-  fs.writeFileSync(POOL_MEMORY_FILE, JSON.stringify(data, null, 2));
+  modeDatabase().put("pool-memory", data);
 }
 
 function isOorCloseReason(reason) {

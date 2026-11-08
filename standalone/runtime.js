@@ -374,6 +374,7 @@ export async function manageOnce() {
 // Fast exit poller (RPC + Meteora deposits, no LLM). An exit fires only after
 // `confirmTicks` consecutive confirming polls; confirmed exits close directly.
 function startPnlPoller() {
+  if (config.standalone.shadow) return;
   const pollMs = Math.max(1, Number(config.pnl.pollIntervalSec ?? 3)) * 1000;
   const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
   timers.pnl = setInterval(async () => {
@@ -514,7 +515,7 @@ async function lifecycleStatusLines(detailed = false) {
   if (topReasons.length) lines.push(`Kendala ${topReasons.map(([reason, n]) => `${reason} ×${n}`).join(" · ")}`);
   if (detailed) {
     try {
-      const saved = JSON.parse(fs.readFileSync(repoPath("pnl-overnight.json"), "utf8"));
+      const saved = store.database.get("overnight");
       lines.push(`Arsip semalam · ${saved.periodWib} · ${saved.uniqueClosedMints} mint selesai`);
       for (const v of saved.variants.slice(0, 10)) lines.push(`• ${v.variant} · ${signed(v.realized)} SOL · ${v.closed} close`);
     } catch { /* Archive is optional. */ }
@@ -581,6 +582,7 @@ export async function startStandalone() {
   acquireLock();
 
   store = new MonitorStore();
+  log("runtime", `SQLite storage mode=${store.database.mode}`);
   for (const [mint, attempt] of Object.entries(store.data.attempts)) {
     if (attempt.status === "submitting") {
       log("runtime_warn", `Mint ${mint.slice(0, 8)} was mid-submit at shutdown (position ${attempt.position ?? "unknown"}, txs ${attempt.txs?.length ?? 0}) — reconcile on-chain before re-enabling entries`);
@@ -601,11 +603,13 @@ export async function startStandalone() {
   }
 
   // Entries come only from signals; exits run on their own cadences.
-  timers.manage = setInterval(() => { void manageOnce(); }, Math.max(1, config.schedule.managementIntervalMin) * 60_000);
+  if (!config.standalone.shadow) {
+    timers.manage = setInterval(() => { void manageOnce(); }, Math.max(1, config.schedule.managementIntervalMin) * 60_000);
+    void manageOnce();
+  }
   startPnlPoller();
   startHeartbeat();
   startChronosKeepalive();
-  void manageOnce();
   const adminOptions = {
     monitor,
     statusDetails: () => lifecycleStatusLines(true),
@@ -615,18 +619,17 @@ export async function startStandalone() {
       store.save();
     },
     activeSignals: () => Object.values(store.data.signals).filter(s => !s.done).length,
-  };
-  stopAdmin = startAdmin(adminOptions);
-  slackAdmin = await startSlackAdmin({
-    ...adminOptions,
-    restart: async send => {
+    restart: async (send, beforeRestart) => {
       if (pursuing || manageBusy || pollBusy) {
         await send("Meridian sedang memproses pekerjaan. Coba restart lagi setelah selesai.");
         return;
       }
-      await shutdown("Slack admin restart", 1);
+      beforeRestart?.();
+      await shutdown("Admin restart", 1);
     },
-  });
+  };
+  stopAdmin = startAdmin(adminOptions);
+  slackAdmin = await startSlackAdmin(adminOptions);
   setNotificationMirror(slackAdmin?.sendMessage ?? null);
   stopDiscovery = startDiscovery({
     gmgnKey: process.env.GMGN_API_KEY?.trim(),

@@ -14,7 +14,7 @@ Shadow mode is the default and forces `DRY_RUN=true` for all transaction paths. 
 
 ## Setup
 
-Use Node.js 18 or newer and a Solana RPC provider supporting WebSocket subscriptions and transaction history.
+Use Node.js 22.13 or newer and a Solana RPC provider supporting WebSocket subscriptions and transaction history.
 
 ```sh
 npm install
@@ -68,6 +68,8 @@ Each variant has a separate bankroll (`paperBankrollSol`), a daily loss admissio
 Paper waits up to `paperInitialRangeWaitMinutes` (45 by default) for first range contact. After contact, a non-profitable discretionary exit needs a continuous `paperLossGraceMinutes` buffer (20 by default). Stop loss and maximum hold still apply. A paper close message lists up to `paperCloseListLimit` variants (3 by default); every result is recorded.
 
 Set `lifecycleReportMinutes` to a positive interval to send wallet balance, open positions and reported open-position PnL to the configured Slack DM and Telegram destination. A report also runs at startup. Edit the interval from the admin menu and restart. Zero disables reports.
+
+Runtime storage is split into `.meridian-data/shadow.sqlite` and `.meridian-data/live.sqlite`. Shadow stores the paper ledger, NAV, research, and its PnL reset. Live stores tracked positions, closed-position PnL, decisions, and pool memory. Both keep separate monitor checkpoints and history. The first open of each database imports applicable legacy JSON records. Old files remain as migration sources. Pending signals are rebuilt from fresh wallet baselines. Settings, credentials, and the smart-wallet list remain shared. Switch modes from the admin console to save the selected mode and perform a supervised restart.
 
 To enable live trading, review your thresholds, wallet list, and shadow results, set `shadowMode` to `false`, remove any `DRY_RUN=true` override, and restart. Configuration edits take effect after restart.
 

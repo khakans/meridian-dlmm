@@ -1,9 +1,46 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { config } from '../config.js';
 import { paperBins, paperCloseRule, paperInventory, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
 import { summarizePaper } from '../standalone/pnl-summary.js';
+import { emptyMonitor, openModeDatabase } from '../standalone/database.js';
+
+test('SQLite migrates paper and live data separately and persists paper history once', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-sqlite-'));
+  let shadow, live;
+  try {
+    const monitor = { ...emptyMonitor(), paper: { closed: [{ id: 'paper1', closedAt: 100, pnl: 0.03 }] },
+      attempts: { a: { status: 'entered' }, b: { status: 'proposed' } }, pending: { stale: {} },
+      pnlResetAt: { shadow: 10, live: 20 } };
+    fs.writeFileSync(path.join(dir, 'wallet-monitor-state.json'), JSON.stringify(monitor));
+    fs.writeFileSync(path.join(dir, 'lessons.json'), JSON.stringify({ lessons: [], performance: [{ position: 'live1', pnl_usd: 3 }] }));
+    shadow = openModeDatabase('shadow', dir);
+    live = openModeDatabase('live', dir);
+    const state = shadow.get('monitor');
+    assert.deepEqual(Object.keys(state.attempts), ['b']);
+    assert.deepEqual(Object.keys(live.get('monitor').attempts), ['a']);
+    assert.deepEqual(state.pending, {});
+    assert.deepEqual(state.pnlResetAt, { shadow: 10 });
+    assert.equal(live.get('monitor').paper, undefined);
+    assert.equal(shadow.get('performance'), null);
+    assert.equal(live.get('performance').performance[0].position, 'live1');
+    shadow.saveMonitor(state);
+    shadow.saveMonitor({ ...state, paper: { closed: [] } });
+    shadow.db.close();
+    shadow = openModeDatabase('shadow', dir);
+    assert.equal(shadow.get('monitor').paper.closed.length, 0);
+    assert.equal(shadow.db.prepare("SELECT count(*) AS n FROM history WHERE kind='paper-close'").get().n, 1);
+    assert.equal(live.db.prepare("SELECT count(*) AS n FROM history WHERE kind='paper-close'").get().n, 0);
+  } finally {
+    if (shadow?.db.isOpen) shadow.db.close();
+    if (live?.db.isOpen) live.db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('paper status separates variants, ignores stale marks and applies the realized reset cutoff', () => {
   const now = 1_800_000_000_000;

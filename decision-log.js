@@ -1,24 +1,9 @@
-import fs from "fs";
-import { log } from "./logger.js";
-import { repoPath } from "./repo-root.js";
+import { modeDatabase } from "./standalone/database.js";
 
-const DECISION_LOG_FILE = repoPath("decision-log.json");
 const MAX_DECISIONS = 100;
 
 function load() {
-  if (!fs.existsSync(DECISION_LOG_FILE)) {
-    return { decisions: [] };
-  }
-  try {
-    return JSON.parse(fs.readFileSync(DECISION_LOG_FILE, "utf8"));
-  } catch (error) {
-    log("decision_log_warn", `Invalid ${DECISION_LOG_FILE}: ${error.message}`);
-    return { decisions: [] };
-  }
-}
-
-function save(data) {
-  fs.writeFileSync(DECISION_LOG_FILE, JSON.stringify(data, null, 2));
+  return modeDatabase().get("decisions", { decisions: [] });
 }
 
 function sanitize(value, maxLen = 280) {
@@ -27,7 +12,6 @@ function sanitize(value, maxLen = 280) {
 }
 
 export function appendDecision(entry) {
-  const data = load();
   const decision = {
     id: `dec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     ts: new Date().toISOString(),
@@ -42,9 +26,13 @@ export function appendDecision(entry) {
     metrics: entry.metrics || {},
     rejected: Array.isArray(entry.rejected) ? entry.rejected.map((r) => sanitize(r, 180)).filter(Boolean).slice(0, 8) : [],
   };
-  data.decisions.unshift(decision);
-  data.decisions = data.decisions.slice(0, MAX_DECISIONS);
-  save(data);
+  const storage = modeDatabase();
+  storage.transaction(() => {
+    const data = load();
+    data.decisions = [decision, ...data.decisions].slice(0, MAX_DECISIONS);
+    storage.put("decisions", data);
+    storage.append("decision", decision.id, Date.parse(decision.ts), decision);
+  });
   return decision;
 }
 

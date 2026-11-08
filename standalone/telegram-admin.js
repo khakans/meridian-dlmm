@@ -483,16 +483,13 @@ export function createAdminConsole(transport, {
       }
       if (data === "m:shadow2:shadow" || data === "m:shadow2:live") {
         const next = data.endsWith(":shadow");
-        if (slack && !next && (process.env.SLACK_ALLOW_LIVE !== "true" ||
-            envValue("DRY_RUN") !== "false" || !process.env.WALLET_PRIVATE_KEY)) {
-          return void await sendMessage("Live requires a local signing key, DRY_RUN=false and SLACK_ALLOW_LIVE=true on the server. Restart before confirming.");
+        if (!next && (envValue("DRY_RUN") !== "false" || !process.env.WALLET_PRIVATE_KEY ||
+            (slack && process.env.SLACK_ALLOW_LIVE !== "true"))) {
+          return void await sendMessage("Live requires a local signing key and DRY_RUN=false on the server. Slack also requires SLACK_ALLOW_LIVE=true.");
         }
-        if (slack && !next) parseSecretKey(process.env.WALLET_PRIVATE_KEY);
-        writeUserConfig({ shadowMode: next });
-        config.standalone.shadow = next;
-        if (next) process.env.DRY_RUN = "true";
-        else if (envValue("DRY_RUN") !== "true") delete process.env.DRY_RUN;
-        return void await viewRoot();
+        if (!next) parseSecretKey(process.env.WALLET_PRIVATE_KEY);
+        if (!restart) return void await sendMessage("Mode switching requires a supervised restart.");
+        return void await restart(sendMessage, () => writeUserConfig({ shadowMode: next }));
       }
       if (data === "m:pnlreset" && resetPnl) {
         pending = { kind: "pnlreset", shadow: config.standalone.shadow };

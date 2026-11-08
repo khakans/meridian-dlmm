@@ -1,12 +1,13 @@
 import fs from 'node:fs';
-import { repoPath } from '../repo-root.js';
+import { emptyMonitor, modeDatabase } from './database.js';
 
 export class MonitorStore {
-  constructor(file = repoPath('wallet-monitor-state.json')) {
+  constructor(file = null) {
     this.file = file;
-    this.data = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {
-      version: 1, wallets: {}, pending: {}, seen: {}, events: [], signals: {}, attempts: {}, paused: false,
-    };
+    this.database = file == null ? modeDatabase() : null;
+    this.historyIds = new Set();
+    this.data = this.database ? this.database.get('monitor', emptyMonitor()) :
+      fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : emptyMonitor();
     if (this.data.version !== 1 || !this.data.wallets || !this.data.attempts || !Array.isArray(this.data.events)) throw new Error('Invalid monitor state; refusing to discard recovery history');
     // The paper ledger originally used a different label for its Fibonacci range.
     for (const item of [
@@ -20,6 +21,7 @@ export class MonitorStore {
     }
   }
   save() {
+    if (this.database) return this.database.saveMonitor(this.data, this.historyIds);
     fs.writeFileSync(`${this.file}.tmp`, JSON.stringify(this.data, null, 2), { mode: 0o600 });
     fs.renameSync(`${this.file}.tmp`, this.file);
   }

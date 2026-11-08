@@ -1,8 +1,6 @@
-// Local closed-position accounting. Existing lessons.json history is preserved.
-import fs from "node:fs";
+// Closed-position accounting in the current mode database.
+import { modeDatabase } from "./standalone/database.js";
 import { log } from "./logger.js";
-import { repoPath } from "./repo-root.js";
-const LESSONS_FILE = repoPath("lessons.json");
 const PERFORMANCE_SIGNAL_FIELDS = [
   "organic_score",
   "fee_tvl_ratio",
@@ -20,18 +18,7 @@ const PERFORMANCE_SIGNAL_FIELDS = [
 ];
 
 function load() {
-  if (!fs.existsSync(LESSONS_FILE)) {
-    return { lessons: [], performance: [] };
-  }
-  try {
-    return JSON.parse(fs.readFileSync(LESSONS_FILE, "utf8"));
-  } catch {
-    return { lessons: [], performance: [] };
-  }
-}
-
-function save(data) {
-  fs.writeFileSync(LESSONS_FILE, JSON.stringify(data, null, 2));
+  return modeDatabase().get("performance", { lessons: [], performance: [] });
 }
 
 function buildSignalSnapshot(perf) {
@@ -46,8 +33,6 @@ function buildSignalSnapshot(perf) {
 }
 
 export async function recordPerformance(perf) {
-  const data = load();
-
   // Guard against unit-mixed records where a SOL-sized final value is
   // accidentally written into a USD field (e.g. final_value_usd = 2 for a 2 SOL close).
   const suspiciousUnitMix =
@@ -94,9 +79,16 @@ export async function recordPerformance(perf) {
     recorded_at: new Date().toISOString(),
   };
 
-  data.performance.push(entry);
-
-  save(data);
+  const storage = modeDatabase();
+  const added = storage.transaction(() => {
+    const data = load();
+    if (entry.position && data.performance.some(row => row.position === entry.position)) return false;
+    data.performance.push(entry);
+    storage.put("performance", data);
+    storage.append("live-close", entry.position ?? data.performance.length, Date.parse(entry.recorded_at), entry, entry.pnl_usd);
+    return true;
+  });
+  if (!added) return;
 
   // Update pool-level memory
   if (perf.pool) {

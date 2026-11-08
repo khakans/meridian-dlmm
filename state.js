@@ -1,5 +1,5 @@
 /**
- * Persistent agent state — stored in state.json.
+ * Persistent position state stored in the current mode database.
  *
  * Tracks position metadata that isn't available on-chain:
  * - When a position was deployed
@@ -8,11 +8,9 @@
  * - Actions taken (claims, rebalances)
  */
 
-import fs from "fs";
+import { modeDatabase } from "./standalone/database.js";
 import { log } from "./logger.js";
-import { repoPath } from "./repo-root.js";
 
-const STATE_FILE = repoPath("state.json");
 
 const MAX_RECENT_EVENTS = 20;
 const MAX_INSTRUCTION_LENGTH = 280;
@@ -29,24 +27,12 @@ function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
 }
 
 function load() {
-  if (!fs.existsSync(STATE_FILE)) {
-    return { positions: {}, recentEvents: [], lastUpdated: null };
-  }
-  try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  } catch (err) {
-    log("state_error", `Failed to read state.json: ${err.message}`);
-    return { positions: {}, lastUpdated: null };
-  }
+  return modeDatabase().get("positions", { positions: {}, recentEvents: [], lastUpdated: null });
 }
 
-function save(state) {
-  try {
-    state.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch (err) {
-    log("state_error", `Failed to write state.json: ${err.message}`);
-  }
+function save(data) {
+  data.lastUpdated = new Date().toISOString();
+  modeDatabase().put("positions", data);
 }
 
 // ─── Position Registry ─────────────────────────────────────────

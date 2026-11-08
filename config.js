@@ -48,7 +48,7 @@ export const config = {
   // The LLM/server-driven flow lives on the `legacy` branch.
   // Shadow mode never submits transactions.
   standalone: {
-    shadow: u.shadowMode !== false,
+    shadow: u.shadowMode !== false || process.env.DRY_RUN === "true",
     monitorRpcUrl: nonEmptyString(process.env.MONITOR_RPC_URL, u.monitorRpcUrl, process.env.RPC_URL),
     monitorWsUrl: nonEmptyString(process.env.MONITOR_WS_URL, u.monitorWsUrl),
     balanceRpcUrl: nonEmptyString(process.env.BALANCE_RPC_URL, u.balanceRpcUrl, process.env.RPC_URL),

@@ -10,6 +10,7 @@ node_modules/
 # User config (contains RPC URL, wallet key, API keys)
 user-config.json
 pnl-overnight.json
+.meridian-data/
 
 # GMGN fee-source config (contains API key)
 gmgn-config.json
