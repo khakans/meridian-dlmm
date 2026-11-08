@@ -39,15 +39,20 @@ export function summarizePaper(paper, from, to = Date.now()) {
 
 export function paperPnlLines(summary, detailed) {
   const primary = ["convergence/baseline", "discovery/volatility/spot"];
+  const active = summary.variants.filter(g => isActivePaperVariant(g.variant));
+  const settled = active.filter(g => g.closed || g.cancelled);
+  const total = settled.reduce((sum, g) => sum + g.realized, 0);
+  const all = `PnL Shadow (All) · terealisasi ${settled.length ? `${signed(total)} SOL` : "—"}`;
   const groups = [
-    ...primary.map(variant => summary.variants.find(g => g.variant === variant) ?? { variant }),
-    ...(detailed ? summary.variants.filter(g => isActivePaperVariant(g.variant) && !primary.includes(g.variant)).slice(0, 8) : []),
+    ...primary.map(variant => active.find(g => g.variant === variant) ?? { variant }),
+    ...(detailed ? active.filter(g => !primary.includes(g.variant)).slice(0, 8) : []),
   ];
-  return groups.map(g => {
+  const lines = groups.map(g => {
     const label = g.variant === "convergence/baseline" ? "Convergence" : g.variant.replace(/^discovery\/volatility\//, "Discovery ");
     const open = !g.open ? "—" : !g.marked ? "menunggu valuasi" :
       `${signed(g.openPnl)} SOL${g.marked < g.open ? ` (${g.marked}/${g.open})` : ""}`;
     const realized = g.closed || g.cancelled ? `${signed(g.realized)} SOL` : "—";
     return `PnL Shadow (${label}) · terbuka ${open} · terealisasi ${realized}`;
   });
+  return [all, ...lines];
 }
