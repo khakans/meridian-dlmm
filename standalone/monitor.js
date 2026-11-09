@@ -1,7 +1,7 @@
 import { PublicKey } from '@solana/web3.js';
 import { listSmartWallets } from '../smart-wallets.js';
 import { connection, readRpc, fetchJson } from './rpc.js';
-import { transactionEntries } from './events.js';
+import { DLMM_PROGRAM, transactionEntries } from './events.js';
 import { acceptEvents } from './store.js';
 import { log } from '../logger.js';
 
@@ -9,6 +9,7 @@ export class WalletMonitor {
   constructor(store, options, { rpc = readRpc, wallets = listSmartWallets, entries = transactionEntries, onSignal = () => {} } = {}) {
     Object.assign(this, { store, options, rpc, wallets, entries, onSignal });
     this.subscriptions = new Map(); this.running = false; this.reconciling = false; this.draining = false;
+    this.retry = new Map();
     this.stats = { transactions: 0, entries: 0, lastLagMs: null, errors: 0 };
   }
   enqueue(wallet, signature, slot) {
@@ -19,18 +20,26 @@ export class WalletMonitor {
     this.store.data.pending[key] = { wallet, signature, slot, queuedAt: Date.now(), retryAt: 0, failures: 0 };
     this.store.save();
   }
-  healthy() {
+  coverage(now = Date.now()) {
     const wallets = this.wallets().wallets.filter(w => !w.type || w.type === 'lp');
-    return wallets.length >= this.options.walletThreshold && wallets.every(w => {
+    const result = { total: wallets.length, fresh: 0, stale: 0, errors: 0 };
+    for (const w of wallets) {
       const state = this.store.data.wallets[w.address];
-      return state && !state.error && Date.now() - state.reconciledAt < this.options.reconcileSec * 3000;
-    });
+      if (state?.error || this.retry.has(w.address)) result.errors++;
+      else if (state?.reconciledAt && now - state.reconciledAt < this.options.reconcileSec * 3000) result.fresh++;
+      else result.stale++;
+    }
+    return result;
+  }
+  healthy() {
+    const { total, fresh } = this.coverage();
+    return fresh === total && fresh >= this.options.walletThreshold;
   }
   async start() {
     this.running = true;
     this.ws = connection(this.options.monitorRpcUrl, this.options.monitorWsUrl);
     await this.reconcile();
-    this.reconcileTimer = setInterval(() => this.reconcile(), this.options.reconcileSec * 1000);
+    this.reconcileTimer = setInterval(() => this.reconcile(), 1000);
     this.queueTimer = setInterval(() => this.drain(), 1000);
   }
   async reconcile() {
@@ -39,6 +48,7 @@ export class WalletMonitor {
     try {
       const wallets = this.wallets().wallets.filter(w => !w.type || w.type === 'lp');
       const addresses = new Set(wallets.map(w => w.address));
+      for (const address of this.retry.keys()) if (!addresses.has(address)) this.retry.delete(address);
       for (const [address, id] of this.subscriptions) if (!addresses.has(address)) {
         await this.ws.removeOnLogsListener(id).catch(() => {});
         this.subscriptions.delete(address);
@@ -47,11 +57,17 @@ export class WalletMonitor {
         delete this.store.data.wallets[address];
         this.store.data.events = this.store.data.events.filter(e => e.wallet !== address);
       }
-      for (const w of wallets) {
-        if (!this.running) break;
+      const now = Date.now();
+      const last = w => this.store.data.wallets[w.address]?.reconciledAt ?? 0;
+      const due = wallets.filter(w => now >= (this.retry.get(w.address)?.at ?? 0) &&
+        (!this.subscriptions.has(w.address) || now >= last(w) + this.options.reconcileSec * 1000))
+        .sort((a, b) => last(a) - last(b)).slice(0, 4);
+      let baseline;
+      await Promise.all(due.map(async w => {
+        if (!this.running) return;
         try {
           if (!this.store.data.wallets[w.address]) {
-            const baselineSlot = await this.rpc('monitor', c => c.getSlot('confirmed'));
+            const baselineSlot = await (baseline ??= this.rpc('monitor', c => c.getSlot('confirmed')));
             // Existing portfolio is a reconciliation baseline, never an entry signal.
             const portfolio = await fetchJson(`https://dlmm.datapi.meteora.ag/portfolio/open?user=${w.address}`);
             if (!Array.isArray(portfolio.pools)) throw new Error('Unexpected Meteora portfolio response');
@@ -60,7 +76,8 @@ export class WalletMonitor {
           }
           if (!this.subscriptions.has(w.address)) {
             const id = this.ws.onLogs(new PublicKey(w.address), (event, context) => {
-              if (event.err) return;
+              if (event.err || (Array.isArray(event.logs) &&
+                  !event.logs.some(line => line.startsWith(`Program ${DLMM_PROGRAM} invoke [`)))) return;
               try { this.enqueue(w.address, event.signature, context.slot); }
               catch (e) { this.store.data.wallets[w.address].error = e.message; this.store.save(); }
             }, 'confirmed');
@@ -83,14 +100,17 @@ export class WalletMonitor {
           for (const s of found.reverse()) this.enqueue(w.address, s.signature, s.slot);
           state.cursor = newest || state.cursor;
           state.error = null; state.reconciledAt = Date.now();
+          this.retry.delete(w.address);
           this.store.save();
         } catch (e) {
           this.stats.errors++;
+          const failures = (this.retry.get(w.address)?.failures ?? 0) + 1;
+          this.retry.set(w.address, { failures, at: Date.now() + Math.min(120_000, 5000 * 2 ** Math.min(failures - 1, 5)) });
           const state = this.store.data.wallets[w.address];
           if (state) { state.error = e.message; this.store.save(); }
           log('monitor_warn', `Wallet ${w.address.slice(0, 8)}: ${e.message}`);
         }
-      }
+      }));
     } finally { this.reconciling = false; }
   }
   async drain() {
@@ -98,15 +118,17 @@ export class WalletMonitor {
     this.draining = true;
     let dirty = false;
     try {
-      for (const [key, pending] of Object.entries(this.store.data.pending).slice(0, 20)) {
+      const reads = new Map();
+      for (const [key, pending] of Object.entries(this.store.data.pending).filter(([, row]) => row.retryAt <= Date.now()).slice(0, 20)) {
         if (!this.running) break;
-        if (pending.retryAt > Date.now()) continue;
         dirty = true;
         try {
           if (!this.store.data.wallets[pending.wallet] || Date.now() - pending.queuedAt > this.options.windowSec * 1000 || (pending.failures ?? 0) >= 3) {
             delete this.store.data.pending[key]; continue;
           }
-          const tx = await this.rpc('monitor', c => c.getTransaction(pending.signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 }));
+          if (!reads.has(pending.signature)) reads.set(pending.signature, this.rpc('monitor', c =>
+            c.getTransaction(pending.signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 })));
+          const tx = await reads.get(pending.signature);
           if (!tx) throw new Error('Confirmed transaction not yet available');
           this.stats.transactions++;
           const events = await this.entries(tx, pending.signature, pending.wallet, this.options);

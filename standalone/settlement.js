@@ -1,7 +1,7 @@
 import { config } from '../config.js';
 import { modeDatabase } from './database.js';
 import { readRpc } from './rpc.js';
-import { netWalletSol, reconcilePositionWrites } from './position-journal.js';
+import { netWalletSol, reconcilePositionWrites, walletLamportDelta } from './position-journal.js';
 import { PublicKey } from '@solana/web3.js';
 import { getWalletBalances, quoteTokenToSol, reclaimEmptyPositionAta, SETTLEMENT_SLIPPAGE_BPS, swapToken } from '../tools/wallet.js';
 
@@ -75,6 +75,21 @@ export function entryCreatedTokenAccounts(txs, mint, owner) {
   return [...addresses];
 }
 
+export function settlementCashCosts(txs, entryTxs, mint, wallet) {
+  const accounts = entryCreatedTokenAccounts(entryTxs, mint, wallet);
+  const fees = txs.map(tx => {
+    const message = tx.transaction?.message;
+    const payer = (message?.staticAccountKeys ?? message?.accountKeys)?.[0];
+    return String(payer?.pubkey ?? payer) === wallet ? tx.meta.fee : 0;
+  });
+  const retained = accounts.reduce((total, account) =>
+    total + txs.reduce((sum, tx) => sum + (walletLamportDelta(tx, account) ?? 0), 0), 0);
+  return {
+    networkFeeSol: fees.every(Number.isSafeInteger) ? fees.reduce((sum, fee) => sum + fee, 0) / 1e9 : null,
+    retainedTokenRentSol: Math.max(0, retained) / 1e9,
+  };
+}
+
 async function finalizeSettlement(row, status) {
   const journal = await reconcilePositionWrites(row.id);
   const entry = journal.filter(item => item.stage === 'entry' && item.status === 'confirmed');
@@ -104,7 +119,9 @@ async function finalizeSettlement(row, status) {
     }
   }
   const netSol = entry.length && close.length ? netWalletSol(txs, row.wallet) : null;
-  return update(row, status, { netSol, rentReclaimTx: reclaimed[0], netSolSource: netSol == null ? 'entry or wallet metadata unavailable' : 'wallet transaction deltas' });
+  const cashCosts = entry.length && close.length ? settlementCashCosts(txs, txs.slice(0, entry.length), row.mint, row.wallet) : {};
+  return update(row, status, { netSol, ...cashCosts, rentReclaimTx: reclaimed[0],
+    netSolSource: netSol == null ? 'entry or wallet metadata unavailable' : 'wallet transaction deltas' });
 }
 
 export async function advanceSettlement(row) {

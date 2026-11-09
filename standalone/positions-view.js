@@ -1,4 +1,4 @@
-import { isActivePaperVariant } from './entry-plans.js';
+import { isActivePaperVariant, shapeLabel } from './entry-plans.js';
 
 const PAGE_SIZE = 2;
 const MARK_MAX_AGE = 180_000;
@@ -64,7 +64,8 @@ function paperLines(p, tab, now, research) {
   if (p.capital != null || p.costSol != null) lines.push(`Modal ${amount(p.capital, 'SOL')} · Biaya simulasi ${amount(p.costSol, 'SOL')}`);
   if (p.feeSol != null || p.quotedSol != null) lines.push(`Fee LP ${amount(p.feeSol, 'SOL')}${p.feeTokens > 0 ? ` + ${p.feeTokens.toPrecision(5)} token` : ''} · Quote keluar ${amount(p.quotedSol, 'SOL')}`);
   if (p.lower != null && p.upper != null) lines.push(`Range bin ${p.lower}–${p.upper}${p.entryBin == null ? '' : ` · Entry bin ${p.entryBin}`}`);
-  if (p.shape) lines.push(`Shape ${safe(p.shape)}${p.shapeReason ? ` · ${safe(p.shapeReason)}` : ''}`);
+  const shape = shapeLabel(p.shape, p.shapeMode);
+  if (shape) lines.push(`Shape ${shape}${p.shapeReason ? ` · ${safe(p.shapeReason)}` : ''}`);
   const reason = p.reason ?? p.exit?.reason ?? p.manualExit ?? p.hardLowerExit;
   if (reason) lines.push(`Alasan ${safe(reason)}`);
   if (p.mint) lines.push(`Mint ${safe(p.mint)}`);
@@ -100,9 +101,10 @@ function liveLines(p, tab, now, solMode, tracked, settlement) {
   const upper = p.upper_bin ?? p.bin_range?.max;
   if (lower != null && upper != null) lines.push(`Range bin ${lower}–${upper}${p.active_bin == null ? '' : ` · Aktif ${p.active_bin}`}`);
   const capital = p.amount_sol ?? tracked?.amount_sol;
-  const strategy = p.strategy ?? tracked?.strategy;
+  const strategy = shapeLabel(p.strategy ?? tracked?.strategy, p.shape_mode ?? tracked?.shape_mode);
+  const shapeReason = p.shape_reason ?? tracked?.shape_reason;
   if (capital != null) lines.push(`Modal awal ${amount(capital, 'SOL')}`);
-  if (typeof strategy === 'string') lines.push(`Strategi ${safe(strategy)}`);
+  if (strategy) lines.push(`Shape ${strategy}${shapeReason ? ` · ${safe(shapeReason)}` : ''}`);
   const mint = p.base_mint ?? p.metrics?.base_mint;
   if (mint) lines.push(`Mint ${safe(mint)}`);
   if (p.pool) lines.push(`Pool ${safe(p.pool)}`);
@@ -111,6 +113,10 @@ function liveLines(p, tab, now, solMode, tracked, settlement) {
   if (closeTx) lines.push('Transaksi tutup', `Tx ${safe(closeTx)}`);
   if (settlement) lines.push(`Settlement ${safe(settlement.status)} · ${stamp(settlement.updatedAt)}`,
     `PnL net aktual ${amount(settlement.netSol, 'SOL', true)}`);
+  if (Number.isFinite(p.lp_value_change_sol) || Number.isFinite(p.fee_lp_sol)) lines.push(
+    `Perubahan nilai LP ${amount(p.lp_value_change_sol, 'SOL', true)} · Fee LP ${amount(p.fee_lp_sol, 'SOL')}`);
+  if (Number.isFinite(settlement?.networkFeeSol) || Number.isFinite(settlement?.retainedTokenRentSol)) lines.push(
+    `Biaya jaringan ${amount(settlement.networkFeeSol, 'SOL')} · Rent akun token saat settlement ${amount(settlement.retainedTokenRentSol, 'SOL')}`);
   if (Number.isFinite(settlement?.dustSol)) lines.push(`Sisa token di wallet ≈ ${settlement.dustSol.toFixed(8)} SOL`);
   if (settlement?.signature) lines.push(`Tx ${safe(settlement.signature)}`);
   return lines;

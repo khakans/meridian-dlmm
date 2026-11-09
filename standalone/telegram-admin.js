@@ -82,6 +82,7 @@ const SECTIONS = [
     id: "strategy", title: "📐 Strategy", desc: "Position shape & bin range",
     settings: [
       { k: "strategy", path: ["strategy", "strategy"], type: "enum", options: ["auto", "spot", "curve", "bid_ask"], label: "shape" },
+      { k: "autoRebalance", path: ["strategy", "autoRebalance"], type: "bool", label: "Auto Rebalance (Shadow)" },
       { k: "minBinsBelow", path: ["strategy", "minBinsBelow"], type: "int", min: MIN_SAFE_BINS_BELOW, max: 200, unit: "bins" },
       { k: "maxBinsBelow", path: ["strategy", "maxBinsBelow"], type: "int", min: MIN_SAFE_BINS_BELOW, max: 200, unit: "bins" },
       { k: "defaultBinsBelow", path: ["strategy", "defaultBinsBelow"], type: "int", min: MIN_SAFE_BINS_BELOW, max: 200, unit: "bins" },

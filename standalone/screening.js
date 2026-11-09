@@ -9,9 +9,9 @@ import { analyzePoolWithChronos } from './chronos.js';
 
 const number = value => value == null || value === '' ? null : Number.isFinite(Number(value)) ? Number(value) : null;
 const discovery = 'https://pool-discovery-api.datapi.meteora.ag/pools';
-export async function poolDetail(address, timeframe = config.screening.timeframe) {
+export async function poolDetail(address, timeframe = config.screening.timeframe, options) {
   const params = new URLSearchParams({ page_size: '1', filter_by: `pool_address=${address}`, timeframe });
-  const result = await fetchJson(`${discovery}?${params}`);
+  const result = await fetchJson(`${discovery}?${params}`, options);
   const pool = result.data?.find(p => p.pool_address === address);
   if (!pool) throw new Error('Pool data unavailable');
   return pool;

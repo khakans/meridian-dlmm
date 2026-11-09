@@ -1,4 +1,4 @@
-import { ENTRY_SHAPES, isActivePaperVariant } from './entry-plans.js';
+import { ENTRY_SHAPES, isActivePaperVariant, shapeLabel } from './entry-plans.js';
 
 export const signed = value => `${value >= 0 ? "+" : ""}${value.toFixed(4)}`;
 
@@ -11,7 +11,7 @@ export function shapeTrialLines(closed = [], from) {
   }
   const complete = [...cohorts.values()].filter(group => group.size === ENTRY_SHAPES.length);
   if (!complete.length) return cohorts.size ? ['Auto Shape · menunggu ketiga shape selesai pada entry yang sama'] : [];
-  return [`Auto Shape · ${complete.length} entry pembanding Shadow`, ...ENTRY_SHAPES.map(shape => {
+  return [`Auto Shape · ${complete.length}/20 entry pembanding Shadow`, ...ENTRY_SHAPES.map(shape => {
     const positions = complete.map(group => group.get(shape));
     const pnl = positions.reduce((sum, p) => sum + p.pnl, 0);
     const inRange = positions.reduce((sum, p) => sum + (p.inRangeMs ?? 0), 0);
@@ -19,6 +19,30 @@ export function shapeTrialLines(closed = [], from) {
     const drawdown = Math.max(...positions.map(p => p.drawdownPct ?? 0));
     return `• ${shape} · net ${signed(pnl)} SOL · drawdown maks ${drawdown.toFixed(1)}% · in range ${observed ? (100 * inRange / observed).toFixed(0) + '%' : '—'}`;
   })];
+}
+
+export function rebalanceTrialLines(paper, from, detailed) {
+  const rows = (paper?.closed ?? []).filter(p => p.closedAt >= from && Number.isFinite(p.pnl));
+  const baselines = new Map(rows.filter(p => p.rebalancePair && p.mirror).map(p => [p.rebalancePair, p]));
+  const pairs = rows.filter(p => p.rebalanceTrial && baselines.has(p.rebalancePair));
+  const open = Object.values(paper?.open ?? {}).filter(p => p.rebalanceTrial);
+  const lines = [];
+  if (open.length || pairs.length) {
+    const delta = pairs.reduce((sum, p) => sum + p.pnl - baselines.get(p.rebalancePair).pnl, 0);
+    lines.push(`Auto Rebalance · ${open.length} terbuka · ${pairs.length} pembanding selesai${pairs.length ? ` · Δ net ${signed(delta)} SOL (${pairs.filter(p => p.rebalances?.length).length} berubah)` : ''}`);
+  }
+  for (const p of open.slice(0, 4)) {
+    const latest = p.rebalances?.at(-1);
+    lines.push(`• ${p.pair ?? p.mint.slice(0, 8)} · ${shapeLabel(p.shape, p.shapeMode, p.rebalances)}${latest ? ` · ${latest.reason} · biaya simulasi ${latest.costSol.toFixed(5)} SOL` : ''}`);
+  }
+  if (detailed) {
+    const groups = ['pass', 'reject', 'missing'].map(status => rows.filter(p => p.mirror && p.screenTrial?.status === status));
+    if (groups.some(group => group.length)) {
+      const label = (i, name) => `${name} ${groups[i].length}${groups[i].length ? ` (${signed(groups[i].reduce((sum, p) => sum + p.pnl, 0))} SOL)` : ''}`;
+      lines.push(`Uji screening Shadow · ${label(0, 'lolos')} · ${label(1, 'tertahan')} · ${groups[2].length} data kurang`);
+    }
+  }
+  return lines;
 }
 
 export function summarizePaper(paper, from, to = Date.now()) {

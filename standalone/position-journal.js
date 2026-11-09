@@ -84,7 +84,8 @@ export async function reconcilePositionWrites(position, db = modeDatabase(), rpc
 export function walletLamportDelta(tx, owner) {
   if (!tx?.meta) return null;
   const message = tx.transaction?.message;
-  const keys = message?.staticAccountKeys ?? message?.accountKeys ?? [];
+  const keys = [...(message?.staticAccountKeys ?? message?.accountKeys ?? []),
+    ...(tx.meta.loadedAddresses?.writable ?? []), ...(tx.meta.loadedAddresses?.readonly ?? [])];
   const i = keys.findIndex(key => String(key.pubkey ?? key) === owner);
   const pre = tx.meta.preBalances?.[i], post = tx.meta.postBalances?.[i];
   return Number.isSafeInteger(pre) && Number.isSafeInteger(post) ? post - pre : null;

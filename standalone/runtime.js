@@ -15,14 +15,15 @@ import { MonitorStore, finishSignal } from "./store.js";
 import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
-import { isActivePaperVariant, resolveEntryShape } from "./entry-plans.js";
+import { entryCandles, isActivePaperVariant, resolveEntryShape, scoreShadowScreen, shapeLabel } from "./entry-plans.js";
 import { mirrorExitReason, prepareMirrorPosition, prepareShapeTrials, startPaper, validateExitQuote } from "./paper.js";
+import { prepareRebalanceTrial } from "./paper-rebalance.js";
 import { advanceSettlement, dueSettlements, SETTLEMENT_DUST_SOL, settlementComplete, settlementRows } from "./settlement.js";
 import { estimateEntryOverheadSol, estimateNetExitPct, isRetryableEntryError, positionWrites, reconcilePositionWrites } from "./position-journal.js";
 import { readRpc } from "./rpc.js";
 import { withWalletLock } from "./transactions.js";
 import { paperDay } from "./paper-accounting.js";
-import { paperPnlLines, paperRealizedLine, shapeTrialLines, signed, summarizePaper } from "./pnl-summary.js";
+import { paperPnlLines, paperRealizedLine, rebalanceTrialLines, shapeTrialLines, signed, summarizePaper } from "./pnl-summary.js";
 import { openPositions, positionsPage, positionTarget } from "./positions-view.js";
 import { exposureStillPresent, recoverablePositionRent } from "./events.js";
 import { getActiveBin, getMyPositions, getPositionExitInventory, simulateEntryPosition } from "../tools/dlmm.js";
@@ -75,7 +76,7 @@ async function reconcileEntries() {
       } else {
         if (!getTrackedPosition(attempt.position)) trackPosition({
           position: attempt.position, pool: position.pool, pool_name: position.pair,
-          strategy: attempt.strategy, amount_sol: attempt.amountSol,
+          strategy: attempt.strategy, shape_mode: attempt.shapeMode, shape_reason: attempt.shapeReason, amount_sol: attempt.amountSol,
           bin_step: attempt.binStep, bin_range: { min: position.lower_bin, max: position.upper_bin },
         });
         attempt.status = "entered";
@@ -365,16 +366,25 @@ async function attemptEntry(signal) {
     });
   } catch { return "exit quote or entry range unavailable"; }
   const shapeMode = config.strategy.strategy;
-  const plan = await resolveEntryShape(shapeMode, pool, binsBelow, entry);
+  const compareShapes = shadow && shapeMode === "auto" && Object.values(paper.open).filter(p => p.shapeTrial).length < 24;
+  const candleTime = Math.floor(Date.now() / 1000);
+  const candles = shadow ? await entryCandles(pool.pool_address, candleTime) : undefined;
+  const plan = await resolveEntryShape(shapeMode, pool, binsBelow, entry, { candles: shadow ? candles ?? [] : undefined, now: candleTime });
   if (!plan.shape) return `Auto Shape: ${plan.reason}`;
   const modelInput = { source, mint, pool: pool.pool_address, pair: pool.name,
     decimals: screened.decimals, binStep: entry.binStep, binsBelow, capital: amountY, shape: plan.shape, entry };
   let model, trials;
   try {
     model = prepareMirrorPosition(modelInput);
+    model.shapeMode = shapeMode;
     model.shapeReason = plan.reason;
-    trials = shadow && shapeMode === "auto" && Object.values(paper.open).filter(p => p.shapeTrial).length < 24
-      ? prepareShapeTrials(modelInput, model) : [];
+    trials = compareShapes ? prepareShapeTrials(modelInput, model) : [];
+    if (shadow) {
+      const hourlyPool = await poolDetail(pool.pool_address, '1h', { signal: AbortSignal.timeout(4500) }).catch(() => null);
+      model.screenTrial = scoreShadowScreen(candles, hourlyPool, amountY, candleTime);
+    }
+    if (shadow && shapeMode === "auto" && config.strategy.autoRebalance &&
+        Object.values(paper.open).filter(p => p.rebalanceTrial).length < 8) trials.push(prepareRebalanceTrial(model));
   } catch { return "entry range unavailable for selected shape"; }
   const fresh = await finalRecheck(signal, screened, simulatedSol);
   if (fresh) return fresh;
@@ -418,6 +428,8 @@ async function attemptEntry(signal) {
     bins_above: binsAbove,
     expected_active_bin: entry.binId,
     strategy: plan.shape,
+    shape_mode: shapeMode,
+    shape_reason: plan.reason,
     assert_entry_active: () => {
       if (shuttingDown || store.data.paused || signal.done || Date.now() >= signal.deadline) throw Error("Entry stopped or expired before broadcast");
     },
@@ -450,7 +462,7 @@ async function attemptEntry(signal) {
     finishSignal(store, signal, record.status === "proposed" ? "shadow proposal recorded" : "entered");
     const label = result.dry_run ? "[SHADOW] Would deploy" : "Deployed";
     log("entry", `${label} ${amountY} SOL → pool ${pool.pool_address.slice(0, 8)} mint ${mint.slice(0, 8)} (${binsBelow} bins below, ${source}, ${plan.shape}: ${plan.reason})`);
-    void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.pool_address.slice(0, 8)} (mint ${mint.slice(0, 8)}, ${signal.events.length} wallets)\nShape ${plan.shape}${shapeMode === "auto" ? ` · ${plan.reason}` : ""}`);
+    void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.pool_address.slice(0, 8)} (mint ${mint.slice(0, 8)}, ${signal.events.length} wallets)\nShape ${shapeLabel(plan.shape, shapeMode)}${shapeMode === "auto" ? ` · ${plan.reason}` : ""}`);
     return null;
   }
 
@@ -480,7 +492,9 @@ async function attemptEntry(signal) {
 async function finalRecheck(signal, screened, simulatedSol = null) {
   if (shuttingDown || store.data.paused || signal.done || Date.now() >= signal.deadline) return "entry stopped or expired";
   let present = 0;
+  const checkedAt = Date.now();
   for (const e of signal.events) {
+    if (!store.data.wallets[e.wallet] || checkedAt - e.at > config.standalone.windowSec * 1000) continue;
     try { if (await exposureStillPresent(e)) present++; } catch { /* unreadable position = not confirmed */ }
   }
   if (signal.source !== "discovery" && present < config.standalone.walletThreshold) {
@@ -589,22 +603,33 @@ function startPnlPoller() {
         }
         const gross = Number.isFinite(p.strategy_pnl_pct) ? p.strategy_pnl_pct : null;
         let pnlPct = gross != null && gross <= config.management.stopLossPct ? gross : null;
-        if (!state.closeReason && capital > 0 && Number.isFinite(state.entryOverheadSol)) {
-          try {
-            const inventory = await getPositionExitInventory(p.position, p.pool, p.base_mint, live.wallet);
-            const proceeds = inventory.tokenRaw > 0n ? await quoteTokenToSol(p.base_mint, inventory.tokenRaw) : 0;
-            const exitValue = inventory.sol + (proceeds > SETTLEMENT_DUST_SOL ? proceeds : 0);
-            pnlPct = estimateNetExitPct((exitValue / capital - 1) * 100, capital, state.entryOverheadSol);
-          } catch { /* An unavailable quote must not trigger profit-taking. */ }
-        }
+        const netExitPct = async () => {
+          if (!(capital > 0) || !Number.isFinite(state.entryOverheadSol)) return null;
+          const inventory = await getPositionExitInventory(p.position, p.pool, p.base_mint, live.wallet);
+          const proceeds = inventory.tokenRaw > 0n ? await quoteTokenToSol(p.base_mint, inventory.tokenRaw) : 0;
+          const exitValue = inventory.sol + (proceeds > SETTLEMENT_DUST_SOL ? proceeds : 0);
+          return estimateNetExitPct((exitValue / capital - 1) * 100, capital, state.entryOverheadSol);
+        };
+        if (!state.closeReason) pnlPct = await netExitPct().catch(() => null) ?? pnlPct;
         const reason = state.closeReason ?? mirrorExitReason(state, { binId: p.active_bin }, pnlPct, now);
         if (!reason) continue;
         if (shuttingDown || manageBusy || getTrackedPosition(p.position)?.hard_lower_exit) continue;
-        state.closeReason = reason;
+        const profitExit = reason === "take profit" || reason === "trailing take profit";
+        if (profitExit) delete state.closeReason;
+        else state.closeReason = reason;
         store.save();
         manageBusy = true;
         try {
-          const res = await executeTool("close_position", { position_address: p.position, reason }).catch(e => ({ error: e.message }));
+          const res = await executeTool("close_position", {
+            position_address: p.position, reason,
+            verifyProfit: profitExit ? async () => {
+              const fresh = await netExitPct();
+              const m = config.management;
+              const valid = reason === "take profit" ? fresh >= m.takeProfitPct :
+                m.trailingTakeProfit && state.peakPct >= m.trailingTriggerPct && fresh <= state.peakPct - m.trailingDropPct;
+              if (!(fresh > 0 && valid)) throw Error("Profit exit deferred: fresh quote no longer qualifies");
+            } : undefined,
+          }).catch(e => ({ error: e.message }));
           log("poll", `${p.position.slice(0, 8)}: ${reason} — ${res?.error || res?.reason || (res?.success ? "closed" : "unconfirmed")}`);
         } finally { manageBusy = false; }
       }
@@ -664,22 +689,31 @@ async function lifecycleStatusLines(detailed = false) {
     for (const p of book.positions.slice(0, 10)) {
       const pct = !p.pnl_pct_suspicious && Number.isFinite(p.pnl_pct) ? `${p.pnl_pct > 0 ? "+" : ""}${p.pnl_pct.toFixed(2)}%` : "PnL belum tersedia";
       const range = typeof p.in_range === "boolean" ? (p.in_range ? "di dalam range" : "di luar range") : "range belum tersedia";
-      lines.push(`• ${String(p.pair || p.position).replace(/[<>&\r\n]/g, " ").slice(0, 80)} · ${pct} · ${range}`);
+      const tracked = getTrackedPosition(p.position);
+      const attempt = Object.values(store.data.attempts).find(row => row.position === p.position);
+      const shape = shapeLabel(tracked?.strategy ?? attempt?.strategy, tracked?.shape_mode ?? attempt?.shapeMode);
+      lines.push(`• ${String(p.pair || p.position).replace(/[<>&\r\n]/g, " ").slice(0, 80)} · ${pct} · ${range}${shape ? ` · ${shape}` : ""}`);
     }
     if (book.positions.length > 10) lines.push(`+${book.positions.length - 10} posisi lainnya`);
   }
   const now = Date.now();
   const resetAt = store.data.pnlResetAt?.[store.database.mode] ?? 0;
   const from = Math.max(now - 86_400_000, resetAt);
-  if (detailed) lines.push(`Shape entry · ${config.strategy.strategy}`);
+  lines.push(`Mode shape · ${shapeLabel(config.strategy.strategy) ?? "—"}`);
   if (config.standalone.shadow) {
     const paper = store.data.paper;
     const mirror = { open: Object.fromEntries(Object.entries(paper?.open ?? {}).filter(([, p]) => p.mirror)),
       closed: (paper?.closed ?? []).filter(p => p.mirror) };
     lines.push(...paperPnlLines(summarizePaper(mirror, from, now), detailed, "discovery/volatility/mirror", "Mirror"));
     lines.push(paperRealizedLine(summarizePaper(paper, from, now), "All varian eksperimen + Mirror"));
-    if (detailed) lines.push(...shapeTrialLines(paper?.closed, Math.max(now - 30 * 86_400_000, resetAt)));
-    const legacy = Object.values(paper?.open ?? {}).filter(p => !p.mirror && !p.shapeTrial).length;
+    for (const p of Object.values(mirror.open).slice(0, 8)) {
+      const shape = shapeLabel(p.shape, p.shapeMode);
+      if (shape) lines.push(`• ${p.pair ?? p.mint.slice(0, 8)} · ${shape}`);
+    }
+    const trialFrom = Math.max(now - 30 * 86_400_000, resetAt);
+    if (detailed) lines.push(...shapeTrialLines(paper?.closed, trialFrom));
+    lines.push(...rebalanceTrialLines(paper, trialFrom, detailed));
+    const legacy = Object.values(paper?.open ?? {}).filter(p => !p.mirror && !p.shapeTrial && !p.rebalanceTrial).length;
     if (legacy) lines.push(`Eksperimen lama · ${legacy} posisi terbuka di riwayat paper`);
   }
   if (resetAt > now - 86_400_000) lines.push(`Periode PnL sejak reset ${new Date(resetAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })} WIB`);
@@ -691,6 +725,11 @@ async function lifecycleStatusLines(detailed = false) {
     const priced = settled.filter(row => Number.isFinite(row.netSol));
     const missing = settled.length - priced.length;
     lines.push(`PnL net setelah settlement ${priced.length ? signed(priced.reduce((total, row) => total + row.netSol, 0)) + " SOL" : "—"} · ${priced.length} terukur · ${unsettled.length} tertunda${missing ? ` · ${missing} tanpa data lengkap` : ""}`);
+    const costs = priced.filter(row => Number.isFinite(row.networkFeeSol) && Number.isFinite(row.retainedTokenRentSol));
+    if (costs.length) lines.push(`Biaya jaringan ${costs.reduce((n, p) => n + p.networkFeeSol, 0).toFixed(6)} SOL · Rent akun token saat settlement ${costs.reduce((n, p) => n + p.retainedTokenRentSol, 0).toFixed(6)} SOL · ${costs.length}/${priced.length} terukur`);
+    const lpRows = (store.database.get("performance")?.performance ?? []).filter(p =>
+      Date.parse(p.recorded_at) >= from && Number.isFinite(p.lp_value_change_sol) && Number.isFinite(p.fee_lp_sol));
+    if (lpRows.length) lines.push(`Perubahan nilai LP ${signed(lpRows.reduce((n, p) => n + p.lp_value_change_sol, 0))} SOL · Fee LP ${signed(lpRows.reduce((n, p) => n + p.fee_lp_sol, 0))} SOL · ${lpRows.length} posisi`);
   }
   const signals = Object.values(store.data.signals).filter(signal => now - signal.createdAt < 86_400_000);
   const discovery = signals.filter(signal => signal.source === "discovery").length;
@@ -699,6 +738,8 @@ async function lifecycleStatusLines(detailed = false) {
   const qualifyingMints = walletMints.filter(d => d.current > 0).length;
   lines.push(`${Object.keys(store.data.wallets).length} wallet dipantau · ${qualifyingMints} mint dengan deposit yang lolos`,
     `Trigger Convergence ${config.standalone.walletThreshold} wallet pada token yang sama dalam ${config.standalone.windowSec} detik`);
+  const coverage = monitor?.coverage(now);
+  if (coverage) lines.push(`Monitor wallet · ${coverage.fresh}/${coverage.total} segar · ${coverage.stale} kedaluwarsa/baseline · ${coverage.errors} error`);
   if (config.standalone.shadow) {
     const paper = store.data.paper;
     const open = Object.values(paper?.open ?? {}).filter(p => p.mirror);
@@ -797,7 +838,13 @@ export async function startStandalone() {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   log("runtime", `Standalone starting — ${config.standalone.shadow ? "SHADOW MODE (proposals recorded, nothing submitted)" : "LIVE MODE"} | threshold=${config.standalone.walletThreshold} wallets / ${config.standalone.windowSec}s window | screening deadline=${config.standalone.screeningDeadlineSec}s`);
 
-  if (config.standalone.shadow) stopPaper = startPaper(store, notify, { admitResearch: false });
+  if (config.standalone.shadow) stopPaper = startPaper(store, notify, {
+    admitResearch: false,
+    rebalancePlan: async (p, active) => {
+      const pool = await poolDetail(p.pool, config.screening.timeframe, { signal: AbortSignal.timeout(4500) });
+      return resolveEntryShape("auto", pool, active.binId - p.lower, active);
+    },
+  });
 
   // Entries come only from signals; exits run on their own cadences.
   if (!config.standalone.shadow) {
@@ -816,10 +863,12 @@ export async function startStandalone() {
       const open = store.data.paper?.open ?? {};
       const positions = targets.map(({ id }) => open[id]).filter(Boolean);
       const newlyQueued = positions.filter(p => !p.exit && !p.manualExit);
-      for (const p of newlyQueued) p.manualExit = "manual force close";
+      const ids = new Set(newlyQueued.map(p => p.id));
+      const paired = Object.values(open).filter(p => p.rebalanceTrial && ids.has(p.rebalancePair) && !p.exit && !p.manualExit);
+      for (const p of [...newlyQueued, ...paired]) p.manualExit = "manual force close";
       try { store.save(); }
       catch (error) {
-        for (const p of newlyQueued) delete p.manualExit;
+        for (const p of [...newlyQueued, ...paired]) delete p.manualExit;
         throw error;
       }
       return `Shadow · ${newlyQueued.length} masuk antrean close · ${positions.length - newlyQueued.length} sudah diproses/antre · ${targets.length - positions.length} sudah tidak terbuka. Lifecycle menyelesaikan close setelah data tersedia.`;

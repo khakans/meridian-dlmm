@@ -5,6 +5,7 @@ import { getActiveBin, getPaperBinSnapshot } from '../tools/dlmm.js';
 import { quoteTokenToSol } from '../tools/wallet.js';
 import { markPaperBins, paperRiskBlocked, recordPaperNav, seedPaperBins } from './paper-accounting.js';
 import { ENTRY_SHAPES, isActivePaperVariant } from './entry-plans.js';
+import { assessRebalance, rebalanceDue, REBALANCE_CHECK_MS } from './paper-rebalance.js';
 
 const MINUTE = 60_000;
 const COST_SOL = 0.001; // Estimated round-trip network cost, excluding refundable rent.
@@ -116,6 +117,7 @@ export function mirrorExitReason(p, active, pnlPct, now) {
 
 export function startPaper(store, notify, {
   getBin = getActiveBin, snapshot = getPaperBinSnapshot, quote = quoteTokenToSol, schedule = setInterval, admitResearch = true,
+  rebalancePlan,
 } = {}) {
   const paper = store.data.paper ??= { open: {}, closed: [], skipped: 0 };
   paper.realized ??= {};
@@ -180,6 +182,11 @@ export function startPaper(store, notify, {
             active.binStep ?? (p.ratio - 1) * 10_000, config.management.outOfRangeBelowStopPct);
           const bins = p.exit ? null : await readSnapshot(p.pool, p.lower, p.upper);
           const inventory = p.exit?.inventory ?? (bins && markPaperBins(p, active.binId, bins));
+          if (inventory && !p.exit && p.rebalanceTrial) {
+            inventory.sol += p.rebalanceIdleSol ?? 0;
+            inventory.feeSol += p.rebalanceFeeSol ?? 0;
+            inventory.feeTokens += p.rebalanceFeeTokens ?? 0;
+          }
           if (!inventory) {
             markUnavailable(p, bins ? 'Inventori bin belum bisa dinilai' : 'Snapshot bin belum tersedia');
             if (p.mirror) p.manualExit ??= mirrorExitReason(p, active, null, now);
@@ -197,7 +204,7 @@ export function startPaper(store, notify, {
             p.mark = { at: Date.now(), pnl };
             p.markIssue = null;
             p.indicativeMark = null;
-            if (p.shapeTrial) {
+            if (p.shapeTrial || p.rebalancePair) {
               p.trialPeakPnl = Math.max(p.trialPeakPnl ?? 0, pnl);
               p.trialDrawdownPct = Math.max(p.trialDrawdownPct ?? 0, 100 * (p.trialPeakPnl - pnl) / p.capital);
             }
@@ -210,6 +217,23 @@ export function startPaper(store, notify, {
             const reason = mirrorExitReason(p, active, pnl == null ? null : pnl / p.capital * 100, now);
             if (reason) p.exit = { at: now, reason, inventory };
           }
+          if (p.rebalanceTrial && config.strategy.autoRebalance && !store.data.paused && rebalancePlan && pnl != null &&
+              active.binId > p.lower + 1 && active.binId <= p.upper && rebalanceDue(p, now)) {
+            const stressRaw = rawTokens(p.capital / (Number(active.price) * p.ratio ** (p.lower - active.binId)), p.decimals);
+            const stressProceeds = await sellQuote(p.mint, stressRaw);
+            const stressValue = stressRaw / 10 ** p.decimals * Number(active.price);
+            const exitRatio = stressValue > 0 && stressProceeds != null ? stressProceeds / stressValue : 0;
+            let plan = exitRatio >= config.research.paperMinExitRatio ? await rebalancePlan(p, { ...active, exitRatio }).catch(() => null) : null;
+            if (plan?.shape && plan.shape !== p.shape) {
+              const fresh = await getBin({ pool_address: p.pool }).catch(() => null);
+              if (fresh?.binId !== active.binId) plan = null;
+            }
+            if (stopped || !config.standalone.shadow) return;
+            if (!store.data.paused && config.strategy.autoRebalance && Date.now() - now < REBALANCE_CHECK_MS / 3 &&
+                assessRebalance(p, { now, active, bins, plan, quotePrice: Number(active.price) * Math.min(1, exitRatio) })) {
+              p.mark.pnl -= p.costSol - costSol;
+            }
+          }
           if (p.exit && !p.filledAt) {
             paper.cancelled.push({ id: p.id, mint: p.mint, pool: p.pool, pair: p.pair, capital: p.capital,
               lower: p.lower, upper: p.upper, entryBin: p.entryBin, source: p.source, variant: p.variant, at: now, closedAt: now,
@@ -221,14 +245,15 @@ export function startPaper(store, notify, {
               lower: p.lower, upper: p.upper, entryBin: p.entryBin, shape: p.shape, range: p.range, variant: p.variant, openedAt: p.openedAt,
               closedAt: Date.now(), filledAt: p.filledAt, pnl, reason: p.exit.reason, solInventory: inventory.sol, quotedSol: proceeds,
               feeSol: inventory.feeSol, feeTokens: inventory.feeTokens, costSol,
-              source: p.source, mirror: p.mirror, shapeReason: p.shapeReason,
+              source: p.source, mirror: p.mirror, shapeMode: p.shapeMode, shapeReason: p.shapeReason,
+              rebalancePair: p.rebalancePair, rebalanceTrial: p.rebalanceTrial, rebalances: p.rebalances, screenTrial: p.screenTrial,
               ...(p.shapeTrial ? { shapeTrial: p.shapeTrial, observedMs: p.observedMs ?? 0,
                 inRangeMs: p.inRangeMs ?? 0, drawdownPct: p.trialDrawdownPct ?? 0 } : {}),
               outcome: 'settled', accountingVersion: 1 });
             paper.realized[p.variant] += pnl;
             if (p.mirror) paper.mirrorRealized = (paper.mirrorRealized ?? 0) + pnl;
             delete paper.open[p.id];
-            if (!p.shapeTrial) closed.push(`• ${p.mint.slice(0, 8)} · ${p.variant ?? `${p.range}/${p.shape}`} · ${pnl.toFixed(4)} SOL · ${p.exit.reason}`);
+            if (!p.shapeTrial && !p.rebalanceTrial) closed.push(`• ${p.mint.slice(0, 8)} · ${p.variant ?? `${p.range}/${p.shape}`} · ${pnl.toFixed(4)} SOL · ${p.exit.reason}`);
           }
         } catch { markUnavailable(p, 'Valuasi belum bisa dihitung'); }
       }

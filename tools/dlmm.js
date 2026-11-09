@@ -259,6 +259,8 @@ export async function deployPosition({
   amount_x,
   amount_y,
   strategy,
+  shape_mode,
+  shape_reason,
   bins_below,
   bins_above,
   downside_pct,
@@ -587,6 +589,8 @@ export async function deployPosition({
       pool: pool_address,
       pool_name,
       strategy: activeStrategy,
+      shape_mode,
+      shape_reason,
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
       bin_step: bin_step ?? actualBinStep,
       volatility: normalizedVolatility,
@@ -1090,7 +1094,7 @@ export async function getPositionExitInventory(positionAddress, poolAddress, min
   });
 }
 
-export async function closePosition({ position_address, reason, onClosing, onClosed }) {
+export async function closePosition({ position_address, reason, verifyProfit, onClosing, onClosed }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
@@ -1113,6 +1117,7 @@ export async function closePosition({ position_address, reason, onClosing, onClo
     const pool = await getPool(poolAddress);
 
     const positionPubKey = new PublicKey(position_address);
+    await verifyProfit?.();
     await onClosing?.({ mint: pool.lbPair.tokenXMint.toString(), wallet: wallet.publicKey.toString(),
       pool: poolAddress, pool_name: tracked?.pool_name ?? poolMeta.name, deployed_at: tracked?.deployed_at });
     const claimTxHashes = [];
@@ -1249,6 +1254,7 @@ export async function closePosition({ position_address, reason, onClosing, onClo
       let finalValueUsd = 0;
       let initialUsd = 0;
       let feesUsd = tracked.total_fees_claimed_usd || 0;
+      let feeLpSol = null, lpValueChangeSol = null;
       try {
         const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
         for (let attempt = 0; attempt < 6; attempt++) {
@@ -1269,6 +1275,10 @@ export async function closePosition({ position_address, reason, onClosing, onClo
               } else if (shouldRejectClosedPnl(nextPnlPct, reason || tracked?.close_reason)) {
                 log("close_warn", `Rejected unsettled closed PnL for ${position_address.slice(0, 8)} on attempt ${attempt + 1}/6: ${nextPnlPct.toFixed(2)}%`);
               } else {
+                const withdrawn = maybeNum(posEntry.allTimeWithdrawals?.total?.sol);
+                const deposited = maybeNum(posEntry.allTimeDeposits?.total?.sol);
+                feeLpSol = maybeNum(posEntry.allTimeFees?.total?.sol);
+                lpValueChangeSol = withdrawn != null && deposited > 0 ? withdrawn - deposited : null;
                 pnlTrueUsd    = nextPnlUsd;
                 pnlUsd        = nextPnlValue;
                 pnlPct        = nextPnlPct;
@@ -1336,6 +1346,8 @@ export async function closePosition({ position_address, reason, onClosing, onClo
         pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
         base_mint: closeBaseMint,
         strategy: tracked.strategy,
+        shape_mode: tracked.shape_mode,
+        shape_reason: tracked.shape_reason,
         bin_range: tracked.bin_range,
         bin_step: tracked.bin_step || null,
         volatility: tracked.volatility ?? null,
@@ -1345,6 +1357,8 @@ export async function closePosition({ position_address, reason, onClosing, onClo
         deployed_at: tracked.deployed_at,
         close_txs: closeTxHashes,
         fees_earned_usd: feesUsd,
+        fee_lp_sol: feeLpSol,
+        lp_value_change_sol: lpValueChangeSol,
         final_value_usd: finalValueUsd,
         initial_value_usd: initialUsd,
         pnl_source: pnlSource,

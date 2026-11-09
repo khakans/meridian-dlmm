@@ -4,6 +4,15 @@ import { fetchJson } from './rpc.js';
 
 export const ENTRY_SHAPES = ['spot', 'curve', 'bid_ask'];
 const CANDLE_SECONDS = 300;
+const SHAPE_LABELS = { spot: 'Spot', curve: 'Curve', bid_ask: 'Bid Ask', auto: 'Auto' };
+
+export function shapeLabel(shape, mode, rebalances) {
+  const actual = SHAPE_LABELS[shape];
+  if (!actual) return null;
+  const latest = rebalances?.at(-1);
+  if (latest) return `Auto (${SHAPE_LABELS[latest.from]} → ${actual})`;
+  return mode === 'auto' ? `Auto (${actual})` : actual;
+}
 
 export function chooseEntryShape(candles, { now, binStep, binsBelow, price, feeRatio, minFeeRatio, exitRatio, minExitRatio }) {
   const end = Math.floor(now / CANDLE_SECONDS) * CANDLE_SECONDS;
@@ -48,18 +57,31 @@ export function chooseEntryShape(candles, { now, binStep, binsBelow, price, feeR
   return { shape: 'spot', reason: 'kondisi campuran' };
 }
 
-export async function resolveEntryShape(mode, pool, binsBelow, entry) {
+export async function entryCandles(address, now = Math.floor(Date.now() / 1000)) {
+  const query = new URLSearchParams({ timeframe: '5m', start_time: String(now - 9 * CANDLE_SECONDS), end_time: String(now) });
+  const result = await fetchJson(`https://dlmm.datapi.meteora.ag/pools/${address}/ohlcv?${query}`,
+    { signal: AbortSignal.timeout(4500) }).catch(() => null);
+  return result?.data;
+}
+
+export async function resolveEntryShape(mode, pool, binsBelow, entry, { candles, now = Math.floor(Date.now() / 1000) } = {}) {
   if (ENTRY_SHAPES.includes(mode)) return { shape: mode, reason: 'manual' };
   if (mode !== 'auto') return { shape: null, reason: 'pengaturan shape tidak valid' };
-  const now = Math.floor(Date.now() / 1000);
-  const query = new URLSearchParams({ timeframe: '5m', start_time: String(now - 9 * CANDLE_SECONDS), end_time: String(now) });
-  const candles = await fetchJson(`https://dlmm.datapi.meteora.ag/pools/${pool.pool_address}/ohlcv?${query}`,
-    { signal: AbortSignal.timeout(4500) }).catch(() => null);
-  return chooseEntryShape(candles?.data, {
+  return chooseEntryShape(candles ?? await entryCandles(pool.pool_address, now), {
     now, binsBelow, binStep: entry.binStep, price: Number(entry.price),
     feeRatio: Number(pool.fee_active_tvl_ratio), minFeeRatio: config.screening.minFeeActiveTvlRatio,
     exitRatio: entry.exitRatio, minExitRatio: config.research.paperMinExitRatio,
   });
+}
+
+export function scoreShadowScreen(candles, poolHour, capital, now) {
+  const end = Math.floor(now / CANDLE_SECONDS) * CANDLE_SECONDS;
+  const volumes = [2, 1].map(i => candles?.find(row => row.timestamp === end - i * CANDLE_SECONDS)?.volume);
+  // Historical pool-level proxy. Actual fees are measured per bin by the paper lifecycle.
+  const ratio = poolHour?.fee_active_tvl_ratio == null || poolHour.fee_active_tvl_ratio === '' ? NaN : Number(poolHour.fee_active_tvl_ratio);
+  if (!volumes.every(v => Number.isFinite(v) && v >= 0) || !Number.isFinite(ratio) || ratio < 0) return { status: 'missing' };
+  const estimatedFeeSol = capital * ratio / 100;
+  return { status: volumes.every(v => v >= 500) && estimatedFeeSol >= 0.0003 ? 'pass' : 'reject', estimatedFeeSol };
 }
 
 export function isActivePaperVariant(variant) {

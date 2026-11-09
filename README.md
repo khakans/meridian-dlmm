@@ -63,6 +63,10 @@ Set `researchEnabled: true` in Shadow mode to compare discovery strategies and a
 
 Each variant has a separate bankroll (`paperBankrollSol`), a daily loss admission limit (`paperDailyLossLimitPct`) and a drawdown admission limit (`paperDrawdownLimitPct`). Exits remain active when admission is blocked. Daily return uses SOL equity across complete WIB days, including idle capital. Baseline starts collecting observations when qualifying wallet-convergence signals arrive. Challenger settings adjust range, first range wait, or max hold. Recommendations require at least 20 paired unique mints in training and 10 in a later validation window. They never update configuration automatically.
 
+With `strategy: "auto"`, Shadow records matched Spot, Curve and Bid Ask trials. The screening trial tags the Mirror outcome using the last two completed five-minute volume candles and a one-hour pool fee-to-active-TVL estimate. The tag is for comparison and does not change entry screening.
+
+`autoRebalance` defaults to true and adds a Shadow trial paired with the unchanged Mirror entry. It checks every three minutes and requires three consecutive qualifying observations and a 30-minute cooldown after a move. The trial only redistributes SOL in initialized bins below the active price inside the existing range. It estimates the fee advantage from recent per-bin fee growth, charges a simulated 0.00010 SOL per move, and yields to exits. Live Auto selects the shape at entry.
+
 `paperCapitalSol` and `paperMaxHoldMinutes` configure paper sizing and maximum hold. `paperMinExitRatio` is the minimum quoted liquidation value as a fraction of the current mark in both modes. Live close notifications distinguish confirmed LP closure from the subsequent token-to-SOL swap.
 
 Paper waits up to `paperInitialRangeWaitMinutes` (45 by default) for first range contact. After contact, a non-profitable discretionary exit needs a continuous `paperLossGraceMinutes` buffer (20 by default). Stop loss and maximum hold still apply. A paper close message lists up to `paperCloseListLimit` variants (3 by default); every result is recorded.

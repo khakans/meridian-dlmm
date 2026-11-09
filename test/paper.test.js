@@ -8,9 +8,11 @@ import { config } from '../config.js';
 import { mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMirrorPosition, prepareShapeTrials, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
 import { paperPnlLines, paperRealizedLine, shapeTrialLines, summarizePaper } from '../standalone/pnl-summary.js';
-import { chooseEntryShape, resolveEntryShape } from '../standalone/entry-plans.js';
+import { chooseEntryShape, resolveEntryShape, scoreShadowScreen, shapeLabel } from '../standalone/entry-plans.js';
+import { assessRebalance, prepareRebalanceTrial, rebalanceDue, REBALANCE_CHECK_MS } from '../standalone/paper-rebalance.js';
+import { WalletMonitor } from '../standalone/monitor.js';
 import { lowerRangeStop } from '../exit-rules.js';
-import { entryCreatedTokenAccounts, settlementComplete, tokenDelta } from '../standalone/settlement.js';
+import { entryCreatedTokenAccounts, settlementCashCosts, settlementComplete, tokenDelta } from '../standalone/settlement.js';
 import { meetsSettlementMinimum } from '../tools/wallet.js';
 import { positionsPage } from '../standalone/positions-view.js';
 import { estimateNetExitPct, isRetryableEntryError, netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
@@ -183,6 +185,89 @@ test('auto shape distinguishes calm, wide, mixed and unsafe pair conditions', as
   assert.equal(chooseEntryShape(wide.slice(1), options).shape, null);
   assert.equal(chooseEntryShape(wide, { ...options, exitRatio: 0.96 }).shape, null);
   assert.deepEqual(await resolveEntryShape('spot'), { shape: 'spot', reason: 'manual' });
+});
+
+test('auto rebalance needs three checks, sufficient observed fees and a 30 minute cooldown', () => {
+  const q = 1n << 64n, openedAt = 1_800_000_000_000, interval = REBALANCE_CHECK_MS;
+  const snapshot = (a, b) => new Map([a, b, 0n].map((fee, i) => [i + 1, {
+    supply: 10_000_000_000n * q, yAmount: 10_000_000_000n, xAmount: 0n, pricePerToken: 1,
+    feeAmountXPerTokenStored: 0n, feeAmountYPerTokenStored: fee,
+  }]));
+  const mirror = { id: 'mirror', lower: 1, upper: 3, shape: 'spot', shapeMode: 'auto', capital: 0.30, decimals: 6,
+    openedAt, costSol: 0.001, mirror: true };
+  mirror.binSeed = seedPaperBins(mirror, snapshot(0n, 0n));
+  const trial = prepareRebalanceTrial(mirror);
+  const assess = (n, bins, shape = 'curve') => assessRebalance(trial, {
+    now: openedAt + n * interval, active: { binId: 3 }, bins, plan: { shape, reason: 'test' }, quotePrice: 1,
+  });
+  assert.equal(assess(0.99, snapshot(0n, 0n)), false);
+  assert.equal(assess(1, snapshot(0n, 0n)), false);
+  assert.equal(assess(2, snapshot(0n, 0n)), false);
+  assert.equal(assess(3, snapshot(0n, 0n)), false);
+  assert.equal(trial.costSol, 0.001);
+  assert.equal(assess(5, snapshot(0n, 0n)), false);
+  assert.equal(trial.rebalanceCheck.checks, 1);
+  assert.equal(assess(6, snapshot(0n, q / 100n)), false);
+  trial.exitSignal = 'take profit';
+  const bins = snapshot(0n, q / 50n);
+  assert.equal(assess(7, bins), false);
+  delete trial.exitSignal;
+  assert.equal(assess(7, bins), true);
+  assert.equal(shapeLabel(trial.shape, trial.shapeMode, trial.rebalances), 'Auto (Spot → Curve)');
+  assert.equal(shapeLabel(mirror.shape, mirror.shapeMode), 'Auto (Spot)');
+  assert.equal(shapeLabel('spot'), 'Spot');
+  const before = markPaperBins(mirror, 3, bins);
+  const after = markPaperBins(trial, 3, bins);
+  assert.ok(Math.abs(before.sol - after.sol - trial.rebalanceIdleSol) < 1e-9);
+  assert.equal(before.feeSol, after.feeSol + trial.rebalanceFeeSol);
+  assert.equal(before.tokens, after.tokens);
+  assert.equal(trial.costSol, 0.0011);
+  assert.equal(rebalanceDue(trial, openedAt + 17 * interval - 1), false);
+  assert.equal(rebalanceDue(trial, openedAt + 17 * interval), true);
+});
+
+test('Shadow screening requires two completed 5 minute candles and a fee estimate', () => {
+  const now = 1_794_200_400;
+  const candles = [{ timestamp: now - 600, volume: 500 }, { timestamp: now - 300, volume: 600 },
+    { timestamp: now, volume: 10 }];
+  assert.equal(scoreShadowScreen(candles, { fee_active_tvl_ratio: 0.31 }, 0.10, now).status, 'pass');
+  assert.equal(scoreShadowScreen(candles, { fee_active_tvl_ratio: 0.29 }, 0.10, now).status, 'reject');
+  assert.equal(scoreShadowScreen(candles.slice(1), { fee_active_tvl_ratio: 0.31 }, 0.10, now).status, 'missing');
+  assert.equal(scoreShadowScreen(candles, { fee_active_tvl_ratio: null }, 0.10, now).status, 'missing');
+});
+
+test('settlement costs include failed transaction fees and remove refunded ATA rent', () => {
+  const tx = (pre, post, fee, postTokenBalances = []) => ({
+    transaction: { message: { staticAccountKeys: ['wallet'] } },
+    meta: { loadedAddresses: { writable: ['ata'] }, preBalances: [1e9, pre],
+      postBalances: [1e9, post], fee, postTokenBalances },
+  });
+  const entry = tx(0, 2_000_000, 5000, [{ accountIndex: 1, mint: 'mint', owner: 'wallet' }]);
+  const failed = tx(2_000_000, 2_000_000, 5000);
+  failed.meta.err = {};
+  assert.deepEqual(settlementCashCosts([entry, failed], [entry], 'mint', 'wallet'),
+    { networkFeeSol: 0.00001, retainedTokenRentSol: 0.002 });
+  assert.deepEqual(settlementCashCosts([entry, failed, tx(2_000_000, 0, 5000)], [entry], 'mint', 'wallet'),
+    { networkFeeSol: 0.000015, retainedTokenRentSol: 0 });
+});
+
+test('wallet reconciliation batches backfill and filters unrelated live logs', async () => {
+  const wallets = Array.from({ length: 5 }, () => ({ address: Keypair.generate().publicKey.toBase58() }));
+  const data = emptyMonitor();
+  for (const w of wallets) data.wallets[w.address] = { baselineSlot: 1, reconciledAt: 0 };
+  const callbacks = [];
+  const monitor = new WalletMonitor({ data, save() {} }, { reconcileSec: 30, walletThreshold: 2 },
+    { wallets: () => ({ wallets }), rpc: (_kind, call) => call({ getSignaturesForAddress: async () => [] }) });
+  monitor.ws = { onLogs: (_key, handler) => callbacks.push(handler) };
+  monitor.running = true;
+  await monitor.reconcile();
+  assert.deepEqual(monitor.coverage(), { total: 5, fresh: 4, stale: 1, errors: 0 });
+  assert.equal(monitor.healthy(), false);
+  await monitor.reconcile();
+  assert.equal(monitor.healthy(), true);
+  callbacks[0]({ signature: 'unrelated', logs: ['Program other invoke [1]'] }, { slot: 2 });
+  callbacks[0]({ signature: 'lp', logs: [`Program ${DLMM_PROGRAM} invoke [1]`] }, { slot: 2 });
+  assert.deepEqual(Object.values(data.pending).map(p => p.signature), ['lp']);
 });
 
 test('mirror uses the planned on-chain range and replay yields the same confirmed exits', () => {

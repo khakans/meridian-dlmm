@@ -30,6 +30,7 @@
   "gasReserve": 0.2,
   "positionSizePct": 0.35,
   "strategy": "bid_ask",
+  "autoRebalance": true,
   "researchEnabled": false,
   "researchMinMcap": 50000,
   "researchMinHolders": 150,
