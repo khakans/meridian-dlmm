@@ -16,7 +16,7 @@ import { WalletMonitor } from '../standalone/monitor.js';
 import { lowerRangeStop } from '../exit-rules.js';
 import { entryCreatedTokenAccounts, settlementCashCosts, settlementComplete, tokenDelta } from '../standalone/settlement.js';
 import { meetsSettlementMinimum } from '../tools/wallet.js';
-import { positionsPage } from '../standalone/positions-view.js';
+import { positionsPage, readLiveReportBook } from '../standalone/positions-view.js';
 import { estimateNetExitPct, isRetryableEntryError, netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
 import { DLMM_PROGRAM, recoverablePositionRent } from '../standalone/events.js';
 import { recentSignalCounts } from '../standalone/store.js';
@@ -485,6 +485,39 @@ test('position pages preserve mode separation, history past a reset, and unknown
     live.db.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('live report includes recent on-chain positions while the index catches up', async () => {
+  const now = 1_800_000_000_000;
+  const row = (position, ago = 1000) => ({ position, pool: 'pool', pool_name: position + '-SOL',
+    deployed_at: new Date(now - ago).toISOString() });
+  const indexed = { position: 'indexed', pnl_usd: 2 };
+  const tracked = [row('indexed'), row('fresh'), row('pending'), row('closed'), row('old', 600_000)];
+  const calls = [];
+  const book = await readLiveReportBook(async () => ({ wallet: 'owner', positions: [indexed] }), () => tracked, 'owner', {
+    now: () => now,
+    verify: async (id, owner, pool) => {
+      assert.equal(owner, 'owner');
+      assert.equal(pool, 'pool');
+      calls.push(id);
+      if (id === 'fresh') tracked.push(row('during'));
+      if (id === 'pending') throw Error('RPC unavailable');
+      if (id === 'closed') tracked.find(p => p.position === id).closed = true;
+      return { shares: '10', xMint: 'mint', lower: 10, upper: 20, active: 15, inRange: true };
+    },
+  });
+  assert.deepEqual(calls, ['fresh', 'pending', 'closed', 'during']);
+  assert.equal(book.total_positions, 3);
+  assert.deepEqual(book.positions.map(p => p.position), ['indexed', 'fresh', 'during']);
+  assert.equal(book.positions[0].pnl_usd, 2);
+  assert.equal(book.positions[1].awaitingIndex, true);
+  assert.equal(book.positions[1].pnl_usd, null);
+  assert.deepEqual(book.pendingEntries, [{ position: 'pending', pair: 'pending-SOL' }]);
+  const partial = await readLiveReportBook(async () => ({ error: 'index down' }), () => [row('fresh')], 'owner', {
+    now: () => now, verify: async () => ({ shares: '10' }),
+  });
+  assert.equal(partial.error, 'index down');
+  assert.equal(partial.positions[0].position, 'fresh');
 });
 
 test('SQLite migrates paper and live data separately and persists paper history once', () => {

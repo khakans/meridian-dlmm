@@ -575,7 +575,6 @@ export async function deployPosition({
     log("deploy", `SUCCESS — ${txHashes.length} tx(s): ${txHashes[0]}`);
     const allDeployTxs = preSwapTxHash ? [preSwapTxHash, ...txHashes] : txHashes;
 
-    _positionsCacheAt = 0;
     const signalSnapshot = null;
     let resolvedInitialValueUsd = initial_value_usd;
     if (resolvedInitialValueUsd == null) {
@@ -606,6 +605,7 @@ export async function deployPosition({
       entry_volume,
       entry_holders,
     });
+    _positionsCacheAt = 0;
 
     appendDecision({
       type: "deploy",
@@ -873,7 +873,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
     try {
       if (!silent) log("positions", "Fetching portfolio via Meteora portfolio API...");
       const portfolioUrl = `https://dlmm.datapi.meteora.ag/portfolio/open?user=${walletAddress}`;
-      const res = await fetch(portfolioUrl);
+      const res = await fetch(portfolioUrl, { signal: AbortSignal.timeout(10_000) });
       if (!res.ok) throw new Error(`Portfolio API ${res.status}: ${await res.text().catch(() => "")}`);
       portfolio = await res.json();
     } catch (error) {

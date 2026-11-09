@@ -1,4 +1,44 @@
 import { isActivePaperVariant, shapeLabel } from './entry-plans.js';
+import { positionSnapshot } from './events.js';
+import { POSITION_INDEX_GRACE_MS } from '../state.js';
+
+export async function readLiveReportBook(readBook, listTracked, walletAddress, {
+  verify = positionSnapshot, now = Date.now,
+} = {}) {
+  const book = await readBook().catch(() => ({ error: 'Position read unavailable' }));
+  const wallet = book.wallet ?? walletAddress;
+  if (!wallet || (walletAddress && book.wallet && book.wallet !== walletAddress)) return book;
+  const positions = Array.isArray(book.positions) ? [...book.positions] : [];
+  const seen = new Set(positions.map(p => p.position));
+  const pendingEntries = [];
+  // Check again for entries confirmed while the first RPC lookups were running.
+  for (let pass = 0; pass < 2; pass++) {
+    const at = now();
+    const missing = listTracked().filter(p => {
+      const age = at - Date.parse(p.deployed_at);
+      return !p.closed && p.position && p.pool && !seen.has(p.position) && age >= 0 && age < POSITION_INDEX_GRACE_MS;
+    });
+    if (!missing.length) break;
+    const results = await Promise.all(missing.map(async p => {
+      const snapshot = await verify(p.position, wallet, p.pool).catch(() => null);
+      return { p, snapshot };
+    }));
+    const stillTracked = new Set(listTracked().filter(p => !p.closed).map(p => p.position));
+    for (const { p, snapshot } of results) {
+      if (seen.has(p.position)) continue;
+      seen.add(p.position);
+      if (!stillTracked.has(p.position)) continue;
+      if (snapshot && BigInt(snapshot.shares) > 0n) {
+        positions.push({
+          position: p.position, pair: p.pool_name, pool: p.pool, base_mint: snapshot.xMint,
+          lower_bin: snapshot.lower, upper_bin: snapshot.upper, active_bin: snapshot.active,
+          in_range: snapshot.inRange, pnl_usd: null, pnl_pct: null, pnl_pct_suspicious: true, awaitingIndex: true,
+        });
+      } else pendingEntries.push({ position: p.position, pair: p.pool_name });
+    }
+  }
+  return { ...book, wallet, positions, total_positions: positions.length, pendingEntries };
+}
 
 const PAGE_SIZE = 2;
 const MARK_MAX_AGE = 180_000;

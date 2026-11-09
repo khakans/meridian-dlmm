@@ -498,7 +498,7 @@ export function setLastBriefingDate() {
  * Reconcile local state with actual on-chain positions.
  * Marks any local open positions as closed if they are not in the on-chain list.
  */
-const SYNC_GRACE_MS = 5 * 60_000; // don't auto-close positions deployed < 5 min ago
+export const POSITION_INDEX_GRACE_MS = 5 * 60_000;
 
 export function syncOpenPositions(active_addresses) {
   const state = load();
@@ -511,7 +511,7 @@ export function syncOpenPositions(active_addresses) {
 
     // Grace period: newly deployed positions may not be indexed yet
     const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;
-    if (Date.now() - deployedAt < SYNC_GRACE_MS) {
+    if (Date.now() - deployedAt < POSITION_INDEX_GRACE_MS) {
       log("state", `Position ${posId} not on-chain yet — within grace period, skipping auto-close`);
       continue;
     }

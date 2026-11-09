@@ -26,7 +26,7 @@ import { readRpc } from "./rpc.js";
 import { withWalletLock } from "./transactions.js";
 import { paperDay } from "./paper-accounting.js";
 import { longRunLines, paperPnlLines, paperRealizedLine, rebalanceTrialLines, shapeTrialLines, signed, summarizePaper, tokenRunnerLines } from "./pnl-summary.js";
-import { openPositions, positionsPage, positionTarget } from "./positions-view.js";
+import { openPositions, positionsPage, positionTarget, readLiveReportBook } from "./positions-view.js";
 import { exposureStillPresent, recoverablePositionRent } from "./events.js";
 import { getActiveBin, getMyPositions, getPositionExitInventory, simulateEntryPosition } from "../tools/dlmm.js";
 import { executeTool, validateDeployPoolThresholds } from "../tools/executor.js";
@@ -684,10 +684,14 @@ function startHeartbeat() {
 }
 
 async function lifecycleStatusLines(detailed = false) {
-  const [wallet, book] = await Promise.all([
+  const [wallet, check, shadowBook] = await Promise.all([
     getWalletBalances({ force: true, nativeOnly: true }),
-    getMyPositions({ silent: true }),
+    detailed ? refreshPreflight() : null,
+    config.standalone.shadow ? getMyPositions({ silent: true }) : null,
   ]);
+  const book = shadowBook ?? await readLiveReportBook(
+    () => getMyPositions({ force: true, silent: true }), () => getTrackedPositions(true), wallet.wallet,
+  );
   const lines = [
     `Saldo ${!wallet.error && Number.isFinite(wallet.sol) ? `${wallet.sol.toFixed(4)} SOL` : "belum tersedia"} · Entry otomatis ${store.data.paused ? "dijeda" : "aktif"}`,
     `Monitor ${monitor?.healthy() ? "siap" : "belum siap"} · RPC wallet ${wallet.error ? "gagal" : "OK"}`,
@@ -697,7 +701,6 @@ async function lifecycleStatusLines(detailed = false) {
   const unsettled = settlements.filter(r => !settlementComplete(r));
   if (detailed) {
     lines.push("", "Diagnostik");
-    const check = await refreshPreflight();
     lines.push(`Preflight · pool ${check.pool} · quote keluar ${check.quote}`);
     lines.push(`Simulasi build entry · ${check.simulation}`);
     if (unsettled.length) for (const row of unsettled.slice(0, 4)) {
@@ -708,15 +711,17 @@ async function lifecycleStatusLines(detailed = false) {
     }
   }
   lines.push("", "Posisi & PnL");
-  if (book.error || !Array.isArray(book.positions)) {
+  if (!Array.isArray(book.positions) || (book.error && !book.positions.length)) {
     lines.push("Posisi dan PnL belum tersedia.");
   } else {
     const unit = config.management.solMode ? "SOL" : "USD";
     const known = book.positions.filter(p => Number.isFinite(p.pnl_usd) && !p.pnl_pct_suspicious);
     const pnl = known.reduce((sum, p) => sum + p.pnl_usd, 0);
-    lines.push(`${book.positions.length} posisi on-chain terbuka · PnL terbuka ${known.length ? `${signed(pnl)} ${unit}` : book.positions.length ? "belum tersedia" : "—"}${known.length < book.positions.length ? ` (${known.length}/${book.positions.length} terukur)` : ""}`);
+    if (book.error) lines.push(`${book.positions.length} posisi baru terverifikasi · daftar lengkap belum tersedia`);
+    else lines.push(`${book.positions.length} posisi on-chain terbuka · PnL terbuka ${known.length ? `${signed(pnl)} ${unit}` : book.positions.length ? "belum tersedia" : "—"}${known.length < book.positions.length ? ` (${known.length}/${book.positions.length} terukur)` : ""}`);
     for (const p of book.positions.slice(0, 10)) {
-      const pct = !p.pnl_pct_suspicious && Number.isFinite(p.pnl_pct) ? `${p.pnl_pct > 0 ? "+" : ""}${p.pnl_pct.toFixed(2)}%` : "PnL belum tersedia";
+      const pct = p.awaitingIndex ? "entry terkonfirmasi · PnL menyusul"
+        : !p.pnl_pct_suspicious && Number.isFinite(p.pnl_pct) ? `${p.pnl_pct > 0 ? "+" : ""}${p.pnl_pct.toFixed(2)}%` : "PnL belum tersedia";
       const range = typeof p.in_range === "boolean" ? (p.in_range ? "di dalam range" : "di luar range") : "range belum tersedia";
       const tracked = getTrackedPosition(p.position);
       const attempt = Object.values(store.data.attempts).find(row => row.position === p.position);
@@ -724,6 +729,9 @@ async function lifecycleStatusLines(detailed = false) {
       lines.push(`• ${String(p.pair || p.position).replace(/[<>&\r\n]/g, " ").slice(0, 80)} · ${pct} · ${range}${shape ? ` · ${shape}` : ""}`);
     }
     if (book.positions.length > 10) lines.push(`+${book.positions.length - 10} posisi lainnya`);
+  }
+  for (const p of (book.pendingEntries ?? []).slice(0, 4)) {
+    lines.push(`• ${String(p.pair || p.position).replace(/[<>&\r\n]/g, " ").slice(0, 80)} · entry tercatat · verifikasi posisi tertunda`);
   }
   const now = Date.now();
   const resetAt = store.data.pnlResetAt?.[store.database.mode] ?? 0;
