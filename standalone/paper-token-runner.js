@@ -18,9 +18,38 @@ function recentCandles(data, now) {
   return rows;
 }
 
+function risingTrend(data, now) {
+  const rows = recentCandles(data, now);
+  if (!rows) return null;
+  const [a, b, c, d] = rows;
+  return d.close > c.close && c.close > b.close && d.low > c.low &&
+    c.volume + d.volume >= a.volume + b.volume && d.volume > 0 ? { candleAt: d.timestamp, swingLow: Math.min(c.low, d.low) } : null;
+}
+
+function runner(p, { id = p.id, raw, now, quote, trend, costSol = EXTRA_SWAP_COST_SOL }) {
+  return { id, mint: p.mint, pool: p.pool, pair: p.pair, raw, openedAt: now, expiresAt: now + MAX_HOLD_MS,
+    longRunArm: p.longRunArm, quote, quoteAt: now, peak: quote, maxDrawdownSol: 0, costSol,
+    ...trend, trendCheckedAt: now };
+}
+
+export async function prepareEntrySpot(p, { capital, now, candles, buy, sell, minExitRatio }) {
+  const trend = risingTrend(candles, now);
+  if (!trend) return null;
+  const lamports = Math.floor(capital * 1e9);
+  if (!Number.isSafeInteger(lamports) || lamports <= 0) return null;
+  const raw = await buy(p.mint, lamports);
+  if (!Number.isSafeInteger(raw) || raw <= 0) return null;
+  const kept = await sell(p.mint, raw);
+  const basis = lamports / 1e9;
+  if (!usableQuote(kept) || kept < basis * minExitRatio) return null;
+  return { ...runner(p, { id: `${p.id}:spot-entry`, raw, now, quote: kept, trend,
+    costSol: 2 * EXTRA_SWAP_COST_SOL }),
+    entrySpot: true, initialQuote: kept, baselinePnl: 0, sold: 0, fullQuote: basis };
+}
+
 export async function prepareTokenRunner(p, { raw, sol, fullQuote, pnl, now, quote, candles }) {
   const reason = p.exit?.reason ?? '';
-  if (!p.mirror || p.manualExit || p.hardLowerExit || !(pnl > 0) ||
+  if (!(p.mirror || p.longRunArm === 'adaptive' || p.longRunArm === 'spot') || p.manualExit || p.hardLowerExit || !(pnl > 0) ||
       !(/^(take profit|trailing take profit|pumped far above range|OOR above \(\d+m\))$/.test(reason))) return null;
   const total = sol + fullQuote;
   if (!usableQuote(fullQuote) || !(sol >= 0) || !(fullQuote > total / 2)) return null;
@@ -29,19 +58,11 @@ export async function prepareTokenRunner(p, { raw, sol, fullQuote, pnl, now, quo
   const [data, sold, kept] = await Promise.all([
     candles(p.pool, Math.floor(now / 1000)), quote(p.mint, raw - amount), quote(p.mint, amount),
   ]);
-  const rows = recentCandles(data, now);
-  if (!rows) return null;
-  const [a, b, c, d] = rows;
-  if (!(d.close > c.close && c.close > b.close && d.low > c.low &&
-      c.volume + d.volume >= a.volume + b.volume && d.volume > 0)) return null;
+  const trend = risingTrend(data, now);
+  if (!trend) return null;
   if (!usableQuote(sold) || !usableQuote(kept) || kept < 0.001 || kept > total * 0.20 ||
       !(pnl + sold + kept - fullQuote - EXTRA_SWAP_COST_SOL > 0)) return null;
-  return {
-    id: p.id, mint: p.mint, pool: p.pool, pair: p.pair, raw: amount, openedAt: now, expiresAt: now + MAX_HOLD_MS,
-    baselinePnl: pnl, fullQuote, sold, initialQuote: kept, costSol: EXTRA_SWAP_COST_SOL,
-    quote: kept, quoteAt: now, peak: kept, maxDrawdownSol: 0,
-    candleAt: d.timestamp, swingLow: Math.min(c.low, d.low), trendCheckedAt: now,
-  };
+  return { ...runner(p, { raw: amount, now, quote: kept, trend }), baselinePnl: pnl, fullQuote, sold, initialQuote: kept };
 }
 
 export async function sampleTokenRunner(row, { now, quote, candles }) {

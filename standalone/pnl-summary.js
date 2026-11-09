@@ -1,4 +1,5 @@
 import { ENTRY_SHAPES, isActivePaperVariant, shapeLabel } from './entry-plans.js';
+import { longRunSpotReady } from './paper-long-run.js';
 
 export const signed = value => `${value >= 0 ? "+" : ""}${value.toFixed(4)}`;
 
@@ -49,8 +50,9 @@ export function rebalanceTrialLines(paper, from, detailed) {
 }
 
 export function tokenRunnerLines(paper, from, now, detailed) {
-  const open = Object.values(paper?.tokenRunners?.open ?? {});
-  const closed = (paper?.tokenRunners?.closed ?? []).filter(p => p.closedAt >= from && p.closedAt <= now);
+  const baseline = p => !p.longRunArm || p.longRunArm === 'baseline';
+  const open = Object.values(paper?.tokenRunners?.open ?? {}).filter(baseline);
+  const closed = (paper?.tokenRunners?.closed ?? []).filter(p => baseline(p) && p.closedAt >= from && p.closedAt <= now);
   if (!open.length && !closed.length) return [];
   const waiting = open.filter(p => p.quoteMissingSince != null).length;
   const delta = closed.reduce((sum, p) => sum + p.deltaSol, 0);
@@ -65,6 +67,35 @@ export function tokenRunnerLines(paper, from, now, detailed) {
       const mark = fresh ? `Δ ${signed(p.sold + p.quote - p.fullQuote - p.costSol)} SOL` : 'menunggu quote';
       lines.push(`• ${p.pair ?? p.mint.slice(0, 8)} · ${mark}${p.reason ? ` · exit ${p.reason}` : ''}`);
     }
+  }
+  return lines;
+}
+
+export function longRunLines(paper, from, detailed) {
+  const state = paper?.longRun;
+  if (!state) return [];
+  const open = Object.values(state.open);
+  const closed = state.closed.filter(p => p.closedAt >= from);
+  const delta = closed.reduce((n, p) => n + p.deltaSol, 0);
+  const lines = [`Long Run Shadow · ${open.length} uji aktif · ${state.matched} pembanding selesai · ${state.extended} pernah diperpanjang${closed.length ? ` · Δ net ${signed(delta)} SOL vs hold standar` : ''}`];
+  if (!detailed) return lines;
+  lines.push(`LP + spot · ${longRunSpotReady(state) ? 'bisa diuji pada entry yang memenuhi syarat' : `tahap 2 setelah ${state.matched}/20 pembanding`}`);
+  const summarize = (label, rows, arm) => {
+    const values = rows.map(r => r.arms[arm]);
+    const sum = key => values.reduce((n, p) => n + p[key], 0);
+    const hours = sum('minutes') / 60;
+    return `${label} · fee LP ${signed(sum('lpFeeSol'))} SOL · spot ${signed(sum('spotPnl'))} SOL · net ${signed(sum('pnl'))} SOL · DD maks ${Math.max(...values.map(p => p.drawdownSol)).toFixed(4)} SOL · ${hours > 0 ? signed(sum('pnl') / hours) + ' SOL/jam' : '—'}`;
+  };
+  if (closed.length) lines.push(summarize('Standar', closed, 'baseline'), summarize('Hold adaptif', closed, 'adaptive'));
+  const spot = closed.filter(p => p.arms.spot);
+  if (spot.length) {
+    const delta = spot.reduce((n, p) => n + p.arms.spot.pnl - p.arms.adaptive.pnl, 0);
+    lines.push(`LP + spot · ${spot.length} pembanding · Δ net ${signed(delta)} SOL vs adaptif`,
+      summarize('Adaptif pembanding', spot, 'adaptive'), summarize('Adaptif + spot', spot, 'spot'));
+  }
+  for (const c of open.slice(0, 4)) {
+    const p = paper.open[c.arms.adaptive.lpId];
+    if (p?.longHold?.extensions) lines.push(`• ${c.pair ?? c.mint.slice(0, 8)} · ${p.longHold.extensions} perpanjangan hold`);
   }
   return lines;
 }

@@ -18,17 +18,19 @@ import { startDiscovery } from "./discovery.js";
 import { entryCandles, isActivePaperVariant, resolveEntryShape, scoreShadowScreen, shapeLabel } from "./entry-plans.js";
 import { mirrorExitReason, prepareMirrorPosition, prepareShapeTrials, startPaper, validateExitQuote } from "./paper.js";
 import { prepareRebalanceTrial } from "./paper-rebalance.js";
+import { canEnrollLongRun, longRunSpotReady, longRunState, prepareLongHold } from "./paper-long-run.js";
+import { prepareEntrySpot } from "./paper-token-runner.js";
 import { advanceSettlement, dueSettlements, SETTLEMENT_DUST_SOL, settlementComplete, settlementRows } from "./settlement.js";
 import { estimateEntryOverheadSol, estimateNetExitPct, isRetryableEntryError, positionWrites, reconcilePositionWrites } from "./position-journal.js";
 import { readRpc } from "./rpc.js";
 import { withWalletLock } from "./transactions.js";
 import { paperDay } from "./paper-accounting.js";
-import { paperPnlLines, paperRealizedLine, rebalanceTrialLines, shapeTrialLines, signed, summarizePaper, tokenRunnerLines } from "./pnl-summary.js";
+import { longRunLines, paperPnlLines, paperRealizedLine, rebalanceTrialLines, shapeTrialLines, signed, summarizePaper, tokenRunnerLines } from "./pnl-summary.js";
 import { openPositions, positionsPage, positionTarget } from "./positions-view.js";
 import { exposureStillPresent, recoverablePositionRent } from "./events.js";
 import { getActiveBin, getMyPositions, getPositionExitInventory, simulateEntryPosition } from "../tools/dlmm.js";
 import { executeTool, validateDeployPoolThresholds } from "../tools/executor.js";
-import { getWalletBalances, quoteTokenToSol } from "../tools/wallet.js";
+import { getWalletBalances, quoteSolToToken, quoteTokenToSol } from "../tools/wallet.js";
 import { getTrackedPosition, getTrackedPositions, syncOpenPositions, trackPosition } from "../state.js";
 import { latchLowerRangeExit } from "../state.js";
 import { recordPositionSnapshot } from "../pool-memory.js";
@@ -373,7 +375,7 @@ async function attemptEntry(signal) {
   if (!plan.shape) return `Auto Shape: ${plan.reason}`;
   const modelInput = { source, mint, pool: pool.pool_address, pair: pool.name,
     decimals: screened.decimals, binStep: entry.binStep, binsBelow, capital: amountY, shape: plan.shape, entry };
-  let model, trials;
+  let model, trials, longRun, entrySpot;
   try {
     model = prepareMirrorPosition(modelInput);
     model.shapeMode = shapeMode;
@@ -386,6 +388,27 @@ async function attemptEntry(signal) {
     }
     if (shadow && shapeMode === "auto" && config.strategy.autoRebalance &&
         Object.values(paper.open).filter(p => p.rebalanceTrial).length < 8) trials.push(prepareRebalanceTrial(model));
+    if (shadow && config.research.paperLongRun && canEnrollLongRun(paper, amountY, config.research.paperBankrollSol, config.risk.maxPositions)) {
+      const baseMinutes = config.research.paperMaxHoldMinutes;
+      const adaptive = prepareLongHold(model, "adaptive", baseMinutes);
+      model.longRunArm = "baseline";
+      model.maxHoldMinutes = baseMinutes;
+      trials.push(adaptive);
+      longRun = { id: model.id, mint, pair: model.pair, capital: amountY, openedAt: model.openedAt,
+        arms: { baseline: { lpId: model.id }, adaptive: { lpId: adaptive.id } } };
+      if (config.research.paperLongRunSpot && longRunSpotReady(longRunState(paper)) && signal.deadline - Date.now() > 20_000) {
+        const spotCapital = Math.floor(amountY * 0.15 * 1e9) / 1e9;
+        const lp = prepareMirrorPosition({ ...modelInput, capital: amountY - spotCapital }, model.openedAt);
+        const split = prepareLongHold(lp, "spot", baseMinutes);
+        const quotedAt = Date.now();
+        entrySpot = await prepareEntrySpot(split, { capital: spotCapital, now: quotedAt, candles,
+          buy: quoteSolToToken, sell: quoteTokenToSol, minExitRatio: config.research.paperMinExitRatio }).catch(() => null);
+        if (entrySpot && Date.now() - quotedAt <= 15_000) {
+          trials.push(split);
+          longRun.arms.spot = { lpId: split.id, entrySpotId: entrySpot.id };
+        } else entrySpot = null;
+      }
+    }
   } catch { return "entry range unavailable for selected shape"; }
   const fresh = await finalRecheck(signal, screened, simulatedSol);
   if (fresh) return fresh;
@@ -399,6 +422,11 @@ async function attemptEntry(signal) {
     for (const trial of trials) {
       paper.realized[trial.variant] ??= 0;
       paper.open[trial.id] = trial;
+    }
+    if (longRun) longRunState(paper).open[longRun.id] = longRun;
+    if (entrySpot) {
+      const runners = paper.tokenRunners ??= { open: {}, closed: [] };
+      runners.open[entrySpot.id] = entrySpot;
     }
     store.data.attempts[mint] = { at: Date.now(), mint, pool: pool.pool_address, source, status: "entered", amountSol: amountY,
       strategy: plan.shape, shapeMode, shapeReason: plan.reason };
@@ -715,7 +743,8 @@ async function lifecycleStatusLines(detailed = false) {
     if (detailed) lines.push(...shapeTrialLines(paper?.closed, trialFrom));
     lines.push(...rebalanceTrialLines(paper, trialFrom, detailed));
     lines.push(...tokenRunnerLines(paper, from, now, detailed));
-    const legacy = Object.values(paper?.open ?? {}).filter(p => !p.mirror && !p.shapeTrial && !p.rebalanceTrial).length;
+    lines.push(...longRunLines(paper, trialFrom, detailed));
+    const legacy = Object.values(paper?.open ?? {}).filter(p => !p.mirror && !p.shapeTrial && !p.rebalanceTrial && !p.longRunArm).length;
     if (legacy) lines.push(`Eksperimen lama · ${legacy} posisi terbuka di riwayat paper`);
   }
   if (resetAt > now - 86_400_000) lines.push(`Periode PnL sejak reset ${new Date(resetAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })} WIB`);
@@ -866,11 +895,18 @@ export async function startStandalone() {
       const positions = targets.map(({ id }) => open[id]).filter(Boolean);
       const newlyQueued = positions.filter(p => !p.exit && !p.manualExit);
       const ids = new Set(newlyQueued.map(p => p.id));
-      const paired = Object.values(open).filter(p => p.rebalanceTrial && ids.has(p.rebalancePair) && !p.exit && !p.manualExit);
+      const cohorts = Object.values(store.data.paper?.longRun?.open ?? {}).filter(c => ids.has(c.id));
+      const arms = cohorts.flatMap(c => Object.values(c.arms));
+      const siblings = new Set(arms.map(a => a.lpId).filter(id => !ids.has(id)));
+      const paired = Object.values(open).filter(p => (siblings.has(p.id) || p.rebalanceTrial && ids.has(p.rebalancePair)) && !p.exit && !p.manualExit);
+      const runners = store.data.paper?.tokenRunners?.open ?? {};
+      const spots = arms.map(a => runners[a.entrySpotId]).filter(p => p && !p.reason);
       for (const p of [...newlyQueued, ...paired]) p.manualExit = "manual force close";
+      for (const p of spots) runners[p.id] = { ...p, reason: "manual force close" };
       try { store.save(); }
       catch (error) {
         for (const p of [...newlyQueued, ...paired]) delete p.manualExit;
+        for (const p of spots) runners[p.id] = p;
         throw error;
       }
       return `Shadow · ${newlyQueued.length} masuk antrean close · ${positions.length - newlyQueued.length} sudah diproses/antre · ${targets.length - positions.length} sudah tidak terbuka. Lifecycle menyelesaikan close setelah data tersedia.`;

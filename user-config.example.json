@@ -40,6 +40,8 @@
   "paperCapitalSol": 0.55,
   "paperSizingExperiment": false,
   "paperTokenRunner": true,
+  "paperLongRun": true,
+  "paperLongRunSpot": true,
   "paperBankrollSol": 2,
   "paperDailyLossLimitPct": 5,
   "paperDrawdownLimitPct": 15,

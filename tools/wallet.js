@@ -53,8 +53,8 @@ function getJupiterApiKey() {
   return config.jupiter.apiKey || process.env.JUPITER_API_KEY || DEFAULT_JUPITER_API_KEY;
 }
 
-export async function quoteTokenToSol(mint, rawAmount, { expectedOutput = false } = {}) {
-  const params = new URLSearchParams({ inputMint: mint, outputMint: config.tokens.SOL, amount: String(rawAmount) });
+async function quoteRawSwap(inputMint, outputMint, rawAmount, expectedOutput) {
+  const params = new URLSearchParams({ inputMint, outputMint, amount: String(rawAmount) });
   const response = await fetch(`${JUPITER_SWAP_V2_API}/order?${params}`, {
     headers: { 'x-api-key': getJupiterApiKey() }, signal: AbortSignal.timeout(8000),
   });
@@ -62,10 +62,18 @@ export async function quoteTokenToSol(mint, rawAmount, { expectedOutput = false 
   const quote = await response.json();
   const expected = Number(quote.outAmount);
   const minimum = Number(quote.otherAmountThreshold);
-  if (quote.inputMint !== mint || quote.outputMint !== config.tokens.SOL ||
+  if (quote.inputMint !== inputMint || quote.outputMint !== outputMint ||
       quote.inAmount !== String(rawAmount) || !(minimum > 0 && minimum <= expected) ||
       !Number.isSafeInteger(minimum) || !Number.isSafeInteger(expected)) throw Error('No valid token/SOL exit quote');
-  return (expectedOutput ? expected : minimum) / LAMPORTS_PER_SOL;
+  return expectedOutput ? expected : minimum;
+}
+
+export async function quoteTokenToSol(mint, rawAmount, { expectedOutput = false } = {}) {
+  return (await quoteRawSwap(mint, config.tokens.SOL, rawAmount, expectedOutput)) / LAMPORTS_PER_SOL;
+}
+
+export async function quoteSolToToken(mint, lamports) {
+  return quoteRawSwap(config.tokens.SOL, mint, lamports, false);
 }
 
 export const SETTLEMENT_SLIPPAGE_BPS = 100;

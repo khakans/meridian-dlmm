@@ -95,6 +95,8 @@ const SECTIONS = [
       { k: "stopLossPct", path: ["management", "stopLossPct"], type: "float", min: -99, max: 0, unit: "%" },
       { k: "takeProfitPct", path: ["management", "takeProfitPct"], type: "float", min: 0, max: 1000, unit: "%" },
       { k: "paperTokenRunner", path: ["research", "paperTokenRunner"], type: "bool", label: "Sisa token (Shadow)" },
+      { k: "paperLongRun", path: ["research", "paperLongRun"], type: "bool", label: "Long Run (Shadow)" },
+      { k: "paperLongRunSpot", path: ["research", "paperLongRunSpot"], type: "bool", label: "LP + spot tahap 2 (Shadow)" },
       { k: "trailingTakeProfit", path: ["management", "trailingTakeProfit"], type: "bool" },
       { k: "trailingTriggerPct", path: ["management", "trailingTriggerPct"], type: "float", min: 0.1, max: 1000, unit: "%" },
       { k: "trailingDropPct", path: ["management", "trailingDropPct"], type: "float", min: 0.1, max: 100, unit: "%" },

@@ -7,10 +7,11 @@ import { Keypair, SystemProgram, Transaction } from '@solana/web3.js';
 import { config } from '../config.js';
 import { mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMirrorPosition, prepareShapeTrials, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
-import { paperPnlLines, paperRealizedLine, shapeTrialLines, summarizePaper, tokenRunnerLines } from '../standalone/pnl-summary.js';
+import { longRunLines, paperPnlLines, paperRealizedLine, shapeTrialLines, summarizePaper, tokenRunnerLines } from '../standalone/pnl-summary.js';
 import { chooseEntryShape, resolveEntryShape, scoreShadowScreen, shapeLabel } from '../standalone/entry-plans.js';
 import { assessRebalance, prepareRebalanceTrial, rebalanceDue, REBALANCE_CHECK_MS } from '../standalone/paper-rebalance.js';
-import { prepareTokenRunner, sampleTokenRunner } from '../standalone/paper-token-runner.js';
+import { prepareEntrySpot, prepareTokenRunner, sampleTokenRunner } from '../standalone/paper-token-runner.js';
+import { applyHoldCheck, canEnrollLongRun, holdEvidence, longRunSpotReady, longRunState, observeHold, prepareLongHold, updateLongRun } from '../standalone/paper-long-run.js';
 import { WalletMonitor } from '../standalone/monitor.js';
 import { lowerRangeStop } from '../exit-rules.js';
 import { entryCreatedTokenAccounts, settlementCashCosts, settlementComplete, tokenDelta } from '../standalone/settlement.js';
@@ -303,6 +304,76 @@ test('paper lifecycle opens a token runner alongside the original LP result', as
   } finally { stop(); }
 });
 
+test('adaptive hold can renew past six hours and expires on missing or unproductive observations', () => {
+  const minute = 60_000, openedAt = 1_800_000_000_000;
+  const base = { id: 'lp', openedAt, lower: 1, upper: 20, capital: 0.15 };
+  const p = prepareLongHold(base, 'adaptive', 240);
+  for (let i = 179; i <= 390; i++) {
+    const now = openedAt + i * minute;
+    observeHold(p, { now, activeBin: 10, feeSol: i * 0.00001, feeTokens: 0, valued: true });
+    if (now < p.longHold.checkAt) continue;
+    const evidence = holdEvidence(p, now, 0, 0.002);
+    assert.ok(evidence);
+    applyHoldCheck(p, now, evidence);
+    assert.equal(paperCloseRule(p, { binId: 10 }, 1.3, now), null);
+  }
+  assert.equal(p.maxHoldMinutes, 420);
+  assert.equal(p.longHold.extensions, 6);
+  const next = openedAt + 405 * minute;
+  observeHold(p, { now: next, activeBin: 10, feeSol: 0, feeTokens: 0, valued: false });
+  assert.equal(holdEvidence(p, next, 0, 0.002), null);
+  applyHoldCheck(p, next, null);
+  assert.equal(paperCloseRule(p, { binId: 10 }, 1.3, next), 'maximum hold time');
+  assert.equal(paperCloseRule(p, { binId: 10 }, -100, next), 'stop loss');
+  const flat = prepareLongHold(base, 'adaptive', 240);
+  for (let i = 180; i <= 240; i++) observeHold(flat, {
+    now: openedAt + i * minute, activeBin: i < 204 ? 21 : 10, feeSol: i * 0.00001, feeTokens: 0, valued: true,
+  });
+  assert.equal(holdEvidence(flat, openedAt + 240 * minute, 0, 0.002), null);
+});
+
+test('spot sleeve uses 15% of the same bankroll and requires an executable two-way quote', async () => {
+  const now = 1_800_000_000_000;
+  const capital = 0.15 * 0.15;
+  const p = { id: 'lp:spot', mint: 'mint', pool: 'pool', longRunArm: 'spot' };
+  const args = { now, capital, candles: risingCandles(now), minExitRatio: 0.97,
+    buy: async (mint, lamports) => { assert.equal(mint, 'mint'); assert.equal(lamports, 22_500_000); return 12345; },
+    sell: async (_mint, raw) => { assert.equal(raw, 12345); return 0.022; } };
+  assert.equal(await prepareEntrySpot(p, { ...args, sell: async () => 0.020 }), null);
+  assert.equal(await prepareEntrySpot(p, { ...args, candles: [] }), null);
+  const row = await prepareEntrySpot(p, args);
+  const { closed } = await sampleTokenRunner(row, { now: row.expiresAt, quote: async () => 0.025, candles: async () => [] });
+  assert.equal(row.fullQuote, 0.0225);
+  assert.ok(Math.abs(closed.deltaSol - 0.00244) < 1e-9);
+  assert.equal(closed.reason, 'batas waktu');
+});
+
+test('Long Run reports wait for both LPs and the spot leg, then unlock phase two after 20 paired closes', () => {
+  const now = 1_800_000_000_000, later = now + 60_000;
+  const paper = { open: {}, closed: [], tokenRunners: { open: {}, closed: [] } };
+  const state = longRunState(paper);
+  state.matched = 19;
+  const arms = { baseline: { lpId: 'lp' }, adaptive: { lpId: 'lp:adaptive' },
+    spot: { lpId: 'lp:spot', entrySpotId: 'spot' } };
+  state.open.lp = { id: 'lp', mint: 'mint', capital: 0.15, openedAt: now, arms };
+  assert.equal(canEnrollLongRun(paper, 0.15, 1, 1), false);
+  assert.equal(canEnrollLongRun(paper, 0.15, 0.20, 2), false);
+  paper.closed = [{ id: 'lp', pnl: 0.001, closedAt: later, feeValueSol: 0.002 },
+    { id: 'lp:adaptive', pnl: 0.002, closedAt: later, feeValueSol: 0.003, longRunExtensions: 1 },
+    { id: 'lp:spot', pnl: 0.0015, closedAt: later, feeValueSol: 0.0025 }];
+  updateLongRun(paper, later);
+  assert.equal(state.matched, 19);
+  assert.equal(longRunSpotReady(state), false);
+  paper.tokenRunners.closed.push({ id: 'spot', deltaSol: 0.002, closedAt: later + 10_000 });
+  updateLongRun(paper, later + 10_000);
+  assert.equal(state.matched, 20);
+  assert.equal(state.extended, 1);
+  assert.equal(longRunSpotReady(state), true);
+  assert.equal(state.closed[0].arms.spot.pnl, 0.0035);
+  assert.match(longRunLines(paper, now, true).join('\n'), /LP \+ spot · 1 pembanding · Δ net \+0\.0015 SOL vs adaptif/);
+  assert.equal(canEnrollLongRun(paper, 0.15, 1, 1), true);
+});
+
 test('settlement costs include failed transaction fees and remove refunded ATA rent', () => {
   const tx = (pre, post, fee, postTokenBalances = []) => ({
     transaction: { message: { staticAccountKeys: ['wallet'] } },
@@ -435,6 +506,7 @@ test('SQLite migrates paper and live data separately and persists paper history 
     assert.equal(shadow.get('performance'), null);
     assert.equal(live.get('performance').performance[0].position, 'live1');
     state.paper.tokenRunners = { open: {}, closed: [{ id: 'paper1', closedAt: 200, pnl: 0.035, deltaSol: 0.005 }] };
+    state.paper.longRun = { open: {}, closed: [{ id: 'paper1', closedAt: 210, deltaSol: 0.01 }] };
     shadow.saveMonitor(state);
     shadow.saveMonitor(state);
     shadow.saveMonitor({ ...state, paper: { closed: [] } });
@@ -445,6 +517,8 @@ test('SQLite migrates paper and live data separately and persists paper history 
     assert.equal(live.db.prepare("SELECT count(*) AS n FROM history WHERE kind='paper-close'").get().n, 0);
     assert.deepEqual(shadow.db.prepare("SELECT pnl FROM history WHERE kind='paper-runner-close'").all().map(row => row.pnl), [0.005]);
     assert.equal(live.db.prepare("SELECT count(*) AS n FROM history WHERE kind='paper-runner-close'").get().n, 0);
+    assert.deepEqual(shadow.db.prepare("SELECT pnl FROM history WHERE kind='paper-long-run'").all().map(row => row.pnl), [0.01]);
+    assert.equal(live.db.prepare("SELECT count(*) AS n FROM history WHERE kind='paper-long-run'").get().n, 0);
     assert.equal(shadow.db.prepare("SELECT count(*) AS n FROM history WHERE kind='pnl-reset'").get().n, 1);
     assert.equal(live.get('monitor').pnlResetAt.live, 20);
   } finally {

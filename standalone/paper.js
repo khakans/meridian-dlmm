@@ -7,6 +7,7 @@ import { markPaperBins, paperRiskBlocked, recordPaperNav, seedPaperBins } from '
 import { ENTRY_SHAPES, entryCandles, isActivePaperVariant } from './entry-plans.js';
 import { assessRebalance, rebalanceDue, REBALANCE_CHECK_MS } from './paper-rebalance.js';
 import { prepareTokenRunner, RUNNER_POLL_MS, sampleTokenRunner } from './paper-token-runner.js';
+import { applyHoldCheck, holdEvidence, observeHold, updateLongRun } from './paper-long-run.js';
 
 const MINUTE = 60_000;
 const COST_SOL = 0.001; // Estimated round-trip network cost, excluding refundable rent.
@@ -92,7 +93,7 @@ export function paperCloseRule(p, active, pnlPct, now) {
     minutes_out_of_range: p.outsideSince ? (now - p.outsideSince) / MINUTE : 0,
   }, m);
   if (rule?.rule === 1) return rule.reason;
-  if (now - p.openedAt >= (p.maxHoldMinutes ?? config.research.paperMaxHoldMinutes) * MINUTE) return 'maximum hold time';
+  if (p.longHold?.ended || now - p.openedAt >= (p.maxHoldMinutes ?? config.research.paperMaxHoldMinutes) * MINUTE) return 'maximum hold time';
   if (!p.rangeReached && outside === 'above') {
     return now - p.openedAt >= (p.rangeWaitMinutes ?? config.research.paperInitialRangeWaitMinutes) * MINUTE
       ? 'entry range not reached' : null;
@@ -136,9 +137,18 @@ export function startPaper(store, notify, {
     busy = true;
     try {
       const now = Date.now();
-      paper.closed = paper.closed.filter(p => now - p.closedAt < 90 * 86_400_000).slice(-10_000);
+      const cohorts = Object.values(paper.longRun?.open ?? {});
+      const trackedLegs = new Set(cohorts.flatMap(c => Object.values(c.arms).flatMap(a => [a.lpId, a.entrySpotId])));
+      const recent = rows => rows.filter(row => now - row.closedAt < 90 * 86_400_000);
+      const keepTracked = (rows, limit) => {
+        const newest = recent(rows).slice(-limit);
+        const ids = new Set(newest.map(row => row.id));
+        return [...rows.filter(row => trackedLegs.has(row.id) && !ids.has(row.id)), ...newest];
+      };
+      paper.closed = keepTracked(paper.closed, 10_000);
       paper.cancelled = paper.cancelled.filter(p => now - p.at < 90 * 86_400_000).slice(-10_000);
-      runners.closed = runners.closed.filter(p => now - p.closedAt < 90 * 86_400_000).slice(-2000);
+      runners.closed = keepTracked(runners.closed, 2000);
+      if (paper.longRun) paper.longRun.closed = recent(paper.longRun.closed).slice(-2000);
       const activeReads = new Map();
       const quotes = new Map();
       const readActive = pool => {
@@ -150,6 +160,18 @@ export function startPaper(store, notify, {
         const key = `${mint}:${raw}`;
         if (!quotes.has(key)) quotes.set(key, quote(mint, raw).catch(() => null));
         return quotes.get(key);
+      };
+      const downsideQuoteRatio = async (p, active) => {
+        const price = Number(active.price);
+        const raw = rawTokens(p.capital / (price * p.ratio ** (p.lower - active.binId)), p.decimals);
+        const value = raw / 10 ** p.decimals * price;
+        const proceeds = await sellQuote(p.mint, raw);
+        return value > 0 && proceeds != null ? proceeds / value : 0;
+      };
+      const candleReads = new Map();
+      const readCandles = (pool, time) => {
+        if (!candleReads.has(pool)) candleReads.set(pool, candles(pool, time));
+        return candleReads.get(pool);
       };
       const closed = [];
       const snapshots = new Map();
@@ -169,6 +191,7 @@ export function startPaper(store, notify, {
           if (p.manualExit && !p.exit) p.manualExitCheckedAt = now;
           const active = p.exit ? null : await readActive(p.pool);
           if (!p.exit && !validActive(active)) {
+            if (p.longHold) applyHoldCheck(p, now, null);
             markUnavailable(p, 'Bin aktif belum tersedia');
             continue;
           }
@@ -191,6 +214,7 @@ export function startPaper(store, notify, {
             inventory.feeTokens += p.rebalanceFeeTokens ?? 0;
           }
           if (!inventory) {
+            if (p.longHold) applyHoldCheck(p, now, null);
             markUnavailable(p, bins ? 'Inventori bin belum bisa dinilai' : 'Snapshot bin belum tersedia');
             if (p.mirror) p.manualExit ??= mirrorExitReason(p, active, null, now);
             continue;
@@ -205,6 +229,8 @@ export function startPaper(store, notify, {
           if (stopped || !config.standalone.shadow) return;
           const net = inventory.sol + inventory.feeSol + proceeds - p.capital - costSol;
           const pnl = proceeds != null && Number.isFinite(net) ? net : null;
+          const feeTokenPrice = tokenAmount > 0 && proceeds != null ? proceeds / tokenAmount : 0;
+          const feeValueSol = pnl == null ? null : inventory.feeSol + inventory.feeTokens * feeTokenPrice;
           if (pnl != null) {
             p.mark = { at: Date.now(), pnl };
             p.markIssue = null;
@@ -218,16 +244,30 @@ export function startPaper(store, notify, {
               ? inventory.sol + inventory.feeSol + tokenAmount * Number(active.price) - p.capital - costSol : null;
             markUnavailable(p, 'Quote jual belum tersedia', Number.isFinite(indicative) ? { at: Date.now(), pnl: indicative } : null);
           }
+          if (!p.exit && p.longHold && !p.hardLowerExit && !p.manualExit) {
+            const valued = pnl != null && Date.now() - now <= 30_000;
+            observeHold(p, { now, activeBin: active.binId, feeSol: inventory.feeSol, feeTokens: inventory.feeTokens, valued });
+            if (!p.longHold.ended && now >= p.longHold.checkAt) {
+              const ordinaryExit = paperCloseRule({ ...p, longHold: null, maxHoldMinutes: Infinity },
+                active, pnl == null ? null : pnl / p.capital * 100, now);
+              if (!ordinaryExit && !p.exitSignal) {
+                const evidence = valued ? holdEvidence(p, now, Math.min(feeTokenPrice, Number(active.price)), pnl) : null;
+                const ratio = evidence ? await downsideQuoteRatio(p, active).catch(() => 0) : 0;
+                if (stopped || !config.standalone.shadow) return;
+                const eligible = evidence && ratio >= config.research.paperMinExitRatio && Date.now() - now <= 30_000 &&
+                  !p.hardLowerExit && !p.manualExit;
+                applyHoldCheck(p, now, eligible ? { ...evidence, exitRatio: ratio } : null);
+              } else if (now >= p.longHold.until) applyHoldCheck(p, now, null);
+            }
+          }
+          if (!p.exit && (p.hardLowerExit || p.manualExit)) p.exit = { at: now, reason: p.hardLowerExit ?? p.manualExit, inventory };
           if (!p.exit) {
             const reason = mirrorExitReason(p, active, pnl == null ? null : pnl / p.capital * 100, now);
             if (reason) p.exit = { at: now, reason, inventory };
           }
           if (p.rebalanceTrial && config.strategy.autoRebalance && !store.data.paused && rebalancePlan && pnl != null &&
               active.binId > p.lower + 1 && active.binId <= p.upper && rebalanceDue(p, now)) {
-            const stressRaw = rawTokens(p.capital / (Number(active.price) * p.ratio ** (p.lower - active.binId)), p.decimals);
-            const stressProceeds = await sellQuote(p.mint, stressRaw);
-            const stressValue = stressRaw / 10 ** p.decimals * Number(active.price);
-            const exitRatio = stressValue > 0 && stressProceeds != null ? stressProceeds / stressValue : 0;
+            const exitRatio = await downsideQuoteRatio(p, active);
             let plan = exitRatio >= config.research.paperMinExitRatio ? await rebalancePlan(p, { ...active, exitRatio }).catch(() => null) : null;
             if (plan?.shape && plan.shape !== p.shape) {
               const fresh = await getBin({ pool_address: p.pool }).catch(() => null);
@@ -246,11 +286,12 @@ export function startPaper(store, notify, {
             paper.realized[p.variant] -= costSol;
             delete paper.open[p.id];
           } else if (p.exit && pnl != null) {
-            const activeRunners = Object.values(runners.open);
-            if (config.research.paperTokenRunner && p.mirror && activeRunners.length < 4 &&
+            const scope = p.longRunArm ?? 'baseline';
+            const activeRunners = Object.values(runners.open).filter(runner => (runner.longRunArm ?? 'baseline') === scope);
+            if (config.research.paperTokenRunner && (p.mirror || p.longRunArm) && activeRunners.length < 4 &&
                 !activeRunners.some(runner => runner.mint === p.mint)) {
               const runner = await prepareTokenRunner(p, { raw, sol: inventory.sol + inventory.feeSol,
-                fullQuote: proceeds, pnl, now: quotedAt, quote: sellQuote, candles }).catch(() => null);
+                fullQuote: proceeds, pnl, now: quotedAt, quote: sellQuote, candles: readCandles }).catch(() => null);
               if (stopped || !config.standalone.shadow) return;
               if (runner && config.research.paperTokenRunner && Date.now() - quotedAt <= RUNNER_POLL_MS) {
                 runners.open[p.id] = runner;
@@ -259,7 +300,8 @@ export function startPaper(store, notify, {
             paper.closed.push({ id: p.id, mint: p.mint, pool: p.pool, pair: p.pair, capital: p.capital,
               lower: p.lower, upper: p.upper, entryBin: p.entryBin, shape: p.shape, range: p.range, variant: p.variant, openedAt: p.openedAt,
               closedAt: Date.now(), filledAt: p.filledAt, pnl, reason: p.exit.reason, solInventory: inventory.sol, quotedSol: proceeds,
-              feeSol: inventory.feeSol, feeTokens: inventory.feeTokens, costSol,
+              feeSol: inventory.feeSol, feeTokens: inventory.feeTokens, feeValueSol, costSol,
+              exitRunnerId: runners.open[p.id]?.id, longRunExtensions: p.longHold?.extensions,
               source: p.source, mirror: p.mirror, shapeMode: p.shapeMode, shapeReason: p.shapeReason,
               rebalancePair: p.rebalancePair, rebalanceTrial: p.rebalanceTrial, rebalances: p.rebalances, screenTrial: p.screenTrial,
               ...(p.shapeTrial || p.shapeComparison ? { shapeTrial: p.shapeTrial, observedMs: p.observedMs ?? 0,
@@ -268,7 +310,7 @@ export function startPaper(store, notify, {
             paper.realized[p.variant] += pnl;
             if (p.mirror) paper.mirrorRealized = (paper.mirrorRealized ?? 0) + pnl;
             delete paper.open[p.id];
-            if (!p.shapeTrial && !p.rebalanceTrial) {
+            if (!p.shapeTrial && !p.rebalanceTrial && (!p.longRunArm || p.mirror)) {
               const runner = runners.open[p.id];
               closed.push(`• ${p.mint.slice(0, 8)} · ${p.variant ?? `${p.range}/${p.shape}`} · ${pnl.toFixed(4)} SOL · ${p.exit.reason}${runner ? ` · sisa token ${runner.initialQuote.toFixed(5)} SOL` : ''}`);
             }
@@ -355,6 +397,7 @@ export function startPaper(store, notify, {
         } catch { log('paper_warn', `Paper admission unavailable for ${c.mint}`); }
       }
       recordPaperNav(paper, Date.now(), config.research.paperBankrollSol);
+      updateLongRun(paper, Date.now());
       store.save();
       if (closed.length && !stopped) {
         const limit = config.research.paperCloseListLimit;
@@ -374,20 +417,32 @@ export function startPaper(store, notify, {
     samplingRunners = true;
     nextRunnerAt = now + RUNNER_POLL_MS;
     try {
+      const quotes = new Map(), market = new Map();
+      const sharedQuote = (mint, raw) => {
+        const key = `${mint}:${raw}`;
+        if (!quotes.has(key)) quotes.set(key, quote(mint, raw).catch(() => null));
+        return quotes.get(key);
+      };
+      const sharedCandles = (pool, at) => {
+        if (!market.has(pool)) market.set(pool, candles(pool, at).catch(() => null));
+        return market.get(pool);
+      };
       const notices = await Promise.all(open.map(async row => {
-        const result = await sampleTokenRunner(row, { now, candles, quote: (mint, raw) => quote(mint, raw).catch(() => null) });
+        const result = await sampleTokenRunner(row, { now, candles: sharedCandles, quote: sharedQuote });
         if (stopped || !config.standalone.shadow || runners.open[row.id] !== row) return null;
         const name = row.pair ?? row.mint.slice(0, 8);
         if (result.closed) {
           runners.closed.push(result.closed);
           delete runners.open[row.id];
           const delta = result.closed.deltaSol;
-          return `${name} · ${delta >= 0 ? '+' : ''}${delta.toFixed(5)} SOL vs langsung jual · ${result.closed.reason}`;
+          return !row.longRunArm || row.longRunArm === 'baseline'
+            ? `${name} · ${delta >= 0 ? '+' : ''}${delta.toFixed(5)} SOL vs langsung jual · ${result.closed.reason}` : null;
         }
         runners.open[row.id] = result.next;
         return result.alert ? `${name} · quote jual belum tersedia, posisi simulasi masih terbuka` : null;
       }));
       if (stopped || !config.standalone.shadow) return;
+      updateLongRun(paper, Date.now());
       store.save();
       const lines = notices.filter(Boolean);
       if (lines.length) await notify(['🧪 Shadow · Sisa token', ...lines.map(line => `• ${line}`)].join('\n'));
