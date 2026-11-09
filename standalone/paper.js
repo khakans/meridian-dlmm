@@ -169,7 +169,7 @@ export function startPaper(store, notify, {
             markUnavailable(p, 'Bin aktif belum tersedia');
             continue;
           }
-          if (p.shapeTrial && !p.exit) {
+          if ((p.shapeTrial || p.shapeComparison) && !p.exit) {
             const elapsed = now - (p.lastRangeMarkAt ?? now);
             if (elapsed > 0 && elapsed <= 180_000) {
               p.observedMs = (p.observedMs ?? 0) + elapsed;
@@ -204,7 +204,7 @@ export function startPaper(store, notify, {
             p.mark = { at: Date.now(), pnl };
             p.markIssue = null;
             p.indicativeMark = null;
-            if (p.shapeTrial || p.rebalancePair) {
+            if (p.shapeTrial || p.shapeComparison) {
               p.trialPeakPnl = Math.max(p.trialPeakPnl ?? 0, pnl);
               p.trialDrawdownPct = Math.max(p.trialDrawdownPct ?? 0, 100 * (p.trialPeakPnl - pnl) / p.capital);
             }
@@ -247,7 +247,7 @@ export function startPaper(store, notify, {
               feeSol: inventory.feeSol, feeTokens: inventory.feeTokens, costSol,
               source: p.source, mirror: p.mirror, shapeMode: p.shapeMode, shapeReason: p.shapeReason,
               rebalancePair: p.rebalancePair, rebalanceTrial: p.rebalanceTrial, rebalances: p.rebalances, screenTrial: p.screenTrial,
-              ...(p.shapeTrial ? { shapeTrial: p.shapeTrial, observedMs: p.observedMs ?? 0,
+              ...(p.shapeTrial || p.shapeComparison ? { shapeTrial: p.shapeTrial, observedMs: p.observedMs ?? 0,
                 inRangeMs: p.inRangeMs ?? 0, drawdownPct: p.trialDrawdownPct ?? 0 } : {}),
               outcome: 'settled', accountingVersion: 1 });
             paper.realized[p.variant] += pnl;

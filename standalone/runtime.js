@@ -378,6 +378,7 @@ async function attemptEntry(signal) {
     model = prepareMirrorPosition(modelInput);
     model.shapeMode = shapeMode;
     model.shapeReason = plan.reason;
+    model.shapeComparison = compareShapes;
     trials = compareShapes ? prepareShapeTrials(modelInput, model) : [];
     if (shadow) {
       const hourlyPool = await poolDetail(pool.pool_address, '1h', { signal: AbortSignal.timeout(4500) }).catch(() => null);

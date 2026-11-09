@@ -292,7 +292,10 @@ test('mirror uses the planned on-chain range and replay yields the same confirme
   assert.ok(bidAsk[0] > bidAsk.at(-1));
   const history = trials.map(p => ({ ...p, closedAt: now + 60_000, pnl: 0.001, drawdownPct: 2, observedMs: 60_000, inRangeMs: 30_000 }));
   assert.match(shapeTrialLines(history.slice(1), now)[0], /menunggu/);
-  assert.match(shapeTrialLines(history, now)[1], /net \+0\.0010 SOL.*2\.0%.*50%/);
+  const matched = shapeTrialLines([...history, { ...model, closedAt: now + 60_000, pnl: -0.001 }], now);
+  assert.match(matched[0], /1\/20/);
+  assert.match(matched[1], /Auto.*net -0\.0010 SOL/);
+  assert.match(matched[2], /Spot.*net \+0\.0010 SOL.*2\.0%.*50%/);
   const live = { id: 'live', openedAt: now, lower: 65, upper: 100, rangeReached: true };
   const marks = Array.from({ length: Math.max(1, config.pnl.confirmTicks) }, (_, i) => ({
     binId: 95, pnl: config.management.takeProfitPct + 1, at: now + i * 60_000,

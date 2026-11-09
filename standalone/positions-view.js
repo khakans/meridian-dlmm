@@ -6,8 +6,8 @@ const wib = new Intl.DateTimeFormat('id-ID', { timeZone: 'Asia/Jakarta', dateSty
 const time = value => typeof value === 'number' ? value : Date.parse(value);
 const stamp = value => time(value) > 0 ? wib.format(time(value)) + ' WIB' : '—';
 const safe = value => String(value ?? '').replace(/[<>&]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140);
-const amount = (value, unit, signed = false) => Number.isFinite(value)
-  ? `${signed && value > 0 ? '+' : ''}${value.toFixed(unit === 'SOL' ? 4 : 2)}${unit === '%' ? '' : ' '}${unit}`
+const amount = (value, unit, signed = false, digits = unit === 'SOL' ? 4 : 2) => Number.isFinite(value)
+  ? `${signed && value > 0 ? '+' : ''}${value.toFixed(digits)}${unit === '%' ? '' : ' '}${unit}`
   : '—';
 
 function elapsed(start, end) {
@@ -116,7 +116,7 @@ function liveLines(p, tab, now, solMode, tracked, settlement) {
   if (Number.isFinite(p.lp_value_change_sol) || Number.isFinite(p.fee_lp_sol)) lines.push(
     `Perubahan nilai LP ${amount(p.lp_value_change_sol, 'SOL', true)} · Fee LP ${amount(p.fee_lp_sol, 'SOL')}`);
   if (Number.isFinite(settlement?.networkFeeSol) || Number.isFinite(settlement?.retainedTokenRentSol)) lines.push(
-    `Biaya jaringan ${amount(settlement.networkFeeSol, 'SOL')} · Rent akun token saat settlement ${amount(settlement.retainedTokenRentSol, 'SOL')}`);
+    `Biaya jaringan ${amount(settlement.networkFeeSol, 'SOL', false, 6)} · Rent akun token saat settlement ${amount(settlement.retainedTokenRentSol, 'SOL', false, 6)}`);
   if (Number.isFinite(settlement?.dustSol)) lines.push(`Sisa token di wallet ≈ ${settlement.dustSol.toFixed(8)} SOL`);
   if (settlement?.signature) lines.push(`Tx ${safe(settlement.signature)}`);
   return lines;

@@ -9,16 +9,19 @@ export function shapeTrialLines(closed = [], from) {
     if (!cohorts.has(p.shapeTrial)) cohorts.set(p.shapeTrial, new Map());
     cohorts.get(p.shapeTrial).set(p.shape, p);
   }
-  const complete = [...cohorts.values()].filter(group => group.size === ENTRY_SHAPES.length);
-  if (!complete.length) return cohorts.size ? ['Auto Shape · menunggu ketiga shape selesai pada entry yang sama'] : [];
-  return [`Auto Shape · ${complete.length}/20 entry pembanding Shadow`, ...ENTRY_SHAPES.map(shape => {
-    const positions = complete.map(group => group.get(shape));
+  const mirrors = new Map(closed.filter(p => p.mirror && p.closedAt >= from && Number.isFinite(p.pnl)).map(p => [p.id, p]));
+  const complete = [...cohorts.entries()].filter(([id, group]) => mirrors.has(id) && group.size === ENTRY_SHAPES.length);
+  if (!complete.length) return cohorts.size ? ['Auto Shape · menunggu Auto dan ketiga shape pembanding selesai'] : [];
+  const summary = (label, positions) => {
     const pnl = positions.reduce((sum, p) => sum + p.pnl, 0);
     const inRange = positions.reduce((sum, p) => sum + (p.inRangeMs ?? 0), 0);
     const observed = positions.reduce((sum, p) => sum + (p.observedMs ?? 0), 0);
-    const drawdown = Math.max(...positions.map(p => p.drawdownPct ?? 0));
-    return `• ${shape} · net ${signed(pnl)} SOL · drawdown maks ${drawdown.toFixed(1)}% · in range ${observed ? (100 * inRange / observed).toFixed(0) + '%' : '—'}`;
-  })];
+    const drawdowns = positions.map(p => p.drawdownPct).filter(Number.isFinite);
+    return `• ${label} · net ${signed(pnl)} SOL · drawdown maks ${drawdowns.length ? Math.max(...drawdowns).toFixed(1) + '%' : '—'} · in range ${observed ? (100 * inRange / observed).toFixed(0) + '%' : '—'}`;
+  };
+  return [`Auto Shape · ${complete.length}/20 entry Shadow yang sama`,
+    summary('Auto', complete.map(([id]) => mirrors.get(id))),
+    ...ENTRY_SHAPES.map(shape => summary(shapeLabel(shape), complete.map(([, group]) => group.get(shape))))];
 }
 
 export function rebalanceTrialLines(paper, from, detailed) {
