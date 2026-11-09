@@ -1,6 +1,25 @@
-import { isActivePaperVariant } from './entry-plans.js';
+import { ENTRY_SHAPES, isActivePaperVariant } from './entry-plans.js';
 
 export const signed = value => `${value >= 0 ? "+" : ""}${value.toFixed(4)}`;
+
+export function shapeTrialLines(closed = [], from) {
+  const cohorts = new Map();
+  for (const p of closed) {
+    if (!p.shapeTrial || p.closedAt < from || !Number.isFinite(p.pnl) || !ENTRY_SHAPES.includes(p.shape)) continue;
+    if (!cohorts.has(p.shapeTrial)) cohorts.set(p.shapeTrial, new Map());
+    cohorts.get(p.shapeTrial).set(p.shape, p);
+  }
+  const complete = [...cohorts.values()].filter(group => group.size === ENTRY_SHAPES.length);
+  if (!complete.length) return cohorts.size ? ['Auto Shape · menunggu ketiga shape selesai pada entry yang sama'] : [];
+  return [`Auto Shape · ${complete.length} entry pembanding Shadow`, ...ENTRY_SHAPES.map(shape => {
+    const positions = complete.map(group => group.get(shape));
+    const pnl = positions.reduce((sum, p) => sum + p.pnl, 0);
+    const inRange = positions.reduce((sum, p) => sum + (p.inRangeMs ?? 0), 0);
+    const observed = positions.reduce((sum, p) => sum + (p.observedMs ?? 0), 0);
+    const drawdown = Math.max(...positions.map(p => p.drawdownPct ?? 0));
+    return `• ${shape} · net ${signed(pnl)} SOL · drawdown maks ${drawdown.toFixed(1)}% · in range ${observed ? (100 * inRange / observed).toFixed(0) + '%' : '—'}`;
+  })];
+}
 
 export function summarizePaper(paper, from, to = Date.now()) {
   const groups = new Map();

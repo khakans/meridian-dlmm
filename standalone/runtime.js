@@ -15,14 +15,14 @@ import { MonitorStore, finishSignal } from "./store.js";
 import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
-import { isActivePaperVariant } from "./entry-plans.js";
-import { mirrorExitReason, prepareMirrorPosition, startPaper, validateExitQuote } from "./paper.js";
+import { isActivePaperVariant, resolveEntryShape } from "./entry-plans.js";
+import { mirrorExitReason, prepareMirrorPosition, prepareShapeTrials, startPaper, validateExitQuote } from "./paper.js";
 import { advanceSettlement, dueSettlements, SETTLEMENT_DUST_SOL, settlementComplete, settlementRows } from "./settlement.js";
 import { estimateEntryOverheadSol, estimateNetExitPct, isRetryableEntryError, positionWrites, reconcilePositionWrites } from "./position-journal.js";
 import { readRpc } from "./rpc.js";
 import { withWalletLock } from "./transactions.js";
 import { paperDay } from "./paper-accounting.js";
-import { paperPnlLines, paperRealizedLine, signed, summarizePaper } from "./pnl-summary.js";
+import { paperPnlLines, paperRealizedLine, shapeTrialLines, signed, summarizePaper } from "./pnl-summary.js";
 import { openPositions, positionsPage, positionTarget } from "./positions-view.js";
 import { exposureStillPresent, recoverablePositionRent } from "./events.js";
 import { getActiveBin, getMyPositions, getPositionExitInventory, simulateEntryPosition } from "../tools/dlmm.js";
@@ -159,25 +159,32 @@ function startSettlementWorker() {
 }
 
 async function refreshPreflight() {
-  if (preflight && Date.now() - preflight.at < 60_000) return preflight;
+  const mode = config.strategy.strategy;
+  if (preflight?.shapeMode === mode && Date.now() - preflight.at < 60_000) return preflight;
   const sample = [store.data.preflightCandidate, ...Object.values(store.data.research ?? {})].filter(c => c && Date.now() - c.at < 300_000)
     .sort((a,b) => b.at - a.at)[0];
-  const result = { at: Date.now(), pool: "belum ada sampel segar", quote: "belum diuji", simulation: "belum diuji" };
+  const result = { at: Date.now(), shapeMode: mode, pool: "belum ada sampel segar", quote: "belum diuji", simulation: "belum diuji" };
   if (sample) {
     try {
       const screened = await screenMint(sample.mint, { poolAddress: sample.pool });
       result.pool = screened.pass ? "lolos screening ulang" : screened.reason;
       if (screened.pass) {
         const binsBelow = Math.max(config.strategy.minBinsBelow, Math.min(69, computeBinsBelow(screened.pool.volatility)));
+        let shape = mode === "auto" ? null : mode;
         try {
-          await validateExitQuote({ mint: sample.mint, pool: sample.pool, decimals: screened.decimals,
+          const entry = await validateExitQuote({ mint: sample.mint, pool: sample.pool, decimals: screened.decimals,
             binStep: Number(screened.pool.dlmm_params?.bin_step), binsBelow,
             capital: config.risk.maxDeployAmount });
           result.quote = "lolos ukuran maksimum";
+          const plan = await resolveEntryShape(mode, screened.pool, binsBelow, entry);
+          shape = plan.shape;
+          if (!shape) result.simulation = `Auto Shape skip: ${plan.reason}`;
         } catch { result.quote = "tidak lolos atau provider gagal"; }
         try {
-          const sim = await simulateEntryPosition({ poolAddress: sample.pool, binsBelow, capital: config.risk.maxDeployAmount });
-          result.simulation = sim.err ? `RPC menolak ${JSON.stringify(sim.err).slice(0, 120)}` : "lolos tanpa broadcast";
+          if (shape) {
+            const sim = await simulateEntryPosition({ poolAddress: sample.pool, binsBelow, capital: config.risk.maxDeployAmount, shape });
+            result.simulation = sim.err ? `RPC menolak ${JSON.stringify(sim.err).slice(0, 120)}` : `${shape} · lolos tanpa broadcast`;
+          }
         } catch { result.simulation = "build atau RPC belum tersedia"; }
       }
     } catch { result.pool = "data tidak tersedia"; }
@@ -350,16 +357,25 @@ async function attemptEntry(signal) {
   if (positions.positions.some(p => p.pool === pool.pool_address)) return "pool already open";
   const poolCheck = await validateDeployPoolThresholds({ pool_address: pool.pool_address });
   if (!poolCheck.pass) return poolCheck.reason;
-  let entry, model;
+  let entry;
   try {
     entry = await validateExitQuote({
       mint, pool: pool.pool_address, decimals: screened.decimals,
       binStep: Number(pool.dlmm_params?.bin_step), binsBelow, capital: amountY, verifyRange: true,
     });
-    model = prepareMirrorPosition({ source, mint, pool: pool.pool_address, pair: pool.name,
-      decimals: screened.decimals, binStep: Number(pool.dlmm_params?.bin_step), binsBelow,
-      capital: amountY, shape: config.strategy.strategy, entry });
   } catch { return "exit quote or entry range unavailable"; }
+  const shapeMode = config.strategy.strategy;
+  const plan = await resolveEntryShape(shapeMode, pool, binsBelow, entry);
+  if (!plan.shape) return `Auto Shape: ${plan.reason}`;
+  const modelInput = { source, mint, pool: pool.pool_address, pair: pool.name,
+    decimals: screened.decimals, binStep: entry.binStep, binsBelow, capital: amountY, shape: plan.shape, entry };
+  let model, trials;
+  try {
+    model = prepareMirrorPosition(modelInput);
+    model.shapeReason = plan.reason;
+    trials = shadow && shapeMode === "auto" && Object.values(paper.open).filter(p => p.shapeTrial).length < 24
+      ? prepareShapeTrials(modelInput, model) : [];
+  } catch { return "entry range unavailable for selected shape"; }
   const fresh = await finalRecheck(signal, screened, simulatedSol);
   if (fresh) return fresh;
   if (shadow) {
@@ -369,7 +385,12 @@ async function attemptEntry(signal) {
     if (shuttingDown || store.data.paused || signal.done || Date.now() >= signal.deadline) return "entry stopped or expired";
     paper.realized[model.variant] ??= 0;
     paper.open[model.id] = model;
-    store.data.attempts[mint] = { at: Date.now(), mint, pool: pool.pool_address, source, status: "entered", amountSol: amountY };
+    for (const trial of trials) {
+      paper.realized[trial.variant] ??= 0;
+      paper.open[trial.id] = trial;
+    }
+    store.data.attempts[mint] = { at: Date.now(), mint, pool: pool.pool_address, source, status: "entered", amountSol: amountY,
+      strategy: plan.shape, shapeMode, shapeReason: plan.reason };
     finishSignal(store, signal, "entered");
     return null;
   }
@@ -378,7 +399,7 @@ async function attemptEntry(signal) {
   store.data.attempts[mint] = {
     at: Date.now(), mint, pool: pool.pool_address, source, wallets: signal.events.map(e => e.wallet),
     status: "submitting", failures: attempt?.failures ?? 0, position: null, txs: [],
-    amountSol: amountY, strategy: config.strategy.strategy, binStep: entry.binStep, journalVersion: 1,
+    amountSol: amountY, strategy: plan.shape, shapeMode, shapeReason: plan.reason, binStep: entry.binStep, journalVersion: 1,
   };
   store.save();
 
@@ -396,7 +417,7 @@ async function attemptEntry(signal) {
     bins_below: binsBelow,
     bins_above: binsAbove,
     expected_active_bin: entry.binId,
-    strategy: config.strategy.strategy,
+    strategy: plan.shape,
     assert_entry_active: () => {
       if (shuttingDown || store.data.paused || signal.done || Date.now() >= signal.deadline) throw Error("Entry stopped or expired before broadcast");
     },
@@ -428,8 +449,8 @@ async function attemptEntry(signal) {
     store.save();
     finishSignal(store, signal, record.status === "proposed" ? "shadow proposal recorded" : "entered");
     const label = result.dry_run ? "[SHADOW] Would deploy" : "Deployed";
-    log("entry", `${label} ${amountY} SOL → pool ${pool.pool_address.slice(0, 8)} mint ${mint.slice(0, 8)} (${binsBelow} bins below, ${source})`);
-    void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.pool_address.slice(0, 8)} (mint ${mint.slice(0, 8)}, ${signal.events.length} wallets)`);
+    log("entry", `${label} ${amountY} SOL → pool ${pool.pool_address.slice(0, 8)} mint ${mint.slice(0, 8)} (${binsBelow} bins below, ${source}, ${plan.shape}: ${plan.reason})`);
+    void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.pool_address.slice(0, 8)} (mint ${mint.slice(0, 8)}, ${signal.events.length} wallets)\nShape ${plan.shape}${shapeMode === "auto" ? ` · ${plan.reason}` : ""}`);
     return null;
   }
 
@@ -650,13 +671,15 @@ async function lifecycleStatusLines(detailed = false) {
   const now = Date.now();
   const resetAt = store.data.pnlResetAt?.[store.database.mode] ?? 0;
   const from = Math.max(now - 86_400_000, resetAt);
+  if (detailed) lines.push(`Shape entry · ${config.strategy.strategy}`);
   if (config.standalone.shadow) {
     const paper = store.data.paper;
     const mirror = { open: Object.fromEntries(Object.entries(paper?.open ?? {}).filter(([, p]) => p.mirror)),
       closed: (paper?.closed ?? []).filter(p => p.mirror) };
     lines.push(...paperPnlLines(summarizePaper(mirror, from, now), detailed, "discovery/volatility/mirror", "Mirror"));
     lines.push(paperRealizedLine(summarizePaper(paper, from, now), "All varian eksperimen + Mirror"));
-    const legacy = Object.values(paper?.open ?? {}).filter(p => !p.mirror).length;
+    if (detailed) lines.push(...shapeTrialLines(paper?.closed, Math.max(now - 30 * 86_400_000, resetAt)));
+    const legacy = Object.values(paper?.open ?? {}).filter(p => !p.mirror && !p.shapeTrial).length;
     if (legacy) lines.push(`Eksperimen lama · ${legacy} posisi terbuka di riwayat paper`);
   }
   if (resetAt > now - 86_400_000) lines.push(`Periode PnL sejak reset ${new Date(resetAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })} WIB`);

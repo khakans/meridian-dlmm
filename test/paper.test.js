@@ -5,9 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { Keypair, SystemProgram, Transaction } from '@solana/web3.js';
 import { config } from '../config.js';
-import { mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMirrorPosition, startPaper } from '../standalone/paper.js';
+import { mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMirrorPosition, prepareShapeTrials, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
-import { paperPnlLines, paperRealizedLine, summarizePaper } from '../standalone/pnl-summary.js';
+import { paperPnlLines, paperRealizedLine, shapeTrialLines, summarizePaper } from '../standalone/pnl-summary.js';
+import { chooseEntryShape, resolveEntryShape } from '../standalone/entry-plans.js';
 import { lowerRangeStop } from '../exit-rules.js';
 import { entryCreatedTokenAccounts, settlementComplete, tokenDelta } from '../standalone/settlement.js';
 import { meetsSettlementMinimum } from '../tools/wallet.js';
@@ -160,17 +161,53 @@ test('Convergence baseline distinguishes no positions, missing valuation, and me
   assert.match(line([{ ...group, marked: 1, openPnl: 0, closed: 1, realized: 0 }]), /terbuka \+0\.0000 SOL · terealisasi \+0\.0000 SOL/);
 });
 
+test('auto shape distinguishes calm, wide, mixed and unsafe pair conditions', async () => {
+  const now = 1_794_200_400;
+  const price = bin => 1.01 ** bin;
+  const data = (closes, volumes = closes.map(() => 1000)) => closes.map((c, i) => {
+    const open = price(closes[i - 1] ?? 0), close = price(c);
+    return { timestamp: now - (6 - i) * 300, open, close,
+      high: Math.max(open, close) * 1.001, low: Math.min(open, close) / 1.001, volume: volumes[i] };
+  });
+  const options = { now, binStep: 100, binsBelow: 40, price: 1,
+    feeRatio: 0.2, minFeeRatio: 0.05, exitRatio: 0.99, minExitRatio: 0.97 };
+  assert.equal(chooseEntryShape(data([2, 0, 2, 0, 2, 0]), options).shape, 'curve');
+  const wide = data([8, -3, 8, -3, -2, 0]);
+  assert.equal(chooseEntryShape(wide, options).shape, 'bid_ask');
+  assert.equal(chooseEntryShape(wide, { ...options, exitRatio: 0.975 }).shape, 'spot');
+  assert.equal(chooseEntryShape(data([1, 2, 3, 4, 5, 6]), { ...options, price: price(6) }).shape, 'spot');
+  assert.match(chooseEntryShape(data([0, -1, -2, -4, -6, -8]), options).reason, /turun tajam/);
+  assert.match(chooseEntryShape(data([1, 0, 1, 0, 1, 0], [1000, 1000, 1000, 10, 10, 10]), options).reason, /volume/);
+  assert.equal(chooseEntryShape(wide, { ...options, price: price(-5) }).shape, null);
+  assert.equal(chooseEntryShape(wide, { ...options, now: now + 900 }).shape, null);
+  assert.equal(chooseEntryShape(wide.slice(1), options).shape, null);
+  assert.equal(chooseEntryShape(wide, { ...options, exitRatio: 0.96 }).shape, null);
+  assert.deepEqual(await resolveEntryShape('spot'), { shape: 'spot', reason: 'manual' });
+});
+
 test('mirror uses the planned on-chain range and replay yields the same confirmed exits', () => {
   const now = Date.UTC(2026, 10, 8);
   const bins = new Map(Array.from({ length: 36 }, (_, i) => [65 + i, {
     supply: 0n, xAmount: 0n, yAmount: 0n, pricePerToken: 1,
     feeAmountXPerTokenStored: 0n, feeAmountYPerTokenStored: 0n,
   }]));
-  const model = prepareMirrorPosition({ source: 'discovery', mint: 'mint', pool: 'pool', shape: 'spot',
-    capital: 0.2, decimals: 6, binStep: 100, binsBelow: 35, entry: { binId: 100, price: 1, bins } }, now);
+  const input = { source: 'discovery', mint: 'mint', pool: 'pool', shape: 'spot',
+    capital: 0.2, decimals: 6, binStep: 100, binsBelow: 35, entry: { binId: 100, price: 1, bins } };
+  const model = prepareMirrorPosition(input, now);
   assert.deepEqual([model.lower, model.upper, model.entryBin, model.filledAt], [65, 100, 100, now]);
   assert.equal(model.rangeReached, true);
   assert.equal(model.mark.pnl, -config.research.mirrorRoundTripCostSol);
+  const trials = prepareShapeTrials(input, model);
+  assert.equal(new Set(trials.map(p => p.id)).size, 3);
+  assert.ok(trials.every(p => p.lower === 65 && p.upper === 100 && p.openedAt === now && p.capital === 0.2 && !p.mirror));
+  const weight = p => p.binSeed.map(b => Number(b.y));
+  const [spot, curve, bidAsk] = trials.map(weight);
+  assert.equal(spot[0], spot.at(-1));
+  assert.ok(curve[0] < curve.at(-1));
+  assert.ok(bidAsk[0] > bidAsk.at(-1));
+  const history = trials.map(p => ({ ...p, closedAt: now + 60_000, pnl: 0.001, drawdownPct: 2, observedMs: 60_000, inRangeMs: 30_000 }));
+  assert.match(shapeTrialLines(history.slice(1), now)[0], /menunggu/);
+  assert.match(shapeTrialLines(history, now)[1], /net \+0\.0010 SOL.*2\.0%.*50%/);
   const live = { id: 'live', openedAt: now, lower: 65, upper: 100, rangeReached: true };
   const marks = Array.from({ length: Math.max(1, config.pnl.confirmTicks) }, (_, i) => ({
     binId: 95, pnl: config.management.takeProfitPct + 1, at: now + i * 60_000,

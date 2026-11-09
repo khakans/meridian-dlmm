@@ -4,7 +4,7 @@ import { log } from '../logger.js';
 import { getActiveBin, getPaperBinSnapshot } from '../tools/dlmm.js';
 import { quoteTokenToSol } from '../tools/wallet.js';
 import { markPaperBins, paperRiskBlocked, recordPaperNav, seedPaperBins } from './paper-accounting.js';
-import { isActivePaperVariant } from './entry-plans.js';
+import { ENTRY_SHAPES, isActivePaperVariant } from './entry-plans.js';
 
 const MINUTE = 60_000;
 const COST_SOL = 0.001; // Estimated round-trip network cost, excluding refundable rent.
@@ -50,10 +50,10 @@ export async function validateExitQuote({ mint, pool, decimals, binStep, binsBel
   const quote = await quoteTokenToSol(mint, raw);
   const mark = raw / 10 ** decimals * price;
   if (quote < mark * config.research.paperMinExitRatio) throw Error('Exit quote below minimum');
-  if (!verifyRange) return;
+  if (!verifyRange) return { ...active, exitRatio: quote / mark };
   if (Number(active.binStep) !== binStep) throw Error('Pool bin step changed');
   const bins = await getPaperBinSnapshot(pool, active.binId - binsBelow, active.binId, { verifyRange });
-  return { ...active, bins };
+  return { ...active, bins, exitRatio: quote / mark };
 }
 
 export function prepareMirrorPosition({ source, mint, pool, pair, decimals, binStep, binsBelow, capital, shape, entry }, now = Date.now()) {
@@ -65,6 +65,14 @@ export function prepareMirrorPosition({ source, mint, pool, pair, decimals, binS
     ratio: 1 + binStep / 10_000, openedAt: now, filledAt: now, rangeReached: true, mark: { at: now, pnl: -costSol } };
   p.binSeed = seedPaperBins(p, entry.bins);
   return p;
+}
+
+export function prepareShapeTrials(input, mirror) {
+  return ENTRY_SHAPES.map(shape => {
+    const trial = shape === mirror.shape ? { ...mirror } : prepareMirrorPosition({ ...input, shape }, mirror.openedAt);
+    return { ...trial, id: `${mirror.id}:${shape}`, mirror: false, shapeTrial: mirror.id,
+      variant: `shape-comparison/${shape}` };
+  });
 }
 
 export function paperCloseRule(p, active, pnlPct, now) {
@@ -159,6 +167,15 @@ export function startPaper(store, notify, {
             markUnavailable(p, 'Bin aktif belum tersedia');
             continue;
           }
+          if (p.shapeTrial && !p.exit) {
+            const elapsed = now - (p.lastRangeMarkAt ?? now);
+            if (elapsed > 0 && elapsed <= 180_000) {
+              p.observedMs = (p.observedMs ?? 0) + elapsed;
+              p.inRangeMs = (p.inRangeMs ?? 0) + (p.wasInRange ? elapsed : 0);
+            }
+            p.lastRangeMarkAt = now;
+            p.wasInRange = active.binId >= p.lower && active.binId <= p.upper;
+          }
           if (!p.exit) p.hardLowerExit ??= lowerRangeStop(active.binId, p.lower,
             active.binStep ?? (p.ratio - 1) * 10_000, config.management.outOfRangeBelowStopPct);
           const bins = p.exit ? null : await readSnapshot(p.pool, p.lower, p.upper);
@@ -180,6 +197,10 @@ export function startPaper(store, notify, {
             p.mark = { at: Date.now(), pnl };
             p.markIssue = null;
             p.indicativeMark = null;
+            if (p.shapeTrial) {
+              p.trialPeakPnl = Math.max(p.trialPeakPnl ?? 0, pnl);
+              p.trialDrawdownPct = Math.max(p.trialDrawdownPct ?? 0, 100 * (p.trialPeakPnl - pnl) / p.capital);
+            }
           } else {
             const indicative = validActive(active)
               ? inventory.sol + inventory.feeSol + tokenAmount * Number(active.price) - p.capital - costSol : null;
@@ -200,11 +221,14 @@ export function startPaper(store, notify, {
               lower: p.lower, upper: p.upper, entryBin: p.entryBin, shape: p.shape, range: p.range, variant: p.variant, openedAt: p.openedAt,
               closedAt: Date.now(), filledAt: p.filledAt, pnl, reason: p.exit.reason, solInventory: inventory.sol, quotedSol: proceeds,
               feeSol: inventory.feeSol, feeTokens: inventory.feeTokens, costSol,
-              source: p.source, mirror: p.mirror, outcome: 'settled', accountingVersion: 1 });
+              source: p.source, mirror: p.mirror, shapeReason: p.shapeReason,
+              ...(p.shapeTrial ? { shapeTrial: p.shapeTrial, observedMs: p.observedMs ?? 0,
+                inRangeMs: p.inRangeMs ?? 0, drawdownPct: p.trialDrawdownPct ?? 0 } : {}),
+              outcome: 'settled', accountingVersion: 1 });
             paper.realized[p.variant] += pnl;
             if (p.mirror) paper.mirrorRealized = (paper.mirrorRealized ?? 0) + pnl;
             delete paper.open[p.id];
-            closed.push(`• ${p.mint.slice(0, 8)} · ${p.variant ?? `${p.range}/${p.shape}`} · ${pnl.toFixed(4)} SOL · ${p.exit.reason}`);
+            if (!p.shapeTrial) closed.push(`• ${p.mint.slice(0, 8)} · ${p.variant ?? `${p.range}/${p.shape}`} · ${pnl.toFixed(4)} SOL · ${p.exit.reason}`);
           }
         } catch { markUnavailable(p, 'Valuasi belum bisa dihitung'); }
       }

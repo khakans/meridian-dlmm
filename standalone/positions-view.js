@@ -64,6 +64,7 @@ function paperLines(p, tab, now, research) {
   if (p.capital != null || p.costSol != null) lines.push(`Modal ${amount(p.capital, 'SOL')} · Biaya simulasi ${amount(p.costSol, 'SOL')}`);
   if (p.feeSol != null || p.quotedSol != null) lines.push(`Fee LP ${amount(p.feeSol, 'SOL')}${p.feeTokens > 0 ? ` + ${p.feeTokens.toPrecision(5)} token` : ''} · Quote keluar ${amount(p.quotedSol, 'SOL')}`);
   if (p.lower != null && p.upper != null) lines.push(`Range bin ${p.lower}–${p.upper}${p.entryBin == null ? '' : ` · Entry bin ${p.entryBin}`}`);
+  if (p.shape) lines.push(`Shape ${safe(p.shape)}${p.shapeReason ? ` · ${safe(p.shapeReason)}` : ''}`);
   const reason = p.reason ?? p.exit?.reason ?? p.manualExit ?? p.hardLowerExit;
   if (reason) lines.push(`Alasan ${safe(reason)}`);
   if (p.mint) lines.push(`Mint ${safe(p.mint)}`);

@@ -232,10 +232,10 @@ function buildPosition(pool, user, positionPubKey, totalXAmount, totalYAmount, m
   });
 }
 
-export async function simulateEntryPosition({ poolAddress, binsBelow, capital }) {
+export async function simulateEntryPosition({ poolAddress, binsBelow, capital, shape = config.strategy.strategy }) {
   const owner = config.standalone.walletAddress ? new PublicKey(config.standalone.walletAddress) : getWallet().publicKey;
   const { DLMM, StrategyType } = await getDLMM();
-  const strategy = { spot: StrategyType.Spot, curve: StrategyType.Curve, bid_ask: StrategyType.BidAsk }[config.strategy.strategy];
+  const strategy = { spot: StrategyType.Spot, curve: StrategyType.Curve, bid_ask: StrategyType.BidAsk }[shape];
   if (strategy == null || !(capital > 0) || !Number.isSafeInteger(binsBelow) || binsBelow < 1 || binsBelow > 69) {
     throw Error("Unsupported preflight plan");
   }

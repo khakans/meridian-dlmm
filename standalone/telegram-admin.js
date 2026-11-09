@@ -81,7 +81,7 @@ const SECTIONS = [
   {
     id: "strategy", title: "📐 Strategy", desc: "Position shape & bin range",
     settings: [
-      { k: "strategy", path: ["strategy", "strategy"], type: "enum", options: ["spot", "curve", "bid_ask"], label: "shape" },
+      { k: "strategy", path: ["strategy", "strategy"], type: "enum", options: ["auto", "spot", "curve", "bid_ask"], label: "shape" },
       { k: "minBinsBelow", path: ["strategy", "minBinsBelow"], type: "int", min: MIN_SAFE_BINS_BELOW, max: 200, unit: "bins" },
       { k: "maxBinsBelow", path: ["strategy", "maxBinsBelow"], type: "int", min: MIN_SAFE_BINS_BELOW, max: 200, unit: "bins" },
       { k: "defaultBinsBelow", path: ["strategy", "defaultBinsBelow"], type: "int", min: MIN_SAFE_BINS_BELOW, max: 200, unit: "bins" },
@@ -264,7 +264,7 @@ function sectionMenu(section, slack = false) {
   const explainers = {
     strategy:
       "Range: bins below the active bin scale with pool volatility, clamped to min–max (bins above = 0). " +
-      "Shape: spot = flat, curve = centered, bid_ask = weighted toward the edges. Applied per entry, no restart.",
+      "Shape: auto reads the pair before entry. Manual options are spot, curve, and bid_ask. Applies to new entries immediately.",
     rpc: "Endpoints live in .env — edit, then ♻️ Restart.",
   };
   return {
