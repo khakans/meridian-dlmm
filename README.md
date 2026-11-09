@@ -1,6 +1,6 @@
 # Meridian
 
-Meridian DLMM, also known as Bandor, is a standalone Meteora liquidity bot for Solana. It screens token/SOL pools, combines signals from tracked LP wallets, and manages positions with rule-based entries, exits, and SOL settlement. It supports Shadow simulation, live trading, and position and PnL reporting through Slack and Telegram.
+Standalone wallet-triggered Meteora DLMM bot for Solana. It waits for fresh LP entries by tracked wallets, screens the matching token, and manages positions with deterministic rules. No LLM or Meridian server is required.
 
 ## Credits
 
