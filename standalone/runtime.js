@@ -11,7 +11,7 @@ import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import { repoPath } from "../repo-root.js";
 import { sendNotification as notify, setNotificationMirror } from "../telegram.js";
-import { MonitorStore, finishSignal } from "./store.js";
+import { MonitorStore, finishSignal, recentSignalCounts } from "./store.js";
 import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
@@ -762,9 +762,10 @@ async function lifecycleStatusLines(detailed = false) {
       Date.parse(p.recorded_at) >= from && Number.isFinite(p.lp_value_change_sol) && Number.isFinite(p.fee_lp_sol));
     if (lpRows.length) lines.push(`Perubahan nilai LP ${signed(lpRows.reduce((n, p) => n + p.lp_value_change_sol, 0))} SOL · Fee LP ${signed(lpRows.reduce((n, p) => n + p.fee_lp_sol, 0))} SOL · ${lpRows.length} posisi`);
   }
-  const signals = Object.values(store.data.signals).filter(signal => now - signal.createdAt < 86_400_000);
-  const discovery = signals.filter(signal => signal.source === "discovery").length;
-  lines.push("", "Sinyal · 24 jam", `Discovery ${discovery} kandidat · Convergence ${signals.length - discovery} sinyal`);
+  const signals = recentSignalCounts(store, now);
+  const signalTime = new Date(now).toLocaleTimeString("id-ID", { timeZone: "Asia/Jakarta", hour: "2-digit", minute: "2-digit" });
+  lines.push("", `Sinyal · 24 jam hingga ${signalTime} WIB`,
+    `Discovery ${signals.discovery} kandidat · Convergence ${signals.convergence} sinyal`);
   const walletMints = Object.values(store.data.convergenceDiagnostics ?? {}).filter(d => now - d.at < 86_400_000);
   const qualifyingMints = walletMints.filter(d => d.current > 0).length;
   lines.push(`${Object.keys(store.data.wallets).length} wallet dipantau · ${qualifyingMints} mint dengan deposit yang lolos`,

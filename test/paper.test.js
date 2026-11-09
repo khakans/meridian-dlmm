@@ -19,6 +19,7 @@ import { meetsSettlementMinimum } from '../tools/wallet.js';
 import { positionsPage } from '../standalone/positions-view.js';
 import { estimateNetExitPct, isRetryableEntryError, netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
 import { DLMM_PROGRAM, recoverablePositionRent } from '../standalone/events.js';
+import { recentSignalCounts } from '../standalone/store.js';
 
 test('settlement only attributes the closed mint balance change to the specified wallet', () => {
   const token = (owner, mint, amount) => ({ owner, mint, uiTokenAmount: { amount } });
@@ -524,6 +525,35 @@ test('SQLite migrates paper and live data separately and persists paper history 
   } finally {
     if (shadow?.db.isOpen) shadow.db.close();
     if (live?.db.isOpen) live.db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('rolling signal counts include prior same-mint signals and live queue without double-counting', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-signals-'));
+  const now = 1_800_000_000_000, day = 86_400_000;
+  let database;
+  try {
+    database = openModeDatabase('live', dir);
+    const monitor = emptyMonitor();
+    const first = { mint: 'mint', source: 'discovery', createdAt: now - 5000, done: true, closedAt: now - 4000 };
+    const stale = { mint: 'stale', createdAt: now - day, done: true, closedAt: now - 1000 };
+    monitor.signals = { mint: first, stale };
+    database.saveMonitor(monitor);
+    assert.deepEqual(recentSignalCounts({ database, data: monitor }, now), { discovery: 1, convergence: 0 });
+    const second = { mint: 'mint', createdAt: now - 2000, done: false };
+    monitor.signals.mint = second;
+    database.saveMonitor(monitor);
+    database.db.close();
+    database = openModeDatabase('live', dir);
+    const saved = database.get('monitor');
+    assert.deepEqual(recentSignalCounts({ database, data: saved }, now), { discovery: 1, convergence: 1 });
+    Object.assign(saved.signals.mint, { done: true, closedAt: now });
+    database.saveMonitor(saved);
+    assert.deepEqual(recentSignalCounts({ database, data: saved }, now), { discovery: 1, convergence: 1 });
+    assert.deepEqual(recentSignalCounts({ database, data: saved }, now + day - 2500), { discovery: 0, convergence: 1 });
+  } finally {
+    if (database?.db.isOpen) database.db.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

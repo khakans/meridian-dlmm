@@ -52,6 +52,27 @@ export class MonitorStore {
     }
   }
 }
+
+export function recentSignalCounts(store, now = Date.now()) {
+  const from = now - 86_400_000;
+  const archived = store.database?.db.prepare(`
+    SELECT json_extract(value, '$.mint') AS mint,
+           json_extract(value, '$.createdAt') AS createdAt,
+           json_extract(value, '$.source') AS source
+      FROM history
+     WHERE kind = 'signal' AND at >= ?
+  `).all(from) ?? [];
+  // Finished signals can still be present in the per-mint monitor snapshot.
+  const unique = new Map();
+  for (const signal of [...archived, ...Object.values(store.data.signals)]) {
+    if (!signal.mint || !Number.isSafeInteger(signal.createdAt) || signal.createdAt <= from || signal.createdAt > now) continue;
+    unique.set(`${signal.mint}:${signal.createdAt}`, signal.source === 'discovery' ? 'discovery' : 'convergence');
+  }
+  const counts = { discovery: 0, convergence: 0 };
+  for (const source of unique.values()) counts[source]++;
+  return counts;
+}
+
 export function qualifyingEvents(events, mint, options, now = Date.now()) {
   const latest = new Map();
   for (const e of events) {
