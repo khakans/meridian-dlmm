@@ -276,6 +276,14 @@ async function buildDualSidePosition(connection, pool, owner, position, active, 
     buildPosition(pool, owner, position, x, new BN(solLamports), lower, upper, strategy),
     connection.getAccountInfo(wsol, "confirmed"),
   ]);
+  const bitmap = pool.binArrayBitmapExtension?.publicKey;
+  if (bitmap) {
+    // The on-chain Swap2 instruction requires a writable bitmap when it is present.
+    const swapInstruction = swap.instructions.find(ix => ix.programId.equals(pool.program.programId));
+    const bitmapAccount = swapInstruction?.keys.find(key => key.pubkey.equals(bitmap));
+    if (!bitmapAccount) throw Error("Meteora Swap2 bitmap account missing");
+    bitmapAccount.isWritable = true;
+  }
   const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }));
   const createdAtas = new Set();
   for (const ix of [...swap.instructions, ...lp.instructions]) {
