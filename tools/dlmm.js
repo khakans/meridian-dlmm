@@ -1074,6 +1074,22 @@ export async function claimFees({ position_address }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
+export async function getPositionExitInventory(positionAddress, poolAddress, mint, owner) {
+  const { DLMM } = await getDLMM();
+  return readRpc("balance", async connection => {
+    const pool = await DLMM.create(connection, new PublicKey(poolAddress));
+    if (String(pool.lbPair.tokenXMint) !== mint || String(pool.lbPair.tokenYMint) !== config.tokens.SOL) {
+      throw Error("Unexpected position mints");
+    }
+    const { positionData: p } = await pool.getPosition(new PublicKey(positionAddress));
+    if (String(p.owner) !== owner) throw Error("Unexpected position owner");
+    return {
+      tokenRaw: BigInt(p.totalXAmountExcludeTransferFee.toString()) + BigInt(p.feeXExcludeTransferFee.toString()),
+      sol: Number(BigInt(p.totalYAmountExcludeTransferFee.toString()) + BigInt(p.feeYExcludeTransferFee.toString())) / 1e9,
+    };
+  });
+}
+
 export async function closePosition({ position_address, reason, onClosing, onClosed }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {

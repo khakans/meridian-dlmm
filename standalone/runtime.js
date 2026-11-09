@@ -17,7 +17,7 @@ import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
 import { isActivePaperVariant } from "./entry-plans.js";
 import { mirrorExitReason, prepareMirrorPosition, startPaper, validateExitQuote } from "./paper.js";
-import { advanceSettlement, dueSettlements, settlementComplete, settlementRows } from "./settlement.js";
+import { advanceSettlement, dueSettlements, SETTLEMENT_DUST_SOL, settlementComplete, settlementRows } from "./settlement.js";
 import { estimateEntryOverheadSol, estimateNetExitPct, isRetryableEntryError, positionWrites, reconcilePositionWrites } from "./position-journal.js";
 import { readRpc } from "./rpc.js";
 import { withWalletLock } from "./transactions.js";
@@ -25,9 +25,9 @@ import { paperDay } from "./paper-accounting.js";
 import { paperPnlLines, paperRealizedLine, signed, summarizePaper } from "./pnl-summary.js";
 import { openPositions, positionsPage, positionTarget } from "./positions-view.js";
 import { exposureStillPresent, recoverablePositionRent } from "./events.js";
-import { getActiveBin, getMyPositions, simulateEntryPosition } from "../tools/dlmm.js";
+import { getActiveBin, getMyPositions, getPositionExitInventory, simulateEntryPosition } from "../tools/dlmm.js";
 import { executeTool, validateDeployPoolThresholds } from "../tools/executor.js";
-import { getWalletBalances } from "../tools/wallet.js";
+import { getWalletBalances, quoteTokenToSol } from "../tools/wallet.js";
 import { getTrackedPosition, getTrackedPositions, syncOpenPositions, trackPosition } from "../state.js";
 import { latchLowerRangeExit } from "../state.js";
 import { recordPositionSnapshot } from "../pool-memory.js";
@@ -133,7 +133,7 @@ function startSettlementWorker() {
         return fresh && !shuttingDown ? advanceSettlement(fresh) : null;
       }, 1);
       if (result?.status === "closing" && result.retryClose && !shuttingDown) {
-        await executeTool("close_position", { position_address: result.id, reason: "resume interrupted close" });
+        await executeTool("close_position", { position_address: result.id, reason: result.exitReason ?? result.reason ?? "resume interrupted close" });
       }
       if (result && settlementComplete(result)) {
         const pair = String(result.pool_name ?? "").replace(/[<>&\r\n]/g, " ").trim().slice(0, 100);
@@ -144,6 +144,7 @@ function startSettlementWorker() {
           `PnL net posisi (setelah biaya) ${pnl}`,
           `Position ${result.id}`,
         ];
+        if (result.exitReason) lines.push(`Alasan exit ${result.exitReason}`);
         if (result.pool) lines.push(`Pool ${result.pool}`);
         if (result.status === "dust_remaining") {
           lines.push(`Sisa token ≈ ${result.dustSol.toFixed(8)} SOL · masih di wallet, di luar PnL net posisi`);
@@ -261,6 +262,15 @@ async function attemptEntry(signal) {
   const shadow = config.standalone.shadow;
   const source = signal.source ?? "convergence";
   const paper = store.data.paper;
+  const lossCutoff = Date.now() - config.management.repeatDeployCooldownHours * 3_600_000;
+  const recentNetLoss = config.management.repeatDeployCooldownEnabled && (shadow
+    ? (paper?.closed ?? []).some(p => p.mirror && p.mint === mint && p.closedAt > lossCutoff && Number.isFinite(p.pnl) && p.pnl < 0)
+    : settlementRows().some(row => row.mint === mint && row.updatedAt > lossCutoff && settlementComplete(row) &&
+      Number.isFinite(row.netSol) && row.netSol < 0));
+  if (recentNetLoss) {
+    finishSignal(store, signal, "mint on cooldown after a net loss");
+    return null;
+  }
   const mirror = Object.values(paper?.open ?? {}).filter(p => p.mirror);
   const positions = shadow ? { positions: mirror } : await getMyPositions({ force: true }).catch(() => null);
   if (!positions || positions.error || !Array.isArray(positions.positions)) return "position read unavailable";
@@ -359,14 +369,14 @@ async function attemptEntry(signal) {
     if (shuttingDown || store.data.paused || signal.done || Date.now() >= signal.deadline) return "entry stopped or expired";
     paper.realized[model.variant] ??= 0;
     paper.open[model.id] = model;
-    store.data.attempts[mint] = { at: Date.now(), mint, pool: pool.pool_address, status: "entered", amountSol: amountY };
+    store.data.attempts[mint] = { at: Date.now(), mint, pool: pool.pool_address, source, status: "entered", amountSol: amountY };
     finishSignal(store, signal, "entered");
     return null;
   }
   // Checkpoint before building anything: a crash mid-sequence leaves a
   // recovery pointer instead of a silent duplicate-entry risk.
   store.data.attempts[mint] = {
-    at: Date.now(), mint, pool: pool.pool_address, wallets: signal.events.map(e => e.wallet),
+    at: Date.now(), mint, pool: pool.pool_address, source, wallets: signal.events.map(e => e.wallet),
     status: "submitting", failures: attempt?.failures ?? 0, position: null, txs: [],
     amountSol: amountY, strategy: config.strategy.strategy, binStep: entry.binStep, journalVersion: 1,
   };
@@ -501,39 +511,40 @@ export async function manageOnce() {
 function startPnlPoller() {
   if (config.standalone.shadow) return;
   const pollMs = Math.max(1, Number(config.pnl.pollIntervalSec ?? 3)) * 1000;
+  let lowerRangeBusy = false;
+  timers.lowerRange = setInterval(async () => {
+    if (lowerRangeBusy || shuttingDown || !(config.management.outOfRangeBelowStopPct > 0)) return;
+    lowerRangeBusy = true;
+    try {
+      const pools = new Map();
+      const breaches = await Promise.all(getTrackedPositions(true).map(async p => {
+        if (p.hard_lower_exit) return { p, reason: p.hard_lower_exit };
+        if (!p.pool || !Number.isSafeInteger(p.bin_range?.min)) return null;
+        if (!pools.has(p.pool)) pools.set(p.pool, getActiveBin({ pool_address: p.pool }).catch(() => null));
+        const active = await pools.get(p.pool);
+        const reason = lowerRangeStop(active?.binId, p.bin_range.min, active?.binStep, config.management.outOfRangeBelowStopPct);
+        if (!reason || shuttingDown) return null;
+        const latched = latchLowerRangeExit(p.position, reason);
+        return latched ? { p, reason: latched } : null;
+      }));
+      for (const { p, reason } of breaches.filter(Boolean)) {
+        if (shuttingDown || manageBusy) return;
+        manageBusy = true;
+        try {
+          const res = await executeTool("close_position", { position_address: p.position, reason }).catch(e => ({ error: e.message }));
+          log("poll", `${p.position.slice(0, 8)}: ${reason} — ${res?.error || res?.reason || (res?.success ? "closed" : "unconfirmed")}`);
+        } finally { manageBusy = false; }
+      }
+    } finally { lowerRangeBusy = false; }
+  }, pollMs);
+
   let lastDecisionAt = 0;
   timers.pnl = setInterval(async () => {
-    if (pollBusy || shuttingDown) return;
-    const tracked = getTrackedPositions(true);
-    if (tracked.length === 0) return;
+    const now = Date.now();
+    if (pollBusy || manageBusy || shuttingDown || now - lastDecisionAt < 60_000 || !getTrackedPositions(true).length) return;
     pollBusy = true;
+    lastDecisionAt = now;
     try {
-      if (config.management.outOfRangeBelowStopPct > 0) {
-        const pools = new Map();
-        const breaches = await Promise.all(tracked.map(async p => {
-          if (p.hard_lower_exit) return { p, reason: p.hard_lower_exit };
-          if (!p.pool || !Number.isSafeInteger(p.bin_range?.min)) return null;
-          if (!pools.has(p.pool)) pools.set(p.pool, getActiveBin({ pool_address: p.pool }).catch(() => null));
-          const active = await pools.get(p.pool);
-          const reason = lowerRangeStop(active?.binId, p.bin_range.min, active?.binStep, config.management.outOfRangeBelowStopPct);
-          if (!reason || shuttingDown) return null;
-          const latched = latchLowerRangeExit(p.position, reason);
-          return latched ? { p, reason: latched } : null;
-        }));
-        for (const breach of breaches.filter(Boolean)) {
-          if (shuttingDown || manageBusy) return;
-          manageBusy = true;
-          try {
-            const { p, reason } = breach;
-            const res = await executeTool("close_position", { position_address: p.position, reason }).catch(e => ({ error: e.message }));
-            log("poll", `${p.position.slice(0, 8)}: ${reason} — ${res?.error || res?.reason || (res?.success ? "closed" : "unconfirmed")}`);
-          } finally { manageBusy = false; }
-        }
-        if (breaches.some(Boolean)) return;
-      }
-      const now = Date.now();
-      if (manageBusy || shuttingDown || now - lastDecisionAt < 60_000) return;
-      lastDecisionAt = now;
       const live = await getMyPositions({ force: true, silent: true }).catch(() => null);
       if (!live || live.error || !Array.isArray(live.positions)) return;
       const states = store.data.mirrorExits ??= {};
@@ -552,15 +563,22 @@ function startPnlPoller() {
         state.lower = p.lower_bin;
         state.upper = p.upper_bin;
         const capital = trackedPosition?.amount_sol;
-        if (state.entryOverheadSol == null && Number.isFinite(p.strategy_pnl_pct) && capital > 0) {
+        if (state.entryOverheadSol == null && capital > 0) {
           state.entryOverheadSol = await estimateEntryOverheadSol(p.position, live.wallet, capital).catch(() => null);
         }
-        // Keep the gross stop-loss as a backstop when entry metadata is unavailable.
         const gross = Number.isFinite(p.strategy_pnl_pct) ? p.strategy_pnl_pct : null;
-        const pnlPct = estimateNetExitPct(gross, capital, state.entryOverheadSol) ??
-          (gross != null && gross <= config.management.stopLossPct ? gross : null);
+        let pnlPct = gross != null && gross <= config.management.stopLossPct ? gross : null;
+        if (!state.closeReason && capital > 0 && Number.isFinite(state.entryOverheadSol)) {
+          try {
+            const inventory = await getPositionExitInventory(p.position, p.pool, p.base_mint, live.wallet);
+            const proceeds = inventory.tokenRaw > 0n ? await quoteTokenToSol(p.base_mint, inventory.tokenRaw) : 0;
+            const exitValue = inventory.sol + (proceeds > SETTLEMENT_DUST_SOL ? proceeds : 0);
+            pnlPct = estimateNetExitPct((exitValue / capital - 1) * 100, capital, state.entryOverheadSol);
+          } catch { /* An unavailable quote must not trigger profit-taking. */ }
+        }
         const reason = state.closeReason ?? mirrorExitReason(state, { binId: p.active_bin }, pnlPct, now);
         if (!reason) continue;
+        if (shuttingDown || manageBusy || getTrackedPosition(p.position)?.hard_lower_exit) continue;
         state.closeReason = reason;
         store.save();
         manageBusy = true;
@@ -636,8 +654,8 @@ async function lifecycleStatusLines(detailed = false) {
     const paper = store.data.paper;
     const mirror = { open: Object.fromEntries(Object.entries(paper?.open ?? {}).filter(([, p]) => p.mirror)),
       closed: (paper?.closed ?? []).filter(p => p.mirror) };
-    lines.push(paperRealizedLine(summarizePaper(paper, from, now), "All"),
-      ...paperPnlLines(summarizePaper(mirror, from, now), detailed, "discovery/volatility/mirror", "Mirror"));
+    lines.push(...paperPnlLines(summarizePaper(mirror, from, now), detailed, "discovery/volatility/mirror", "Mirror"));
+    lines.push(paperRealizedLine(summarizePaper(paper, from, now), "All varian eksperimen + Mirror"));
     const legacy = Object.values(paper?.open ?? {}).filter(p => !p.mirror).length;
     if (legacy) lines.push(`Eksperimen lama · ${legacy} posisi terbuka di riwayat paper`);
   }

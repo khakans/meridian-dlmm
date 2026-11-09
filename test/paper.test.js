@@ -170,6 +170,7 @@ test('mirror uses the planned on-chain range and replay yields the same confirme
     capital: 0.2, decimals: 6, binStep: 100, binsBelow: 35, entry: { binId: 100, price: 1, bins } }, now);
   assert.deepEqual([model.lower, model.upper, model.entryBin, model.filledAt], [65, 100, 100, now]);
   assert.equal(model.rangeReached, true);
+  assert.equal(model.mark.pnl, -config.research.mirrorRoundTripCostSol);
   const live = { id: 'live', openedAt: now, lower: 65, upper: 100, rangeReached: true };
   const marks = Array.from({ length: Math.max(1, config.pnl.confirmTicks) }, (_, i) => ({
     binId: 95, pnl: config.management.takeProfitPct + 1, at: now + i * 60_000,

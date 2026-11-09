@@ -304,6 +304,9 @@ console.log("\n[8] deterministic rules");
   });
   check("TP1/TP2/TP6 high-conviction bull signals", bullSignals.x_ratio_mult === 0.85 && bullSignals.conviction_mult === 1.15 && bullSignals.let_winners_run === true);
   check("TP6 conviction sizing scales deploy amount", computeDeployAmount(2.0, 1.15) > computeDeployAmount(2.0, 0.8));
+  const reserve = config.management.gasReserve;
+  check("position sizing never consumes gas reserve or rounds above spendable SOL",
+    computeDeployAmount(reserve - 0.01) === 0 && computeDeployAmount(reserve + 0.015) <= 0.015);
 
   // Touchpoint 3 OOR-Below Chronos Defense tests
   check("TP3 OOR-below WEAK_STRUCTURAL_BREAKDOWN rescues early at 90m", getDeterministicCloseRule(pos({ active_bin: 40, minutes_out_of_range: 95 }), mgmt, { oor_below_outlook: "WEAK_STRUCTURAL_BREAKDOWN" })?.rule === 4);

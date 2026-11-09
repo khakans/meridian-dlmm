@@ -39,7 +39,7 @@ export function beginSettlement({ id, mint, wallet, baseline, pool, pool_name, d
   const prior = settlementRows().find(r => r.id === id);
   if (prior) return prior;
   if (baseline == null) throw Error('Wallet token baseline unavailable before close');
-  return update({ id, mint, wallet, baseline, pool, pool_name, deployed_at, reason, tries: 0, nextAt: 0 }, 'closing');
+  return update({ id, mint, wallet, baseline, pool, pool_name, deployed_at, reason, exitReason: reason, tries: 0, nextAt: 0 }, 'closing');
 }
 
 export function confirmPositionClosed(id, txs) {

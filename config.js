@@ -111,6 +111,7 @@ export const config = {
     paperLossGraceMinutes: Math.max(0, numericConfig(u.paperLossGraceMinutes) ?? 20),
     paperCloseListLimit: Math.max(1, Math.min(10, Math.floor(numericConfig(u.paperCloseListLimit) ?? 3))),
     paperMinExitRatio: Math.max(0.5, Math.min(1, numericConfig(u.paperMinExitRatio) ?? 0.9)),
+    mirrorRoundTripCostSol: Math.max(0.00003, numericConfig(u.mirrorRoundTripCostSol) ?? 0.0016),
   },
   lifecycleReportMinutes: numericConfig(u.lifecycleReportMinutes) ?? 0,
 
@@ -267,6 +268,5 @@ export function computeDeployAmount(walletSol, convictionMult = 1.0) {
   const deployable = Math.max(0, walletSol - reserve);
   const dynamic    = deployable * pct * mult;
   const raw        = Math.min(ceil, Math.max(floor * Math.min(1.0, mult), dynamic));
-  const safeMax    = deployable > 0 ? Math.min(raw, deployable) : raw;
-  return parseFloat(Math.max(floor * 0.75, safeMax).toFixed(2));
+  return Math.floor(Math.min(raw, deployable) * 100 + 1e-8) / 100;
 }

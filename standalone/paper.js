@@ -59,9 +59,10 @@ export async function validateExitQuote({ mint, pool, decimals, binStep, binsBel
 export function prepareMirrorPosition({ source, mint, pool, pair, decimals, binStep, binsBelow, capital, shape, entry }, now = Date.now()) {
   const id = `mirror:${mint}:${now}`;
   const variant = source === 'convergence' ? 'convergence/baseline' : 'discovery/volatility/mirror';
-  const p = { id, mint, pool, pair, decimals, capital, source, shape, variant, mirror: true, range: 'volatility',
+  const costSol = config.research.mirrorRoundTripCostSol;
+  const p = { id, mint, pool, pair, decimals, capital, source, shape, variant, mirror: true, range: 'volatility', costSol,
     lower: entry.binId - binsBelow, upper: entry.binId, entryBin: entry.binId, entryPrice: Number(entry.price),
-    ratio: 1 + binStep / 10_000, openedAt: now, filledAt: now, rangeReached: true, mark: { at: now, pnl: -COST_SOL } };
+    ratio: 1 + binStep / 10_000, openedAt: now, filledAt: now, rangeReached: true, mark: { at: now, pnl: -costSol } };
   p.binSeed = seedPaperBins(p, entry.bins);
   return p;
 }
@@ -81,7 +82,7 @@ export function paperCloseRule(p, active, pnlPct, now) {
     minutes_out_of_range: p.outsideSince ? (now - p.outsideSince) / MINUTE : 0,
   }, m);
   if (rule?.rule === 1) return rule.reason;
-  if (now - p.openedAt >= (p.maxHoldMinutes ?? config.research.paperMaxHoldMinutes) * MINUTE) return 'paper max hold';
+  if (now - p.openedAt >= (p.maxHoldMinutes ?? config.research.paperMaxHoldMinutes) * MINUTE) return 'maximum hold time';
   if (!p.rangeReached && outside === 'above') {
     return now - p.openedAt >= (p.rangeWaitMinutes ?? config.research.paperInitialRangeWaitMinutes) * MINUTE
       ? 'entry range not reached' : null;
@@ -151,6 +152,7 @@ export function startPaper(store, notify, {
       for (const p of Object.values(paper.open)) {
         if (stopped || !config.standalone.shadow) return;
         try {
+          const costSol = p.costSol ?? COST_SOL;
           if (p.manualExit && !p.exit) p.manualExitCheckedAt = now;
           const active = p.exit ? null : await readActive(p.pool);
           if (!p.exit && !validActive(active)) {
@@ -172,7 +174,7 @@ export function startPaper(store, notify, {
           const tokenAmount = inventory.tokens + inventory.feeTokens;
           const proceeds = await sellQuote(p.mint, rawTokens(tokenAmount, p.decimals));
           if (stopped || !config.standalone.shadow) return;
-          const net = inventory.sol + inventory.feeSol + proceeds - p.capital - COST_SOL;
+          const net = inventory.sol + inventory.feeSol + proceeds - p.capital - costSol;
           const pnl = proceeds != null && Number.isFinite(net) ? net : null;
           if (pnl != null) {
             p.mark = { at: Date.now(), pnl };
@@ -180,7 +182,7 @@ export function startPaper(store, notify, {
             p.indicativeMark = null;
           } else {
             const indicative = validActive(active)
-              ? inventory.sol + inventory.feeSol + tokenAmount * Number(active.price) - p.capital - COST_SOL : null;
+              ? inventory.sol + inventory.feeSol + tokenAmount * Number(active.price) - p.capital - costSol : null;
             markUnavailable(p, 'Quote jual belum tersedia', Number.isFinite(indicative) ? { at: Date.now(), pnl: indicative } : null);
           }
           if (!p.exit) {
@@ -190,14 +192,14 @@ export function startPaper(store, notify, {
           if (p.exit && !p.filledAt) {
             paper.cancelled.push({ id: p.id, mint: p.mint, pool: p.pool, pair: p.pair, capital: p.capital,
               lower: p.lower, upper: p.upper, entryBin: p.entryBin, source: p.source, variant: p.variant, at: now, closedAt: now,
-              openedAt: p.openedAt, reason: p.exit.reason, costSol: COST_SOL, pnl: -COST_SOL, outcome: 'cancelled', accountingVersion: 1 });
-            paper.realized[p.variant] -= COST_SOL;
+              openedAt: p.openedAt, reason: p.exit.reason, costSol, pnl: -costSol, outcome: 'cancelled', accountingVersion: 1 });
+            paper.realized[p.variant] -= costSol;
             delete paper.open[p.id];
           } else if (p.exit && pnl != null) {
             paper.closed.push({ id: p.id, mint: p.mint, pool: p.pool, pair: p.pair, capital: p.capital,
               lower: p.lower, upper: p.upper, entryBin: p.entryBin, shape: p.shape, range: p.range, variant: p.variant, openedAt: p.openedAt,
               closedAt: Date.now(), filledAt: p.filledAt, pnl, reason: p.exit.reason, solInventory: inventory.sol, quotedSol: proceeds,
-              feeSol: inventory.feeSol, feeTokens: inventory.feeTokens, costSol: COST_SOL,
+              feeSol: inventory.feeSol, feeTokens: inventory.feeTokens, costSol,
               source: p.source, mirror: p.mirror, outcome: 'settled', accountingVersion: 1 });
             paper.realized[p.variant] += pnl;
             if (p.mirror) paper.mirrorRealized = (paper.mirrorRealized ?? 0) + pnl;
