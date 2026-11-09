@@ -242,24 +242,29 @@ async function quoteEntrySplit(pool, capital, active) {
   const total = Math.floor(capital * 1e9);
   const buyLamports = Math.floor(total / 2);
   if (!Number.isSafeInteger(total) || buyLamports < 1) throw Error("Invalid 50/50 capital");
-  const binArrays = await pool.getBinArrayForSwap(false, 2);
   if (pool.lbPair.activeId !== active.binId) throw Error("Active bin changed after entry validation");
-  const quote = pool.swapQuote(new BN(buyLamports), false, new BN(0), binArrays, false);
+  const { getBinArrayKeysCoverage } = await getDLMM();
+  const keys = getBinArrayKeysCoverage(new BN(active.binId), new BN(active.binId + 1), pool.pubkey, getDlmmProgramId());
+  const arrays = await pool.program.account.binArray.fetchMultiple(keys);
+  const binArrays = arrays.flatMap((account, i) => account ? [{ account, publicKey: keys[i] }] : []);
+  const buyAmount = new BN(buyLamports);
+  const quote = pool.swapQuote(buyAmount, false, new BN(0), binArrays, false);
   const x = quote.outAmount;
-  if (!quote.consumedInAmount.eqn(buyLamports) || x.isZero() ||
-      Number(quote.endPrice) > Number(active.price) * (1 + pool.lbPair.binStep / 10_000) ||
-      Number(x.toString()) * Number(active.price) < buyLamports * config.research.paperMinExitRatio) {
+  const maxPrice = Number(active.price) * (1 + pool.lbPair.binStep / 10_000 + 1e-9);
+  const tokenValue = Number(x.toString()) * Number(active.price);
+  if (!quote.consumedInAmount.eq(buyAmount) || x.isZero() || Number(quote.endPrice) > maxPrice ||
+      tokenValue < buyLamports * config.research.paperMinExitRatio) {
     throw Error("50/50 buy quote moved too far or could not fill at the required price");
   }
-  return { quote, x, buyLamports, solLamports: total - buyLamports };
+  return { quote, x, buyLamports, solLamports: total - buyLamports, buyCostSol: Math.max(0, buyLamports - tokenValue) / 1e9 };
 }
 
 export async function quoteDualSideEntry(poolAddress, capital, expectedBin) {
   const pool = await getPool(poolAddress, { fresh: true });
   const active = await pool.getActiveBin();
   if (active.binId !== expectedBin) throw Error("Active bin changed after entry validation");
-  const { x, solLamports } = await quoteEntrySplit(pool, capital, active);
-  return { rawX: x.toString(), solLamports };
+  const { x, solLamports, buyCostSol } = await quoteEntrySplit(pool, capital, active);
+  return { rawX: x.toString(), solLamports, buyCostSol };
 }
 
 async function buildDualSidePosition(connection, pool, owner, position, active, capital, lower, upper, strategy) {

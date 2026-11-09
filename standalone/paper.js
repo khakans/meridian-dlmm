@@ -72,7 +72,8 @@ export function prepareMirrorPosition({ source, mint, pool, pair, decimals, binS
   const costSol = config.research.mirrorRoundTripCostSol;
   const p = { id, mint, pool, pair, decimals, capital, source, shape, variant, mirror: true, range: 'volatility', costSol,
     lower: entry.binId - binsBelow, upper: entry.binId + binsAbove, entryBin: entry.binId, entryPrice: Number(entry.price),
-    ratio: 1 + binStep / 10_000, openedAt: now, filledAt: now, rangeReached: true, mark: { at: now, pnl: -costSol } };
+    ratio: 1 + binStep / 10_000, openedAt: now, filledAt: now, rangeReached: true,
+    mark: { at: now, pnl: -costSol - (dualSide?.buyCostSol ?? 0) } };
   p.binSeed = seedPaperBins(p, entry.bins, dualSide);
   return p;
 }
