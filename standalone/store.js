@@ -38,10 +38,11 @@ export class MonitorStore {
       this.data.seen = Object.fromEntries(seenEntries.slice(0, 5000));
     }
     for (const [mint, s] of Object.entries(this.data.signals)) {
-      if (!s.done && now > s.deadline) {
+      if (!s.done && now > s.deadline && this.data.attempts[mint]?.status !== "submitting") {
         s.done = true;
-        s.reason = s.reason || "expired";
+        s.reason = s.reason || entryDeadlineReason(s, now);
         s.closedAt = now;
+        s.cooldownUntil = now + 300_000;
       }
       if (s.done && now - s.createdAt > 24 * 3600_000) delete this.data.signals[mint];
     }
@@ -51,6 +52,13 @@ export class MonitorStore {
       if (!["submitting", "review_required"].includes(a.status) && now - a.at > 24 * 3600_000) delete this.data.attempts[mint];
     }
   }
+}
+
+export function entryDeadlineReason(signal, now = Date.now()) {
+  const elapsed = signal.entryStageAt ? ` (${Math.max(0, Math.round((now - signal.entryStageAt) / 1000))}s)` : '';
+  const stage = signal.entryStage ? ` at ${signal.entryStage}${elapsed}` : ' while queued';
+  const last = signal.lastEntryStage ? ` (${signal.lastEntryStage})` : '';
+  return `entry deadline reached${stage}${signal.lastEntryReason ? `; last check${last}: ${signal.lastEntryReason}` : ''}`;
 }
 
 export function recentSignalCounts(store, now = Date.now()) {

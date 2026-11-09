@@ -17,9 +17,9 @@ import { lowerRangeStop } from '../exit-rules.js';
 import { entryCreatedTokenAccounts, settlementCashCosts, settlementComplete, tokenDelta } from '../standalone/settlement.js';
 import { meetsSettlementMinimum } from '../tools/wallet.js';
 import { positionsPage, readLiveReportBook } from '../standalone/positions-view.js';
-import { estimateNetExitPct, isRetryableEntryError, netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
+import { canRetryUnsignedEntry, estimateNetExitPct, isRetryableEntryError, netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
 import { DLMM_PROGRAM, recoverablePositionRent } from '../standalone/events.js';
-import { recentSignalCounts } from '../standalone/store.js';
+import { MonitorStore, recentSignalCounts } from '../standalone/store.js';
 
 test('settlement only attributes the closed mint balance change to the specified wallet', () => {
   const token = (owner, mint, amount) => ({ owner, mint, uiTokenAmount: { amount } });
@@ -69,6 +69,23 @@ test('temporary entry failures are separated from unrelated and post-submit fail
   assert.equal(isRetryableEntryError('Active bin changed before entry'), true);
   assert.equal(isRetryableEntryError('Transaction failed on-chain; reconciling final status'), false);
   assert.equal(isRetryableEntryError('Transaction simulation rejected: {"InstructionError":[6,{"Custom":6005}]}'), false);
+  const failed = { status: 'failed', failures: 2, error: '50/50 buy quote moved too far or could not fill at the required price', txs: [] };
+  assert.equal(canRetryUnsignedEntry(failed, []), true);
+  assert.equal(canRetryUnsignedEntry({ ...failed, txs: ['signature'] }, []), false);
+  assert.equal(canRetryUnsignedEntry(failed, [{ status: 'pending' }]), false);
+  assert.equal(canRetryUnsignedEntry(failed, [{ status: 'expired' }]), false);
+});
+
+test('entry expiry retains the last check, reopens after cooldown and leaves a submission to reconciliation', () => {
+  const now = 1_800_000_000_000;
+  const entry = { createdAt: now - 121_000, deadline: now - 1000, entryStage: 'retry backoff', entryStageAt: now - 3000,
+    lastEntryStage: 'exit quote', lastEntryReason: 'quote unavailable' };
+  const data = { ...emptyMonitor(), signals: { expired: { ...entry }, inFlight: { ...entry } }, attempts: { inFlight: { status: 'submitting', at: now } } };
+  MonitorStore.prototype.prune.call({ data }, now);
+  assert.equal(data.signals.expired.done, true);
+  assert.equal(data.signals.expired.cooldownUntil, now + 300_000);
+  assert.match(data.signals.expired.reason, /retry backoff.*last check \(exit quote\): quote unavailable/);
+  assert.equal(data.signals.inFlight.done, undefined);
 });
 
 test('settlement bounds executable slippage and treats recorded dust as complete', () => {

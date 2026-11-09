@@ -47,8 +47,16 @@ export function isRetryableEntryError(error) {
     error === 'Transaction simulation rejected: "BlockhashNotFound"' ||
     /^Transaction simulation rejected: \{"InstructionError":\[\d+,\{"Custom":6004\}\]\}$/.test(error) ||
     error === 'Active bin changed after entry validation' ||
-    error === 'Active bin changed before entry'
+    error === 'Active bin changed before entry' ||
+    error === '50/50 buy quote moved too far or could not fill at the required price' ||
+    error === 'Insufficient liquidity in binArrays for swapQuote' ||
+    error === 'Entry stopped or expired before broadcast' ||
+    error === 'Pre-submit recheck failed: entry stopped or expired'
   );
+}
+
+export function canRetryUnsignedEntry(attempt, writes) {
+  return !attempt.txs?.length && !writes.length && isRetryableEntryError(attempt.error);
 }
 
 export function writeStatus(row, signatureStatus, finalizedHeight) {

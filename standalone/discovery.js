@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { PublicKey } from '@solana/web3.js';
 import { config } from '../config.js';
 import { log } from '../logger.js';
-import { connection, fetchJson } from './rpc.js';
+import { fetchJson } from './rpc.js';
 import { screenMint } from './screening.js';
+import { startPumpFeed } from './pump-feed.js';
 
 const PUMP = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const CREATE = '1b72a94ddeeb6376';
@@ -97,7 +98,6 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config
   let stopped = false;
   let busy = false;
   let gmgnRetryAt = 0;
-  let ws, subscription;
 
   function enqueue(mint, source, priority) {
     const item = queue.get(mint);
@@ -186,17 +186,11 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config
     }
   }
 
-  if (heliusKey) {
-    const url = new URL('https://mainnet.helius-rpc.com/');
-    url.searchParams.set('api-key', heliusKey);
-    ws = connection(url.toString(), url.toString().replace(/^https:/, 'wss:'));
-    subscription = ws.onLogs(PUMP, event => {
-      if (stopped || event.err) return;
-      for (const { mint, source } of pumpCandidates(event.logs)) {
-        enqueue(mint, source, source === 'Pump.fun migration' ? 3 : 1);
-      }
-    }, 'confirmed');
-  }
+  const stopPump = startPumpFeed(heliusKey, logs => {
+    for (const { mint, source } of pumpCandidates(logs)) {
+      enqueue(mint, source, source === 'Pump.fun migration' ? 3 : 1);
+    }
+  });
 
   log('discovery', `Watchlist started (GMGN=${Boolean(gmgnKey)}, Helius=${Boolean(heliusKey)})`);
   const timer = setInterval(() => void tick(), MINUTE);
@@ -204,6 +198,6 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config
   return async () => {
     stopped = true;
     clearInterval(timer);
-    if (ws) await ws.removeOnLogsListener(subscription).catch(() => {});
+    stopPump();
   };
 }

@@ -11,7 +11,7 @@ import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import { repoPath } from "../repo-root.js";
 import { sendNotification as notify, setNotificationMirror } from "../telegram.js";
-import { MonitorStore, finishSignal, recentSignalCounts } from "./store.js";
+import { MonitorStore, entryDeadlineReason, finishSignal, recentSignalCounts } from "./store.js";
 import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
@@ -21,7 +21,7 @@ import { prepareRebalanceTrial } from "./paper-rebalance.js";
 import { canEnrollLongRun, longRunSpotReady, longRunState, prepareLongHold } from "./paper-long-run.js";
 import { prepareEntrySpot } from "./paper-token-runner.js";
 import { advanceSettlement, dueSettlements, SETTLEMENT_DUST_SOL, settlementComplete, settlementRows } from "./settlement.js";
-import { estimateEntryOverheadSol, estimateNetExitPct, isRetryableEntryError, positionWrites, reconcilePositionWrites } from "./position-journal.js";
+import { canRetryUnsignedEntry, estimateEntryOverheadSol, estimateNetExitPct, positionWrites, reconcilePositionWrites } from "./position-journal.js";
 import { readRpc } from "./rpc.js";
 import { withWalletLock } from "./transactions.js";
 import { paperDay } from "./paper-accounting.js";
@@ -54,6 +54,7 @@ let pollBusy = false;
 let pursuing = false;
 const timers = {};
 const signalQueue = [];
+const signalRetryTimers = new Map();
 const discoveryStats = { received: 0, retries: 0, waiting: 0, passed: 0, dropped: 0, reasons: Object.create(null) };
 let preflight = null;
 let settlementBusy = false;
@@ -217,7 +218,7 @@ async function refreshPreflight() {
 // ─── Signal pursuit ──────────────────────────────────────────────────────────
 
 function onSignal(signal) {
-  if (store.data.paused || signal.done) return;
+  if (shuttingDown || store.data.paused || signal.done || signalQueue.includes(signal) || signalRetryTimers.has(signal)) return;
   signalQueue.push(signal);
   void drainSignals();
 }
@@ -241,29 +242,50 @@ async function drainSignals() {
   }
 }
 
-// Screen and enter within the signal deadline. Terminal outcomes finish the
-// signal; temporary failures retry every retrySec until the deadline expires.
+// Run one attempt per turn so the retry delay never holds up other signals.
 async function pursueSignal(signal) {
-  const wallets = signal.events.map(e => `${e.wallet.slice(0, 6)}(◎${e.depositSol.toFixed(1)})`).join(", ");
-  log("signal", `${signal.source ?? "convergence"} on ${signal.mint.slice(0, 8)}: ${signal.events.length} wallets [${wallets}] — screening with ${config.standalone.screeningDeadlineSec}s deadline`);
-  let lastReason = "no attempt";
-  while (!shuttingDown && !signal.done && Date.now() < signal.deadline) {
-    const reason = await attemptEntry(signal);
-    if (reason == null) return;
-    lastReason = reason;
+  if (Date.now() < signal.deadline) {
+    if (!signal.entryStage) {
+      const wallets = signal.events.map(e => `${e.wallet.slice(0, 6)}(◎${e.depositSol.toFixed(1)})`).join(", ");
+      log("signal", `${signal.source ?? "convergence"} on ${signal.mint.slice(0, 8)}: ${signal.events.length} wallets [${wallets}] — screening with ${config.standalone.screeningDeadlineSec}s deadline`);
+    }
+    const stage = name => {
+      signal.entryStage = name;
+      signal.entryStageAt = Date.now();
+    };
+    const reason = await attemptEntry(signal, stage);
+    if (reason == null || signal.done || shuttingDown || store.data.paused) return;
+    if (reason !== "entry stopped or expired") {
+      const safe = reason.replace(/https?:\/\/\S+/g, "[endpoint]");
+      if (safe !== signal.lastEntryReason) {
+        log("signal_retry", `${signal.mint.slice(0, 8)} · ${signal.entryStage} · ${safe}`);
+      }
+      signal.lastEntryReason = safe;
+      signal.lastEntryStage = signal.entryStage;
+    }
     const wait = Math.min(config.standalone.retrySec * 1000, signal.deadline - Date.now());
-    if (wait > 0) await sleep(wait);
+    if (wait > 0) {
+      stage("retry backoff");
+      store.save();
+      signalRetryTimers.set(signal, setTimeout(() => {
+        signalRetryTimers.delete(signal);
+        onSignal(signal);
+      }, wait));
+      return;
+    }
   }
   if (!signal.done) {
-    finishSignal(store, signal, lastReason);
-    log("signal", `Signal ${signal.mint.slice(0, 8)} expired: ${lastReason}`);
+    const reason = entryDeadlineReason(signal);
+    finishSignal(store, signal, reason);
+    log("signal", `Signal ${signal.mint.slice(0, 8)} expired: ${reason}`);
   }
 }
 
 // One entry attempt. Returns null when the signal is finished (entered,
 // terminal rejection, or fatal condition), or a reason string to retry.
-async function attemptEntry(signal) {
+async function attemptEntry(signal, stage) {
   if (store.data.paused || signal.done) return null;
+  stage("entry guards");
   const mint = signal.mint;
   if (!config.standalone.shadow && Object.values(store.data.attempts).some(a => a.status === "submitting" || a.status === "review_required")) {
     return "an earlier entry needs on-chain reconciliation";
@@ -280,9 +302,9 @@ async function attemptEntry(signal) {
     finishSignal(store, signal, `mint already attempted (${attempt.status})`);
     return null;
   }
-  if (attempt?.status === "failed" && (attempt.failures ?? 0) >= 2 &&
-      (!isRetryableEntryError(attempt.error) || attempt.txs?.length ||
-       (attempt.position && positionWrites(attempt.position).length))) {
+  const retryablePrior = attempt && ["failed", "retryable"].includes(attempt.status) &&
+    canRetryUnsignedEntry(attempt, attempt.position ? positionWrites(attempt.position) : []);
+  if (attempt?.status === "failed" && (attempt.failures ?? 0) >= 2 && !retryablePrior) {
     finishSignal(store, signal, "deploy failed repeatedly");
     return null;
   }
@@ -301,6 +323,7 @@ async function attemptEntry(signal) {
     return null;
   }
   const mirror = Object.values(paper?.open ?? {}).filter(p => p.mirror);
+  stage("portfolio positions");
   const positions = shadow ? { positions: mirror } : await getMyPositions({ force: true }).catch(() => null);
   if (!positions || positions.error || !Array.isArray(positions.positions)) return "position read unavailable";
   if (positions.positions.length >= config.risk.maxPositions ||
@@ -310,6 +333,7 @@ async function attemptEntry(signal) {
   }
 
   // Focused screening: this mint and its eligible pools only.
+  stage("screening");
   let screened;
   try {
     screened = await screenMint(mint, { poolAddress: signal.pool });
@@ -326,6 +350,7 @@ async function attemptEntry(signal) {
 
   const simulatedSol = shadow ? config.research.paperBankrollSol + (paper?.mirrorRealized ?? 0) -
     mirror.reduce((total, p) => total + p.capital, 0) : null;
+  stage("market and wallet recheck");
   const gate = await finalRecheck(signal, screened, simulatedSol);
   if (gate) return gate;
 
@@ -333,10 +358,12 @@ async function attemptEntry(signal) {
   if (balances.error || !Number.isFinite(balances.sol)) return "balance read unavailable";
   if (balances.sol < config.management.minSolToOpen + config.management.gasReserve) return "insufficient spendable SOL";
   if (!shadow && positions.wallet !== balances.wallet) return "portfolio wallet mismatch";
+  stage("portfolio risk");
   const risk = await riskGate(positions.positions, balances.sol, shadow, balances.wallet);
   if (risk) return risk;
 
   const pool = screened.pool;
+  stage("pair mode and candles");
   const { strategy: shapeMode, pairMode } = config.strategy;
   const candleTime = Math.floor(Date.now() / 1000);
   const candles = shadow || pairMode === "auto" || shapeMode === "auto"
@@ -346,8 +373,10 @@ async function attemptEntry(signal) {
   const dual = pairEntry.side === "dual";
   let { binsBelow, binsAbove } = entryRange(computeBinsBelow(pool.volatility), config.strategy.minBinsBelow, dual);
   if (dual && binsAbove < 1) return "50/50 range has no room above active bin";
+  if (Date.now() >= signal.deadline) return "entry stopped or expired";
 
   // Chronos AI Pre-Deploy Gate & Dynamic Bin Calibration (InstaBox 5-Node Cluster + Fallback)
+  stage("Chronos");
   const chronos = await analyzePoolWithChronos(pool.pool_address, {
     binStep: pool.dlmm_params?.bin_step ?? 100,
     activePrice: pool.pool_price,
@@ -379,14 +408,17 @@ async function attemptEntry(signal) {
       `Pool ${pool.pool_address.slice(0, 8)} [${chronos.engine}]: P10=${s.p10_pct}% P50=${s.p50_pct}% P90=${s.p90_pct}% RSI=${s.rsi_14} BB%B=${s.bb_pct_b} → bins=${binsBelow}↓/${binsAbove}↑ convMult=${convictionMult} (${chronos.latency_ms}ms)`,
     );
   }
+  if (Date.now() >= signal.deadline) return "entry stopped or expired";
   const amountY = computeDeployAmount(balances.sol, convictionMult);
   const minDeploy = Math.max(0.1, Number((config.management.deployAmountSol * 0.75).toFixed(2)));
   if (!(amountY >= minDeploy && amountY <= config.risk.maxDeployAmount &&
         amountY + config.management.gasReserve <= balances.sol)) return "invalid or unaffordable position size";
   if (positions.positions.some(p => p.pool === pool.pool_address)) return "pool already open";
+  stage("pool thresholds");
   const poolCheck = await validateDeployPoolThresholds({ pool_address: pool.pool_address });
   if (!poolCheck.pass) return poolCheck.reason;
   let entry;
+  stage("exit quote and entry range");
   try {
     entry = await validateExitQuote({
       mint, pool: pool.pool_address, decimals: screened.decimals,
@@ -402,11 +434,13 @@ async function attemptEntry(signal) {
   const modelInput = { source, mint, pool: pool.pool_address, pair: pool.name,
     decimals: screened.decimals, binStep: entry.binStep, binsBelow, binsAbove, capital: amountY, shape: plan.shape, entry, pairEntry };
   if (shadow && dual) {
+    stage("50/50 buy quote");
     try { modelInput.dualSide = await quoteDualSideEntry(pool.pool_address, amountY, entry.binId); }
     catch (error) { return `50/50 buy quote unavailable: ${error.message}`; }
   }
   let model, trials, longRun, entrySpot;
   if (shadow) {
+    stage("paper position accounting");
     try {
       model = prepareMirrorPosition(modelInput);
       model.shapeMode = shapeMode;
@@ -446,6 +480,7 @@ async function attemptEntry(signal) {
       }
     } catch { return "entry range unavailable for selected shape"; }
   }
+  stage("final market recheck");
   const fresh = await finalRecheck(signal, screened, simulatedSol);
   if (fresh) return fresh;
   if (shadow) {
@@ -473,13 +508,14 @@ async function attemptEntry(signal) {
   // recovery pointer instead of a silent duplicate-entry risk.
   store.data.attempts[mint] = {
     at: Date.now(), mint, pool: pool.pool_address, source, wallets: signal.events.map(e => e.wallet),
-    status: "submitting", failures: attempt?.failures ?? 0, position: null, txs: [],
+    status: "submitting", failures: retryablePrior ? 0 : attempt?.failures ?? 0, position: null, txs: [],
     amountSol: amountY, strategy: plan.shape, shapeMode, shapeReason: plan.reason, pairEntry, binStep: entry.binStep, journalVersion: 1,
   };
   store.save();
 
   let submitted = 0;
   entryInFlight = true;
+  stage("transaction build");
   const result = await executeTool("deploy_position", {
     pool_address: pool.pool_address,
     base_mint: mint,
@@ -500,14 +536,16 @@ async function attemptEntry(signal) {
     assert_entry_active: () => {
       if (shuttingDown || store.data.paused || signal.done || Date.now() >= signal.deadline) throw Error("Entry stopped or expired before broadcast");
     },
-    before_submit: async (stage = "lp") => {
+    before_submit: async (step = "lp") => {
       // Always recheck before the pre-deploy swap AND before the first LP creation tx.
       // Subsequent chunks of a multi-tx LP creation skip recheck so a half-built position completes.
-      if (stage !== "swap" && submitted++ > 0) return;
+      if (step !== "swap" && submitted++ > 0) return;
+      stage("pre-submit recheck");
       const fresh = await finalRecheck(signal, screened);
       if (fresh) throw new Error(`Pre-submit recheck failed: ${fresh}`);
       const active = await getActiveBin({ pool_address: pool.pool_address });
       if (active.binId !== entry.binId) throw new Error("Active bin changed before entry");
+      stage("transaction simulation and submit");
     },
     on_prepared: position => {
       store.data.attempts[mint].position = position;
@@ -533,13 +571,14 @@ async function attemptEntry(signal) {
     return null;
   }
 
-  if (record.position && positionWrites(record.position).some(row => ["pending", "confirmed"].includes(row.status))) {
+  const writes = record.position ? positionWrites(record.position) : [];
+  if (writes.some(row => ["pending", "confirmed"].includes(row.status))) {
     store.save();
     finishSignal(store, signal, "entry submitted; awaiting on-chain reconciliation");
     return null;
   }
   record.error = result?.error || result?.reason || "unknown";
-  const retryable = !record.txs?.length && isRetryableEntryError(record.error);
+  const retryable = canRetryUnsignedEntry(record, writes);
   record.status = retryable ? "retryable" : "failed";
   if (!retryable && !signal.done) record.failures = (record.failures ?? 0) + 1;
   if (Array.isArray(record.txs) && record.txs.length > 0) record.note = "transaction submitted before failure — outcome uncertain";
@@ -891,6 +930,8 @@ async function shutdown(signalName, exitCode = 0) {
   log("runtime", `${signalName} received — shutting down`);
   stopChronosKeepalive();
   for (const timer of Object.values(timers)) clearInterval(timer);
+  for (const timer of signalRetryTimers.values()) clearTimeout(timer);
+  signalRetryTimers.clear();
   stopPaper?.();
   await Promise.race([stopDiscovery?.(), sleep(3000)]);
   try { stopAdmin?.(); } catch { /* best-effort */ }
@@ -994,8 +1035,11 @@ export async function startStandalone() {
       store.database.saveMonitor({ ...previous, signals, paused, entryResumedAt: paused ? previous.entryResumedAt : now }, store.historyIds);
       for (const [mint, signal] of Object.entries(signals)) Object.assign(previous.signals[mint], signal);
       previous.paused = paused;
-      if (paused) signalQueue.length = 0;
-      else previous.entryResumedAt = now;
+      if (paused) {
+        signalQueue.length = 0;
+        for (const timer of signalRetryTimers.values()) clearTimeout(timer);
+        signalRetryTimers.clear();
+      } else previous.entryResumedAt = now;
     },
     statusDetails: () => lifecycleStatusLines(true),
     positionDetails: (tab, page) => positionsPage({
@@ -1035,7 +1079,8 @@ export async function startStandalone() {
       store.data.preflightCandidate = { mint, pool: screened.pool.pool_address, at: Date.now() };
       const now = Date.now();
       const prior = store.data.signals[mint];
-      if (!shuttingDown && !store.data.paused && (!prior || (prior.done && now >= prior.cooldownUntil))) {
+      const cooldownUntil = prior?.cooldownUntil ?? ((prior?.closedAt ?? prior?.deadline ?? now) + 300_000);
+      if (!shuttingDown && !store.data.paused && (!prior || (prior.done && now >= cooldownUntil))) {
         const signal = { mint, pool: screened.pool.pool_address, source: "discovery", sources, events: [],
           createdAt: now, deadline: now + config.standalone.screeningDeadlineSec * 1000, done: false };
         store.data.signals[mint] = signal;

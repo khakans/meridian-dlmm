@@ -53,6 +53,20 @@ function routesFor(url) {
   return routes;
 }
 
+export function heliusWebSocketRoutes(key) {
+  const primary = new URL(HELIUS_RPC);
+  if (key) primary.searchParams.set('api-key', key);
+  return routesFor(primary.href)
+    .filter(route => (key || route.line) && !(blockedUntil.get(route.url) > Date.now()))
+    .map(route => ({ url: route.url.replace(/^https:/, 'wss:'), line: route.line }));
+}
+
+export function retryAfterMs(header, fallback) {
+  const seconds = header ? Number(header) : NaN;
+  const wait = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(header) - Date.now();
+  return Number.isFinite(wait) ? Math.max(1000, wait) : fallback;
+}
+
 function blockUnavailable(url, message, status, retryAfter) {
   const helius = heliusEndpoint(url);
   let delay;
@@ -61,9 +75,7 @@ function blockUnavailable(url, message, status, retryAfter) {
   } else if (helius && (status === 401 || /(?:invalid|revoked|expired) api key/i.test(message))) {
     delay = Infinity;
   } else if (status === 429 || /\b429\b|too many requests|rate limit|-32005/i.test(message)) {
-    const seconds = retryAfter ? Number(retryAfter) : NaN;
-    const wait = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - Date.now();
-    delay = Number.isFinite(wait) ? Math.max(1000, wait) : 15_000;
+    delay = retryAfterMs(retryAfter, 15_000);
   }
   if (delay) blockedUntil.set(url, Math.max(blockedUntil.get(url) ?? 0, Date.now() + delay));
 }
