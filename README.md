@@ -2,6 +2,10 @@
 
 Standalone wallet-triggered Meteora DLMM bot for Solana. It waits for fresh LP entries by tracked wallets, screens the matching token, and manages positions with deterministic rules. No LLM or Meridian server is required.
 
+## Credits
+
+Meridian DLMM originated as a fork of [yunus-0x/meridian](https://github.com/yunus-0x/meridian). Thanks to Yunus and the upstream contributors for the original project.
+
 ## Flow
 
 1. Watch tracked LP wallets through Solana WebSocket notifications, with signature backfill for missed events.
