@@ -158,6 +158,7 @@ export const config = {
     strategy:     u.strategy     ?? "bid_ask",
     autoRebalance: u.autoRebalance !== false,
     minBinsBelow: strategyMinBinsBelow,
+    dualSidedEntry: u.dualSidedEntry === true,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
     defaultBinsAbove: strategyDefaultBinsAbove,

@@ -16,7 +16,7 @@ import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
 import { entryCandles, isActivePaperVariant, resolveEntryShape, scoreShadowScreen, shapeLabel } from "./entry-plans.js";
-import { mirrorExitReason, prepareMirrorPosition, prepareShapeTrials, startPaper, validateExitQuote } from "./paper.js";
+import { entryRange, mirrorExitReason, prepareMirrorPosition, prepareShapeTrials, startPaper, validateExitQuote } from "./paper.js";
 import { prepareRebalanceTrial } from "./paper-rebalance.js";
 import { canEnrollLongRun, longRunSpotReady, longRunState, prepareLongHold } from "./paper-long-run.js";
 import { prepareEntrySpot } from "./paper-token-runner.js";
@@ -28,7 +28,7 @@ import { paperDay } from "./paper-accounting.js";
 import { longRunLines, paperPnlLines, paperRealizedLine, rebalanceTrialLines, shapeTrialLines, signed, summarizePaper, tokenRunnerLines } from "./pnl-summary.js";
 import { openPositions, positionsPage, positionTarget, readLiveReportBook } from "./positions-view.js";
 import { exposureStillPresent, recoverablePositionRent } from "./events.js";
-import { getActiveBin, getMyPositions, getPositionExitInventory, simulateEntryPosition } from "../tools/dlmm.js";
+import { getActiveBin, getMyPositions, getPositionExitInventory, quoteDualSideEntry, simulateEntryPosition } from "../tools/dlmm.js";
 import { executeTool, validateDeployPoolThresholds } from "../tools/executor.js";
 import { getWalletBalances, quoteSolToToken, quoteTokenToSol } from "../tools/wallet.js";
 import { getTrackedPosition, getTrackedPositions, syncOpenPositions, trackPosition } from "../state.js";
@@ -172,7 +172,7 @@ async function refreshPreflight() {
       const screened = await screenMint(sample.mint, { poolAddress: sample.pool });
       result.pool = screened.pass ? "lolos screening ulang" : screened.reason;
       if (screened.pass) {
-        const binsBelow = Math.max(config.strategy.minBinsBelow, Math.min(69, computeBinsBelow(screened.pool.volatility)));
+        const { binsBelow, binsAbove } = entryRange(computeBinsBelow(screened.pool.volatility));
         let shape = mode === "auto" ? null : mode;
         try {
           const entry = await validateExitQuote({ mint: sample.mint, pool: sample.pool, decimals: screened.decimals,
@@ -185,7 +185,7 @@ async function refreshPreflight() {
         } catch { result.quote = "tidak lolos atau provider gagal"; }
         try {
           if (shape) {
-            const sim = await simulateEntryPosition({ poolAddress: sample.pool, binsBelow, capital: config.risk.maxDeployAmount, shape });
+            const sim = await simulateEntryPosition({ poolAddress: sample.pool, binsBelow, binsAbove, capital: config.risk.maxDeployAmount, shape });
             result.simulation = sim.err ? `RPC menolak ${JSON.stringify(sim.err).slice(0, 120)}` : `${shape} · lolos tanpa broadcast`;
           }
         } catch { result.simulation = "build atau RPC belum tersedia"; }
@@ -318,10 +318,8 @@ async function attemptEntry(signal) {
   if (risk) return risk;
 
   const pool = screened.pool;
-  // Both execution paths use the same SOL-only range and allocation.
-  const binsAbove = 0;
-  const rawBinsBelow = computeBinsBelow(pool.volatility);
-  let binsBelow = Math.max(config.strategy.minBinsBelow, Math.min(rawBinsBelow, 69));
+  let { binsBelow, binsAbove } = entryRange(computeBinsBelow(pool.volatility));
+  if (config.strategy.dualSidedEntry && binsAbove < 1) return "50/50 range has no room above active bin";
 
   // Chronos AI Pre-Deploy Gate & Dynamic Bin Calibration (InstaBox 5-Node Cluster + Fallback)
   const chronos = await analyzePoolWithChronos(pool.pool_address, {
@@ -339,10 +337,12 @@ async function attemptEntry(signal) {
       return `chronos gate: ${chronos.gate.reason}`;
     }
     if (chronos.recommended_bins?.bins_below > 0) {
-      binsBelow = Math.max(
-        MIN_SAFE_BINS_BELOW,
-        Math.min(Math.max(binsBelow, chronos.recommended_bins.bins_below), 69 - binsAbove),
-      );
+      if (config.strategy.dualSidedEntry) {
+        binsBelow = Math.min(69 - Math.min(binsAbove, 12), Math.max(binsBelow, chronos.recommended_bins.bins_below));
+        binsAbove = Math.min(binsAbove, 69 - binsBelow);
+      } else {
+        binsBelow = Math.max(MIN_SAFE_BINS_BELOW, Math.min(Math.max(binsBelow, chronos.recommended_bins.bins_below), 69));
+      }
     }
     if (Number.isFinite(Number(chronos.tactical_signals?.conviction_mult))) {
       convictionMult = Number(chronos.tactical_signals.conviction_mult);
@@ -364,7 +364,7 @@ async function attemptEntry(signal) {
   try {
     entry = await validateExitQuote({
       mint, pool: pool.pool_address, decimals: screened.decimals,
-      binStep: Number(pool.dlmm_params?.bin_step), binsBelow, capital: amountY, verifyRange: true,
+      binStep: Number(pool.dlmm_params?.bin_step), binsBelow, binsAbove, capital: amountY, verifyRange: true,
     });
   } catch { return "exit quote or entry range unavailable"; }
   const shapeMode = config.strategy.strategy;
@@ -374,42 +374,52 @@ async function attemptEntry(signal) {
   const plan = await resolveEntryShape(shapeMode, pool, binsBelow, entry, { candles: shadow ? candles ?? [] : undefined, now: candleTime });
   if (!plan.shape) return `Auto Shape: ${plan.reason}`;
   const modelInput = { source, mint, pool: pool.pool_address, pair: pool.name,
-    decimals: screened.decimals, binStep: entry.binStep, binsBelow, capital: amountY, shape: plan.shape, entry };
+    decimals: screened.decimals, binStep: entry.binStep, binsBelow, binsAbove, capital: amountY, shape: plan.shape, entry };
+  if (shadow && binsAbove > 0) {
+    try { modelInput.dualSide = await quoteDualSideEntry(pool.pool_address, amountY, entry.binId); }
+    catch (error) { return `50/50 buy quote unavailable: ${error.message}`; }
+  }
   let model, trials, longRun, entrySpot;
-  try {
-    model = prepareMirrorPosition(modelInput);
-    model.shapeMode = shapeMode;
-    model.shapeReason = plan.reason;
-    model.shapeComparison = compareShapes;
-    trials = compareShapes ? prepareShapeTrials(modelInput, model) : [];
-    if (shadow) {
+  if (shadow) {
+    try {
+      model = prepareMirrorPosition(modelInput);
+      model.shapeMode = shapeMode;
+      model.shapeReason = plan.reason;
+      model.shapeComparison = compareShapes;
+      trials = compareShapes ? prepareShapeTrials(modelInput, model) : [];
       const hourlyPool = await poolDetail(pool.pool_address, '1h', { signal: AbortSignal.timeout(4500) }).catch(() => null);
       model.screenTrial = scoreShadowScreen(candles, hourlyPool, amountY, candleTime);
-    }
-    if (shadow && shapeMode === "auto" && config.strategy.autoRebalance &&
-        Object.values(paper.open).filter(p => p.rebalanceTrial).length < 8) trials.push(prepareRebalanceTrial(model));
-    if (shadow && config.research.paperLongRun && canEnrollLongRun(paper, amountY, config.research.paperBankrollSol, config.risk.maxPositions)) {
-      const baseMinutes = config.research.paperMaxHoldMinutes;
-      const adaptive = prepareLongHold(model, "adaptive", baseMinutes);
-      model.longRunArm = "baseline";
-      model.maxHoldMinutes = baseMinutes;
-      trials.push(adaptive);
-      longRun = { id: model.id, mint, pair: model.pair, capital: amountY, openedAt: model.openedAt,
-        arms: { baseline: { lpId: model.id }, adaptive: { lpId: adaptive.id } } };
-      if (config.research.paperLongRunSpot && longRunSpotReady(longRunState(paper)) && signal.deadline - Date.now() > 20_000) {
-        const spotCapital = Math.floor(amountY * 0.15 * 1e9) / 1e9;
-        const lp = prepareMirrorPosition({ ...modelInput, capital: amountY - spotCapital }, model.openedAt);
-        const split = prepareLongHold(lp, "spot", baseMinutes);
-        const quotedAt = Date.now();
-        entrySpot = await prepareEntrySpot(split, { capital: spotCapital, now: quotedAt, candles,
-          buy: quoteSolToToken, sell: quoteTokenToSol, minExitRatio: config.research.paperMinExitRatio }).catch(() => null);
-        if (entrySpot && Date.now() - quotedAt <= 15_000) {
-          trials.push(split);
-          longRun.arms.spot = { lpId: split.id, entrySpotId: entrySpot.id };
-        } else entrySpot = null;
+      if (shapeMode === "auto" && config.strategy.autoRebalance &&
+          Object.values(paper.open).filter(p => p.rebalanceTrial).length < 8) trials.push(prepareRebalanceTrial(model));
+      if (config.research.paperLongRun && canEnrollLongRun(paper, amountY, config.research.paperBankrollSol, config.risk.maxPositions)) {
+        const baseMinutes = config.research.paperMaxHoldMinutes;
+        const adaptive = prepareLongHold(model, "adaptive", baseMinutes);
+        model.longRunArm = "baseline";
+        model.maxHoldMinutes = baseMinutes;
+        trials.push(adaptive);
+        longRun = { id: model.id, mint, pair: model.pair, capital: amountY, openedAt: model.openedAt,
+          arms: { baseline: { lpId: model.id }, adaptive: { lpId: adaptive.id } } };
+        if (config.research.paperLongRunSpot && longRunSpotReady(longRunState(paper)) && signal.deadline - Date.now() > 20_000) {
+          const spotCapital = Math.floor(amountY * 0.15 * 1e9) / 1e9;
+          const lpCapital = amountY - spotCapital;
+          const dualSide = binsAbove > 0
+            ? await quoteDualSideEntry(pool.pool_address, lpCapital, entry.binId).catch(() => null)
+            : undefined;
+          if (binsAbove === 0 || dualSide) {
+            const lp = prepareMirrorPosition({ ...modelInput, capital: lpCapital, dualSide }, model.openedAt);
+            const split = prepareLongHold(lp, "spot", baseMinutes);
+            const quotedAt = Date.now();
+            entrySpot = await prepareEntrySpot(split, { capital: spotCapital, now: quotedAt, candles,
+              buy: quoteSolToToken, sell: quoteTokenToSol, minExitRatio: config.research.paperMinExitRatio }).catch(() => null);
+            if (entrySpot && Date.now() - quotedAt <= 15_000) {
+              trials.push(split);
+              longRun.arms.spot = { lpId: split.id, entrySpotId: entrySpot.id };
+            } else entrySpot = null;
+          }
+        }
       }
-    }
-  } catch { return "entry range unavailable for selected shape"; }
+    } catch { return "entry range unavailable for selected shape"; }
+  }
   const fresh = await finalRecheck(signal, screened, simulatedSol);
   if (fresh) return fresh;
   if (shadow) {
@@ -455,6 +465,7 @@ async function attemptEntry(signal) {
     amount_y: amountY,
     bins_below: binsBelow,
     bins_above: binsAbove,
+    entry_split_50_50: binsAbove > 0,
     expected_active_bin: entry.binId,
     strategy: plan.shape,
     shape_mode: shapeMode,

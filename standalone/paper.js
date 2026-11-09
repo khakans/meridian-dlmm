@@ -12,6 +12,13 @@ import { applyHoldCheck, holdEvidence, observeHold, updateLongRun } from './pape
 const MINUTE = 60_000;
 const COST_SOL = 0.001; // Estimated round-trip network cost, excluding refundable rent.
 
+export function entryRange(width, minimum = config.strategy.minBinsBelow, dual = config.strategy.dualSidedEntry) {
+  if (!dual) return { binsBelow: Math.max(minimum, Math.min(width, 69)), binsAbove: 0 };
+  const binsBelow = Math.max(minimum, Math.ceil(Math.min(width, 69) / 2));
+  const binsAbove = Math.max(0, Math.min(69 - binsBelow, Math.max(12, width - binsBelow)));
+  return { binsBelow, binsAbove };
+}
+
 export function paperBins(plan, active, step) {
   if (plan.range !== 'volatility') return null;
   const ratio = 1 + step / 10_000;
@@ -43,7 +50,7 @@ function validActive(active) {
   return Number.isSafeInteger(active?.binId) && Number.isFinite(Number(active?.price)) && Number(active.price) > 0;
 }
 
-export async function validateExitQuote({ mint, pool, decimals, binStep, binsBelow, capital, verifyRange = false }) {
+export async function validateExitQuote({ mint, pool, decimals, binStep, binsBelow, binsAbove = 0, capital, verifyRange = false }) {
   if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18 ||
       !(binStep > 0 && binsBelow > 0 && capital > 0)) throw Error('Invalid exit sizing inputs');
   const active = await getActiveBin({ pool_address: pool });
@@ -55,18 +62,18 @@ export async function validateExitQuote({ mint, pool, decimals, binStep, binsBel
   if (quote < mark * config.research.paperMinExitRatio) throw Error('Exit quote below minimum');
   if (!verifyRange) return { ...active, exitRatio: quote / mark };
   if (Number(active.binStep) !== binStep) throw Error('Pool bin step changed');
-  const bins = await getPaperBinSnapshot(pool, active.binId - binsBelow, active.binId, { verifyRange });
+  const bins = await getPaperBinSnapshot(pool, active.binId - binsBelow, active.binId + binsAbove, { verifyRange });
   return { ...active, bins, exitRatio: quote / mark };
 }
 
-export function prepareMirrorPosition({ source, mint, pool, pair, decimals, binStep, binsBelow, capital, shape, entry }, now = Date.now()) {
+export function prepareMirrorPosition({ source, mint, pool, pair, decimals, binStep, binsBelow, binsAbove = 0, capital, shape, entry, dualSide }, now = Date.now()) {
   const id = `mirror:${mint}:${now}`;
   const variant = source === 'convergence' ? 'convergence/baseline' : 'discovery/volatility/mirror';
   const costSol = config.research.mirrorRoundTripCostSol;
   const p = { id, mint, pool, pair, decimals, capital, source, shape, variant, mirror: true, range: 'volatility', costSol,
-    lower: entry.binId - binsBelow, upper: entry.binId, entryBin: entry.binId, entryPrice: Number(entry.price),
+    lower: entry.binId - binsBelow, upper: entry.binId + binsAbove, entryBin: entry.binId, entryPrice: Number(entry.price),
     ratio: 1 + binStep / 10_000, openedAt: now, filledAt: now, rangeReached: true, mark: { at: now, pnl: -costSol } };
-  p.binSeed = seedPaperBins(p, entry.bins);
+  p.binSeed = seedPaperBins(p, entry.bins, dualSide);
   return p;
 }
 

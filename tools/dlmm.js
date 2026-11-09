@@ -1,9 +1,14 @@
 import {
+  ComputeBudgetProgram,
   Connection,
   Keypair,
   PublicKey,
+  Transaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
+import {
+  ASSOCIATED_TOKEN_PROGRAM_ID, createCloseAccountInstruction, getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID,
+} from "@solana/spl-token";
 import BN from "bn.js";
 import bs58 from "bs58";
 import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
@@ -159,9 +164,9 @@ async function assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, m
 const poolCache = new Map();
 const poolMetadataCache = new Map();
 
-async function getPool(poolAddress) {
+async function getPool(poolAddress, { fresh = false } = {}) {
   const key = poolAddress.toString();
-  if (!poolCache.has(key)) {
+  if (fresh || !poolCache.has(key)) {
     const { DLMM } = await getDLMM();
     const pool = await DLMM.create(getConnection(), new PublicKey(poolAddress));
     poolCache.set(key, pool);
@@ -232,21 +237,80 @@ function buildPosition(pool, user, positionPubKey, totalXAmount, totalYAmount, m
   });
 }
 
-export async function simulateEntryPosition({ poolAddress, binsBelow, capital, shape = config.strategy.strategy }) {
+async function quoteEntrySplit(pool, capital, active) {
+  if (pool.lbPair.tokenYMint.toString() !== config.tokens.SOL) throw Error("Pool quote asset is not SOL");
+  const total = Math.floor(capital * 1e9);
+  const buyLamports = Math.floor(total / 2);
+  if (!Number.isSafeInteger(total) || buyLamports < 1) throw Error("Invalid 50/50 capital");
+  const binArrays = await pool.getBinArrayForSwap(false, 2);
+  if (pool.lbPair.activeId !== active.binId) throw Error("Active bin changed after entry validation");
+  const quote = pool.swapQuote(new BN(buyLamports), false, new BN(0), binArrays, false);
+  const x = quote.outAmount;
+  if (!quote.consumedInAmount.eqn(buyLamports) || x.isZero() ||
+      Number(quote.endPrice) > Number(active.price) * (1 + pool.lbPair.binStep / 10_000) ||
+      Number(x.toString()) * Number(active.price) < buyLamports * config.research.paperMinExitRatio) {
+    throw Error("50/50 buy quote moved too far or could not fill at the required price");
+  }
+  return { quote, x, buyLamports, solLamports: total - buyLamports };
+}
+
+export async function quoteDualSideEntry(poolAddress, capital, expectedBin) {
+  const pool = await getPool(poolAddress, { fresh: true });
+  const active = await pool.getActiveBin();
+  if (active.binId !== expectedBin) throw Error("Active bin changed after entry validation");
+  const { x, solLamports } = await quoteEntrySplit(pool, capital, active);
+  return { rawX: x.toString(), solLamports };
+}
+
+async function buildDualSidePosition(connection, pool, owner, position, active, capital, lower, upper, strategy) {
+  const { quote, x, buyLamports, solLamports } = await quoteEntrySplit(pool, capital, active);
+  const wsol = getAssociatedTokenAddressSync(pool.lbPair.tokenYMint, owner);
+  const [swap, lp, existingWsol] = await Promise.all([
+    pool.swap({ inToken: pool.lbPair.tokenYMint, outToken: pool.lbPair.tokenXMint,
+      inAmount: new BN(buyLamports), minOutAmount: x, lbPair: pool.pubkey, user: owner, binArraysPubkey: quote.binArraysPubkey }),
+    buildPosition(pool, owner, position, x, new BN(solLamports), lower, upper, strategy),
+    connection.getAccountInfo(wsol, "confirmed"),
+  ]);
+  const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }));
+  const createdAtas = new Set();
+  for (const ix of [...swap.instructions, ...lp.instructions]) {
+    if (ix.programId.equals(ComputeBudgetProgram.programId)) continue;
+    if (ix.programId.equals(TOKEN_PROGRAM_ID) && ix.data[0] === 9 && ix.keys[0].pubkey.equals(wsol)) continue;
+    if (ix.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID)) {
+      const ata = ix.keys[1].pubkey.toString();
+      if (createdAtas.has(ata)) continue;
+      createdAtas.add(ata);
+      // A new wSOL account must be ours to close. Reject a concurrent creation.
+      if (!existingWsol && ata === wsol.toString()) ix.data = Buffer.alloc(0);
+    }
+    tx.add(ix);
+  }
+  if (!existingWsol) {
+    if (!createdAtas.has(wsol.toString())) throw Error("Wrapped SOL account changed during entry build");
+    tx.add(createCloseAccountInstruction(wsol, owner, owner));
+  }
+  return { tx, amountX: Number(x.toString()) / 10 ** pool.tokenX.mint.decimals, amountY: solLamports / 1e9 };
+}
+
+export async function simulateEntryPosition({ poolAddress, binsBelow, binsAbove = 0, capital, shape = config.strategy.strategy }, rpc = readRpc) {
   const owner = config.standalone.walletAddress ? new PublicKey(config.standalone.walletAddress) : getWallet().publicKey;
   const { DLMM, StrategyType } = await getDLMM();
   const strategy = { spot: StrategyType.Spot, curve: StrategyType.Curve, bid_ask: StrategyType.BidAsk }[shape];
-  if (strategy == null || !(capital > 0) || !Number.isSafeInteger(binsBelow) || binsBelow < 1 || binsBelow > 69) {
+  if (strategy == null || !(capital > 0) || !Number.isSafeInteger(binsBelow) || binsBelow < 1 ||
+      !Number.isSafeInteger(binsAbove) || binsAbove < 0 || binsBelow + binsAbove > 69) {
     throw Error("Unsupported preflight plan");
   }
-  return readRpc("monitor", async connection => {
+  return rpc("monitor", async connection => {
     const pool = await DLMM.create(connection, new PublicKey(poolAddress));
     if (pool.lbPair.tokenYMint.toString() !== config.tokens.SOL) return { err: "Pool quote asset is not SOL" };
     const active = await pool.getActiveBin();
     const lower = active.binId - binsBelow;
-    await assertRangeDoesNotRequireBinArrayInitialization(pool, lower, active.binId, connection);
-    const tx = await buildPosition(pool, owner, Keypair.generate().publicKey, new BN(0),
-      new BN(Math.floor(capital * 1e9)), lower, active.binId, strategy);
+    const upper = active.binId + binsAbove;
+    await assertRangeDoesNotRequireBinArrayInitialization(pool, lower, upper, connection);
+    const position = Keypair.generate().publicKey;
+    const tx = binsAbove > 0
+      ? (await buildDualSidePosition(connection, pool, owner, position, active, capital, lower, upper, strategy)).tx
+      : await buildPosition(pool, owner, position, new BN(0), new BN(Math.floor(capital * 1e9)), lower, upper, strategy);
     const { blockhash } = await connection.getLatestBlockhash("confirmed");
     return simulateLegacy(connection, tx, owner, blockhash);
   });
@@ -279,6 +343,7 @@ export async function deployPosition({
   entry_volume,
   entry_holders,
   x_ratio_mult,
+  entry_split_50_50 = false,
   before_submit,
   on_prepared,
   expected_active_bin,
@@ -302,7 +367,7 @@ export async function deployPosition({
   }
 
   const { StrategyType, getBinIdFromPrice, getPriceOfBinByBinId } = await getDLMM();
-  const pool = await getPool(pool_address);
+  const pool = await getPool(pool_address, { fresh: entry_split_50_50 });
   const baseMint = pool.lbPair.tokenXMint.toString();
   if (pool.lbPair.tokenYMint.toString() !== config.tokens.SOL) throw new Error("Execution requires SOL as token Y");
   if (isBaseMintOnCooldown(baseMint)) {
@@ -373,6 +438,10 @@ export async function deployPosition({
   }
   const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
   const totalBins = activeBinsBelow + activeBinsAbove;
+  if (entry_split_50_50 && (finalAmountY <= 0 || finalAmountX !== 0 ||
+      activeBinsBelow < minBinsBelow || activeBinsAbove < 1 || totalBins > 69)) {
+    throw Error("50/50 entry requires a SOL budget and an atomic two-sided range");
+  }
   if (totalBins < minBinsBelow) {
     throw new Error(
       `Invalid deploy range: total bins ${totalBins} is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
@@ -392,6 +461,7 @@ export async function deployPosition({
         amount_x: finalAmountX,
         amount_y: finalAmountY,
         wide_range: totalBins > 69,
+        ...(entry_split_50_50 && { entry_split_50_50 }),
       },
       message: "DRY RUN — no transaction sent",
     };
@@ -435,7 +505,7 @@ export async function deployPosition({
 
   try {
     // Auto-swap proportional SOL -> Token X when deploying dual-sided (activeBinsAbove > 0) with only SOL provided
-    if (activeBinsAbove > 0 && finalAmountX <= 0 && finalAmountY > 0) {
+    if (!entry_split_50_50 && activeBinsAbove > 0 && finalAmountX <= 0 && finalAmountY > 0) {
       const initialTotalBins = activeBinsBelow + activeBinsAbove;
       const rawRatio = activeBinsAbove / initialTotalBins;
       const customMult = Number.isFinite(Number(x_ratio_mult))
@@ -564,8 +634,15 @@ export async function deployPosition({
       }
     } else {
       // ── Standard Path (≤69 bins) ─────────────────────────────────
-      const tx = await buildPosition(pool, wallet.publicKey, newPosition.publicKey,
-        totalXLamports, totalYLamports, minBinId, maxBinId, strategyType);
+      let tx;
+      if (entry_split_50_50) {
+        const built = await buildDualSidePosition(getConnection(), pool, wallet.publicKey, newPosition.publicKey,
+          activeBin, totalDeploySol, minBinId, maxBinId, strategyType);
+        ({ tx, amountX: finalAmountX, amountY: finalAmountY } = built);
+      } else {
+        tx = await buildPosition(pool, wallet.publicKey, newPosition.publicKey,
+          totalXLamports, totalYLamports, minBinId, maxBinId, strategyType);
+      }
       await before_submit?.();
       const txHash = await sendPositionWrite(getConnection(), tx, [wallet, newPosition], newPosition.publicKey.toString(), "entry",
         undefined, assert_entry_active);
@@ -649,6 +726,7 @@ export async function deployPosition({
       wide_range: isWideRange,
       amount_x: finalAmountX,
       amount_y: finalAmountY,
+      ...(entry_split_50_50 && { entry_split_50_50 }),
       txs: allDeployTxs,
     };
   } catch (error) {

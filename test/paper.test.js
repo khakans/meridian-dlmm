@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Keypair, SystemProgram, Transaction } from '@solana/web3.js';
 import { config } from '../config.js';
-import { mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMirrorPosition, prepareShapeTrials, startPaper } from '../standalone/paper.js';
+import { entryRange, mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMirrorPosition, prepareShapeTrials, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
 import { longRunLines, paperPnlLines, paperRealizedLine, shapeTrialLines, summarizePaper, tokenRunnerLines } from '../standalone/pnl-summary.js';
 import { chooseEntryShape, resolveEntryShape, scoreShadowScreen, shapeLabel } from '../standalone/entry-plans.js';
@@ -407,6 +407,29 @@ test('wallet reconciliation batches backfill and filters unrelated live logs', a
   callbacks[0]({ signature: 'unrelated', logs: ['Program other invoke [1]'] }, { slot: 2 });
   callbacks[0]({ signature: 'lp', logs: [`Program ${DLMM_PROGRAM} invoke [1]`] }, { slot: 2 });
   assert.deepEqual(Object.values(data.pending).map(p => p.signature), ['lp']);
+});
+
+test('two-sided mirror keeps both halves in the LP across all three shapes', () => {
+  const { binsBelow, binsAbove } = entryRange(55, 35, true);
+  assert.deepEqual([binsBelow, binsAbove], [35, 20]);
+  assert.deepEqual(entryRange(55, 35, false), { binsBelow: 55, binsAbove: 0 });
+  const empty = { supply: 0n, xAmount: 0n, yAmount: 0n, pricePerToken: 1,
+    feeAmountXPerTokenStored: 0n, feeAmountYPerTokenStored: 0n };
+  const bins = new Map(Array.from({ length: binsBelow + binsAbove + 1 }, (_, i) => [i - binsBelow, empty]));
+  bins.set(0, { ...empty, supply: 1_000_000_000n, yAmount: 1_000_000_000n });
+  const input = { source: 'discovery', mint: 'mint', pool: 'pool', shape: 'spot',
+    capital: 0.2, decimals: 6, binStep: 100, binsBelow, binsAbove, entry: { binId: 0, price: 1, bins },
+    dualSide: { rawX: '97001', solLamports: 100_000_000 } };
+  const model = prepareMirrorPosition(input);
+  for (const trial of prepareShapeTrials(input, model)) {
+    assert.equal(trial.binSeed.reduce((n, seed) => n + BigInt(seed.x), 0n), 97001n);
+    assert.equal(trial.binSeed.reduce((n, seed) => n + BigInt(seed.y), 0n), 100_000_000n);
+    assert.ok(trial.binSeed.every(seed => seed.id <= 0 ? seed.x === '0' : seed.y === '0'));
+    const inventory = markPaperBins(trial, 0, bins);
+    assert.equal(inventory.sol, 0.1);
+    assert.equal(inventory.tokens, 0.097001);
+    assert.equal(markPaperBins(trial, 2, bins), null);
+  }
 });
 
 test('mirror uses the planned on-chain range and replay yields the same confirmed exits', () => {

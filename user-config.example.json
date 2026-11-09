@@ -52,6 +52,7 @@
   "paperMinExitRatio": 0.9,
   "lifecycleReportMinutes": 0,
   "minBinsBelow": 35,
+  "dualSidedEntry": false,
   "maxBinsBelow": 69,
   "defaultBinsBelow": 69,
   "timeframe": "5m",

@@ -3,27 +3,41 @@ import { isActivePaperVariant } from './entry-plans.js';
 const Q = 1n << 64n;
 const integer = value => BigInt(value.toString());
 
-export function seedPaperBins(position, bins) {
-  const { lower, upper, shape, capital, decimals } = position;
+export function seedPaperBins(position, bins, dualSide) {
+  const { lower, upper, shape, capital, decimals, entryBin, ratio } = position;
   const ids = Array.from({ length: upper - lower + 1 }, (_, i) => lower + i);
-  const weights = ids.map(id => shape === 'spot' ? 1 : shape === 'curve' ? id - lower + 1 : upper - id + 1);
-  const total = weights.reduce((a, b) => a + b, 0);
+  const solUpper = dualSide ? entryBin : upper;
+  const solWeights = ids.map(id => id > solUpper ? 0 :
+    shape === 'spot' ? 1 : shape === 'curve' ? id - lower + 1 : solUpper - id + 1);
+  const tokenWeights = dualSide ? ids.map(id => id <= entryBin ? 0 :
+    (shape === 'spot' ? 1 : shape === 'curve' ? upper - id + 1 : id - entryBin) / ratio ** (id - entryBin)) : [];
+  const solWeight = solWeights.reduce((a, b) => a + b, 0);
+  const tokenWeight = tokenWeights.reduce((a, b) => a + b, 0);
+  const solLamports = dualSide?.solLamports ?? capital * 1e9;
+  const rawX = BigInt(dualSide?.rawX ?? 0);
+  let assignedX = 0n, assignedY = 0n;
   return ids.map((id, i) => {
     const bin = bins.get(id);
     if (!bin) throw Error('Missing entry bin');
-    const y = BigInt(Math.floor(capital * 1e9 * weights[i] / total));
+    const y = dualSide && id === solUpper ? BigInt(solLamports) - assignedY :
+      BigInt(Math.floor(solLamports * solWeights[i] / solWeight));
+    const x = !dualSide ? 0n : id === upper ? rawX - assignedX :
+      rawX * BigInt(Math.floor(tokenWeights[i] / tokenWeight * 1e12)) / 1_000_000_000_000n;
+    assignedX += x;
+    assignedY += y;
     const supply = integer(bin.supply);
-    const xValue = BigInt(Math.floor(Number(bin.xAmount) / 10 ** decimals * Number(bin.pricePerToken) * 1e9));
-    const liquidity = integer(bin.yAmount) + xValue;
+    const solValue = amount => BigInt(Math.floor(Number(amount) / 10 ** decimals * Number(bin.pricePerToken) * 1e9));
+    const liquidity = integer(bin.yAmount) + solValue(bin.xAmount);
     if (supply > 0n && liquidity <= 0n) throw Error('Invalid bin liquidity');
-    const share = supply === 0n ? y * Q : y * supply / liquidity;
-    return { id, y: String(y), share: String(share),
+    const value = y + (x > 0n ? solValue(x) : 0n);
+    const share = supply === 0n ? value * Q : value * supply / liquidity;
+    return { id, y: String(y), ...(dualSide && { x: String(x) }), share: String(share),
       feeX: String(bin.feeAmountXPerTokenStored), feeY: String(bin.feeAmountYPerTokenStored) };
   });
 }
 
 // Counterfactual position against observed on-chain reserves and cumulative LP fee growth.
-// A bin with no observed supply below the active price has no defensible inventory mark.
+// An empty bin can keep its initial inventory until price crosses it.
 export function markPaperBins(position, activeBin, bins) {
   let x = 0n, y = 0n, feeX = 0n, feeY = 0n;
   for (const seed of position.binSeed) {
@@ -35,8 +49,11 @@ export function markPaperBins(position, activeBin, bins) {
     const dy = integer(bin.feeAmountYPerTokenStored) - BigInt(seed.feeY);
     if (dx < 0n || dy < 0n) return null;
     if (supply === 0n) {
-      if (seed.id >= activeBin) return null;
-      y += BigInt(seed.y);
+      const initialX = BigInt(seed.x ?? 0);
+      const initialY = BigInt(seed.y);
+      if (seed.id < activeBin && initialX === 0n) y += initialY;
+      else if (seed.id > activeBin && initialY === 0n && seed.x != null) x += initialX;
+      else return null;
       continue;
     }
     x += share * integer(bin.xAmount) / supply;
