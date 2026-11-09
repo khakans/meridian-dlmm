@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { createSlackConsole } from "../standalone/slack-admin.js";
 import { _test } from "../standalone/telegram-admin.js";
+import { config } from "../config.js";
 import { notifyClose, notifyDeploy, notifySwap, sendNotification, setNotificationMirror } from "../telegram.js";
 import { repoPath } from "../repo-root.js";
 import { slackMessageBlocks } from "../slack-notify.js";
@@ -223,6 +224,23 @@ test("Slack owner DM reuses every admin section and rejects stale, repeated and 
   assert.match(replies.at(-1).text, /kedaluwarsa/);
   await click(find("Tutup menu"));
   assert.equal(card, undefined);
+  const previousPairMode = config.strategy.pairMode;
+  t.after(() => { config.strategy.pairMode = previousPairMode; });
+  config.strategy.pairMode = "single";
+  for (const [mode, label] of [["dual", "Dual"], ["auto", "Auto"], ["single", "Single"]]) {
+    await message("menu");
+    await click(find("Strategy"));
+    await click(find("Pair Mode"));
+    assert.match(card.text, /100% SOL/);
+    const option = find(label);
+    await click(option, { user: { id: "U2" } });
+    assert.notEqual(config.strategy.pairMode, mode);
+    await click(option);
+    assert.equal(config.strategy.pairMode, mode);
+    assert.equal(JSON.parse(files.get(repoPath("user-config.json"))).pairMode, mode);
+    assert.match(replies.at(-1).text, new RegExp(`Pair Mode → ${label}`));
+    assert.equal(card, undefined);
+  }
   assert.ok(!JSON.stringify(replies).includes("SECRET_SENTINEL"));
   slack.stop();
 });

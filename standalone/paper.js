@@ -12,7 +12,7 @@ import { applyHoldCheck, holdEvidence, observeHold, updateLongRun } from './pape
 const MINUTE = 60_000;
 const COST_SOL = 0.001; // Estimated round-trip network cost, excluding refundable rent.
 
-export function entryRange(width, minimum = config.strategy.minBinsBelow, dual = config.strategy.dualSidedEntry) {
+export function entryRange(width, minimum = config.strategy.minBinsBelow, dual = false) {
   if (!dual) return { binsBelow: Math.max(minimum, Math.min(width, 69)), binsAbove: 0 };
   const binsBelow = Math.max(minimum, Math.ceil(Math.min(width, 69) / 2));
   const binsAbove = Math.max(0, Math.min(69 - binsBelow, Math.max(12, width - binsBelow)));
@@ -66,11 +66,11 @@ export async function validateExitQuote({ mint, pool, decimals, binStep, binsBel
   return { ...active, bins, exitRatio: quote / mark };
 }
 
-export function prepareMirrorPosition({ source, mint, pool, pair, decimals, binStep, binsBelow, binsAbove = 0, capital, shape, entry, dualSide }, now = Date.now()) {
+export function prepareMirrorPosition({ source, mint, pool, pair, decimals, binStep, binsBelow, binsAbove = 0, capital, shape, entry, dualSide, pairEntry }, now = Date.now()) {
   const id = `mirror:${mint}:${now}`;
   const variant = source === 'convergence' ? 'convergence/baseline' : 'discovery/volatility/mirror';
   const costSol = config.research.mirrorRoundTripCostSol;
-  const p = { id, mint, pool, pair, decimals, capital, source, shape, variant, mirror: true, range: 'volatility', costSol,
+  const p = { id, mint, pool, pair, decimals, capital, source, shape, pairEntry, variant, mirror: true, range: 'volatility', costSol,
     lower: entry.binId - binsBelow, upper: entry.binId + binsAbove, entryBin: entry.binId, entryPrice: Number(entry.price),
     ratio: 1 + binStep / 10_000, openedAt: now, filledAt: now, rangeReached: true,
     mark: { at: now, pnl: -costSol - (dualSide?.buyCostSol ?? 0) } };
@@ -310,7 +310,7 @@ export function startPaper(store, notify, {
               closedAt: Date.now(), filledAt: p.filledAt, pnl, reason: p.exit.reason, solInventory: inventory.sol, quotedSol: proceeds,
               feeSol: inventory.feeSol, feeTokens: inventory.feeTokens, feeValueSol, costSol,
               exitRunnerId: runners.open[p.id]?.id, longRunExtensions: p.longHold?.extensions,
-              source: p.source, mirror: p.mirror, shapeMode: p.shapeMode, shapeReason: p.shapeReason,
+              source: p.source, mirror: p.mirror, shapeMode: p.shapeMode, shapeReason: p.shapeReason, pairEntry: p.pairEntry,
               rebalancePair: p.rebalancePair, rebalanceTrial: p.rebalanceTrial, rebalances: p.rebalances, screenTrial: p.screenTrial,
               ...(p.shapeTrial || p.shapeComparison ? { shapeTrial: p.shapeTrial, observedMs: p.observedMs ?? 0,
                 inRangeMs: p.inRangeMs ?? 0, drawdownPct: p.trialDrawdownPct ?? 0 } : {}),

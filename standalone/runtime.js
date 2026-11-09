@@ -15,7 +15,7 @@ import { MonitorStore, finishSignal, recentSignalCounts } from "./store.js";
 import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
-import { entryCandles, isActivePaperVariant, resolveEntryShape, scoreShadowScreen, shapeLabel } from "./entry-plans.js";
+import { chooseEntryPair, entryCandles, isActivePaperVariant, pairModeLabel, resolveEntryShape, scoreShadowScreen, shapeLabel } from "./entry-plans.js";
 import { entryRange, mirrorExitReason, prepareMirrorPosition, prepareShapeTrials, startPaper, validateExitQuote } from "./paper.js";
 import { prepareRebalanceTrial } from "./paper-rebalance.js";
 import { canEnrollLongRun, longRunSpotReady, longRunState, prepareLongHold } from "./paper-long-run.js";
@@ -79,6 +79,7 @@ async function reconcileEntries() {
         if (!getTrackedPosition(attempt.position)) trackPosition({
           position: attempt.position, pool: position.pool, pool_name: position.pair,
           strategy: attempt.strategy, shape_mode: attempt.shapeMode, shape_reason: attempt.shapeReason, amount_sol: attempt.amountSol,
+          pair_entry: attempt.pairEntry,
           bin_step: attempt.binStep, bin_range: { min: position.lower_bin, max: position.upper_bin },
         });
         attempt.status = "entered";
@@ -161,32 +162,50 @@ function startSettlementWorker() {
   }, 10_000);
 }
 
+async function resolveEntryPair(mode, pool, candles, now) {
+  const active = mode === "auto" ? await getActiveBin({ pool_address: pool }).catch(() => null) : null;
+  return { mode, ...chooseEntryPair(mode, candles, { now, price: Number(active?.price), binStep: active?.binStep }) };
+}
+
 async function refreshPreflight() {
-  const mode = config.strategy.strategy;
-  if (preflight?.shapeMode === mode && Date.now() - preflight.at < 60_000) return preflight;
+  const { strategy: shapeMode, pairMode } = config.strategy;
+  if (preflight?.shapeMode === shapeMode && preflight.pairMode === pairMode && Date.now() - preflight.at < 60_000) return preflight;
   const sample = [store.data.preflightCandidate, ...Object.values(store.data.research ?? {})].filter(c => c && Date.now() - c.at < 300_000)
     .sort((a,b) => b.at - a.at)[0];
-  const result = { at: Date.now(), shapeMode: mode, pool: "belum ada sampel segar", quote: "belum diuji", simulation: "belum diuji" };
+  const result = { at: Date.now(), shapeMode, pairMode, pool: "belum ada sampel segar", quote: "belum diuji", simulation: "belum diuji" };
   if (sample) {
     try {
       const screened = await screenMint(sample.mint, { poolAddress: sample.pool });
       result.pool = screened.pass ? "lolos screening ulang" : screened.reason;
       if (screened.pass) {
-        const { binsBelow, binsAbove } = entryRange(computeBinsBelow(screened.pool.volatility));
-        let shape = mode === "auto" ? null : mode;
+        const now = Math.floor(Date.now() / 1000);
+        const candles = pairMode === "auto" || shapeMode === "auto" ? await entryCandles(sample.pool, now) ?? [] : [];
+        const pair = await resolveEntryPair(pairMode, sample.pool, candles, now);
+        const dual = pair.side === "dual";
+        const { binsBelow, binsAbove } = entryRange(computeBinsBelow(screened.pool.volatility), config.strategy.minBinsBelow, dual);
+        if (!pair.side || (dual && !binsAbove)) {
+          result.simulation = `Pair Mode skip: ${pair.side ? "range atas tidak tersedia" : pair.reason}`;
+          return preflight = result;
+        }
+        let shape;
         try {
           const entry = await validateExitQuote({ mint: sample.mint, pool: sample.pool, decimals: screened.decimals,
-            binStep: Number(screened.pool.dlmm_params?.bin_step), binsBelow,
+            binStep: Number(screened.pool.dlmm_params?.bin_step), binsBelow, binsAbove,
             capital: config.risk.maxDeployAmount });
+          if (chooseEntryPair(pairMode, candles, { now, price: Number(entry.price), binStep: entry.binStep }).side !== pair.side) {
+            result.simulation = "Pair Mode skip: kondisi berubah sebelum simulasi";
+            return preflight = result;
+          }
           result.quote = "lolos ukuran maksimum";
-          const plan = await resolveEntryShape(mode, screened.pool, binsBelow, entry);
+          const plan = await resolveEntryShape(shapeMode, screened.pool, binsBelow, entry, { candles, now });
           shape = plan.shape;
           if (!shape) result.simulation = `Auto Shape skip: ${plan.reason}`;
         } catch { result.quote = "tidak lolos atau provider gagal"; }
         try {
           if (shape) {
             const sim = await simulateEntryPosition({ poolAddress: sample.pool, binsBelow, binsAbove, capital: config.risk.maxDeployAmount, shape });
-            result.simulation = sim.err ? `RPC menolak ${JSON.stringify(sim.err).slice(0, 120)}` : `${shape} · lolos tanpa broadcast`;
+            result.simulation = sim.err ? `RPC menolak ${JSON.stringify(sim.err).slice(0, 120)}`
+              : `${pairModeLabel(pairMode, pair.side)} · ${shape} · lolos tanpa broadcast`;
           }
         } catch { result.simulation = "build atau RPC belum tersedia"; }
       }
@@ -318,8 +337,15 @@ async function attemptEntry(signal) {
   if (risk) return risk;
 
   const pool = screened.pool;
-  let { binsBelow, binsAbove } = entryRange(computeBinsBelow(pool.volatility));
-  if (config.strategy.dualSidedEntry && binsAbove < 1) return "50/50 range has no room above active bin";
+  const { strategy: shapeMode, pairMode } = config.strategy;
+  const candleTime = Math.floor(Date.now() / 1000);
+  const candles = shadow || pairMode === "auto" || shapeMode === "auto"
+    ? await entryCandles(pool.pool_address, candleTime) ?? [] : [];
+  const pairEntry = await resolveEntryPair(pairMode, pool.pool_address, candles, candleTime);
+  if (!pairEntry.side) return `Pair Mode: ${pairEntry.reason}`;
+  const dual = pairEntry.side === "dual";
+  let { binsBelow, binsAbove } = entryRange(computeBinsBelow(pool.volatility), config.strategy.minBinsBelow, dual);
+  if (dual && binsAbove < 1) return "50/50 range has no room above active bin";
 
   // Chronos AI Pre-Deploy Gate & Dynamic Bin Calibration (InstaBox 5-Node Cluster + Fallback)
   const chronos = await analyzePoolWithChronos(pool.pool_address, {
@@ -337,7 +363,7 @@ async function attemptEntry(signal) {
       return `chronos gate: ${chronos.gate.reason}`;
     }
     if (chronos.recommended_bins?.bins_below > 0) {
-      if (config.strategy.dualSidedEntry) {
+      if (dual) {
         binsBelow = Math.min(69 - Math.min(binsAbove, 12), Math.max(binsBelow, chronos.recommended_bins.bins_below));
         binsAbove = Math.min(binsAbove, 69 - binsBelow);
       } else {
@@ -367,15 +393,15 @@ async function attemptEntry(signal) {
       binStep: Number(pool.dlmm_params?.bin_step), binsBelow, binsAbove, capital: amountY, verifyRange: true,
     });
   } catch { return "exit quote or entry range unavailable"; }
-  const shapeMode = config.strategy.strategy;
+  const currentPair = chooseEntryPair(pairMode, candles, { now: candleTime, price: Number(entry.price), binStep: entry.binStep });
+  if (currentPair.side !== pairEntry.side) return `Pair Mode berubah saat validasi: ${currentPair.reason}`;
+  pairEntry.reason = currentPair.reason;
   const compareShapes = shadow && shapeMode === "auto" && Object.values(paper.open).filter(p => p.shapeTrial).length < 24;
-  const candleTime = Math.floor(Date.now() / 1000);
-  const candles = shadow ? await entryCandles(pool.pool_address, candleTime) : undefined;
-  const plan = await resolveEntryShape(shapeMode, pool, binsBelow, entry, { candles: shadow ? candles ?? [] : undefined, now: candleTime });
+  const plan = await resolveEntryShape(shapeMode, pool, binsBelow, entry, { candles, now: candleTime });
   if (!plan.shape) return `Auto Shape: ${plan.reason}`;
   const modelInput = { source, mint, pool: pool.pool_address, pair: pool.name,
-    decimals: screened.decimals, binStep: entry.binStep, binsBelow, binsAbove, capital: amountY, shape: plan.shape, entry };
-  if (shadow && binsAbove > 0) {
+    decimals: screened.decimals, binStep: entry.binStep, binsBelow, binsAbove, capital: amountY, shape: plan.shape, entry, pairEntry };
+  if (shadow && dual) {
     try { modelInput.dualSide = await quoteDualSideEntry(pool.pool_address, amountY, entry.binId); }
     catch (error) { return `50/50 buy quote unavailable: ${error.message}`; }
   }
@@ -439,7 +465,7 @@ async function attemptEntry(signal) {
       runners.open[entrySpot.id] = entrySpot;
     }
     store.data.attempts[mint] = { at: Date.now(), mint, pool: pool.pool_address, source, status: "entered", amountSol: amountY,
-      strategy: plan.shape, shapeMode, shapeReason: plan.reason };
+      strategy: plan.shape, shapeMode, shapeReason: plan.reason, pairEntry };
     finishSignal(store, signal, "entered");
     return null;
   }
@@ -448,7 +474,7 @@ async function attemptEntry(signal) {
   store.data.attempts[mint] = {
     at: Date.now(), mint, pool: pool.pool_address, source, wallets: signal.events.map(e => e.wallet),
     status: "submitting", failures: attempt?.failures ?? 0, position: null, txs: [],
-    amountSol: amountY, strategy: plan.shape, shapeMode, shapeReason: plan.reason, binStep: entry.binStep, journalVersion: 1,
+    amountSol: amountY, strategy: plan.shape, shapeMode, shapeReason: plan.reason, pairEntry, binStep: entry.binStep, journalVersion: 1,
   };
   store.save();
 
@@ -465,7 +491,8 @@ async function attemptEntry(signal) {
     amount_y: amountY,
     bins_below: binsBelow,
     bins_above: binsAbove,
-    entry_split_50_50: binsAbove > 0,
+    entry_split_50_50: dual,
+    pair_entry: pairEntry,
     expected_active_bin: entry.binId,
     strategy: plan.shape,
     shape_mode: shapeMode,
@@ -502,7 +529,7 @@ async function attemptEntry(signal) {
     finishSignal(store, signal, record.status === "proposed" ? "shadow proposal recorded" : "entered");
     const label = result.dry_run ? "[SHADOW] Would deploy" : "Deployed";
     log("entry", `${label} ${amountY} SOL → pool ${pool.pool_address.slice(0, 8)} mint ${mint.slice(0, 8)} (${binsBelow} bins below, ${source}, ${plan.shape}: ${plan.reason})`);
-    void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.pool_address.slice(0, 8)} (mint ${mint.slice(0, 8)}, ${signal.events.length} wallets)\nShape ${shapeLabel(plan.shape, shapeMode)}${shapeMode === "auto" ? ` · ${plan.reason}` : ""}`);
+    void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.pool_address.slice(0, 8)} (mint ${mint.slice(0, 8)}, ${signal.events.length} wallets)\nPair Mode ${pairModeLabel(pairMode, pairEntry.side)}${pairMode === "auto" ? ` · ${pairEntry.reason}` : ""}\nShape ${shapeLabel(plan.shape, shapeMode)}${shapeMode === "auto" ? ` · ${plan.reason}` : ""}`);
     return null;
   }
 
@@ -737,7 +764,10 @@ async function lifecycleStatusLines(detailed = false) {
       const tracked = getTrackedPosition(p.position);
       const attempt = Object.values(store.data.attempts).find(row => row.position === p.position);
       const shape = shapeLabel(tracked?.strategy ?? attempt?.strategy, tracked?.shape_mode ?? attempt?.shapeMode);
-      lines.push(`• ${String(p.pair || p.position).replace(/[<>&\r\n]/g, " ").slice(0, 80)} · ${pct} · ${range}${shape ? ` · ${shape}` : ""}`);
+      const entry = tracked?.pair_entry ?? attempt?.pairEntry;
+      const pairMode = pairModeLabel(entry?.mode, entry?.side);
+      lines.push([`• ${String(p.pair || p.position).replace(/[<>&\r\n]/g, " ").slice(0, 80)}`, pct, range, shape,
+        pairMode && `Pair ${pairMode}`].filter(Boolean).join(" · "));
     }
     if (book.positions.length > 10) lines.push(`+${book.positions.length - 10} posisi lainnya`);
   }
@@ -747,7 +777,7 @@ async function lifecycleStatusLines(detailed = false) {
   const now = Date.now();
   const resetAt = store.data.pnlResetAt?.[store.database.mode] ?? 0;
   const from = Math.max(now - 86_400_000, resetAt);
-  lines.push(`Mode shape · ${shapeLabel(config.strategy.strategy) ?? "—"}`);
+  lines.push(`Pair Mode ${pairModeLabel(config.strategy.pairMode)} · Shape ${shapeLabel(config.strategy.strategy) ?? "—"}`);
   if (config.standalone.shadow) {
     const paper = store.data.paper;
     const mirror = { open: Object.fromEntries(Object.entries(paper?.open ?? {}).filter(([, p]) => p.mirror)),
@@ -756,7 +786,8 @@ async function lifecycleStatusLines(detailed = false) {
     lines.push(paperRealizedLine(summarizePaper(paper, from, now), "All varian eksperimen + Mirror"));
     for (const p of Object.values(mirror.open).slice(0, 8)) {
       const shape = shapeLabel(p.shape, p.shapeMode);
-      if (shape) lines.push(`• ${p.pair ?? p.mint.slice(0, 8)} · ${shape}`);
+      const pairMode = pairModeLabel(p.pairEntry?.mode, p.pairEntry?.side);
+      if (shape) lines.push(`• ${p.pair ?? p.mint.slice(0, 8)} · ${shape}${pairMode ? ` · Pair ${pairMode}` : ""}`);
     }
     const trialFrom = Math.max(now - 30 * 86_400_000, resetAt);
     if (detailed) lines.push(...shapeTrialLines(paper?.closed, trialFrom));

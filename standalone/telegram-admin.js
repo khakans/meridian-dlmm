@@ -9,10 +9,11 @@
 import fs from "node:fs";
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
-import { config, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { config, ENTRY_PAIR_MODES, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import { repoPath } from "../repo-root.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets } from "../smart-wallets.js";
+import { pairModeLabel } from "./entry-plans.js";
 import { sendMessage, sendMenu, editMenu, answerCallbackQuery, setBotCommands, startAdminPolling } from "../telegram.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
@@ -79,8 +80,9 @@ const SECTIONS = [
     ],
   },
   {
-    id: "strategy", title: "📐 Strategy", desc: "Position shape & bin range",
+    id: "strategy", title: "📐 Strategy", desc: "Pair mode, shape & bin range",
     settings: [
+      { k: "pairMode", path: ["strategy", "pairMode"], type: "enum", options: ENTRY_PAIR_MODES, label: "Pair Mode" },
       { k: "strategy", path: ["strategy", "strategy"], type: "enum", options: ["auto", "spot", "curve", "bid_ask"], label: "shape" },
       { k: "autoRebalance", path: ["strategy", "autoRebalance"], type: "bool", label: "Auto Rebalance (Shadow)" },
       { k: "minBinsBelow", path: ["strategy", "minBinsBelow"], type: "int", min: MIN_SAFE_BINS_BELOW, max: 200, unit: "bins" },
@@ -218,6 +220,7 @@ function applySetting(setting, value) {
 
 function fmtValue(setting, slack = false) {
   const v = currentValue(setting);
+  if (setting.k === "pairMode") return pairModeLabel(v);
   if (setting.type === "bool") return v ? "ON" : "OFF";
   if (setting.type === "env" && setting.kind === "secret") return v ? "set ✓" : "not set";
   if (slack && setting.kind === "url" && v) {
@@ -267,8 +270,7 @@ function sectionMenu(section, slack = false) {
   }]);
   const explainers = {
     strategy:
-      "Range: bins below the active bin scale with pool volatility, clamped to min–max (bins above = 0). " +
-      "Shape: auto reads the pair before entry. Manual options are spot, curve, and bid_ask. Applies to new entries immediately.",
+      "Pair Mode selects the assets and range. Shape sets the liquidity distribution. Changes apply to new entries.",
     rpc: "Endpoints live in .env — edit, then ♻️ Restart.",
   };
   return {
@@ -508,10 +510,18 @@ export function createAdminConsole(transport, {
       }
       if (data.startsWith("t:")) {
         const setting = byKey.get(data.slice(2));
-        if (!setting) return;
+        if (setting?.type !== "bool") return;
         const needs = applySetting(setting, !currentValue(setting));
         const result = slack ? `${setting.label ?? setting.k} → ${fmtValue(setting, slack)}` : "Saved";
         return void await finish(`✅ ${result}${needs ? " — ♻️ restart to apply" : ""}`, SECTIONS.find(s => s.settings.includes(setting))?.id);
+      }
+      if (data.startsWith("pm:")) {
+        const value = data.slice(3);
+        if (pending?.kind !== "set" || pending.setting.k !== "pairMode" || !ENTRY_PAIR_MODES.includes(value)) return;
+        const setting = pending.setting;
+        pending = null;
+        applySetting(setting, value);
+        return void await finish(`✅ Pair Mode → ${pairModeLabel(value)}`, "strategy");
       }
       if (slack && (data.startsWith("k:imp") || data.startsWith("k:exp"))) {
         return void await finish("Manage the signing key in the server .env. Restart to load a new key.");
@@ -523,6 +533,13 @@ export function createAdminConsole(transport, {
           return void await finish("Update this API key in the server .env and restart.");
         }
         pending = { kind: "set", setting };
+        if (setting.k === "pairMode") {
+          return void await render(
+            `<b>Pair Mode · ${fmtValue(setting)}</b>\nSingle · 100% SOL\nDual · 50% SOL + 50% token\nAuto · pilih sesuai kondisi pasar atau skip`,
+            [ENTRY_PAIR_MODES.map(mode => ({ text: pairModeLabel(mode), callback_data: `pm:${mode}` })),
+              [{ text: "← Back", callback_data: "s:strategy" }]],
+          );
+        }
         return void await render(`✏️ <b>${setting.label ?? setting.k}</b>\nCurrent: <code>${fmtValue(setting, slack)}</code>\n\n${editHint(setting)}`, cancelKB());
       }
       if (data === "w:add") {

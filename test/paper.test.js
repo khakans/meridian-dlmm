@@ -8,7 +8,7 @@ import { config } from '../config.js';
 import { entryRange, mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMirrorPosition, prepareShapeTrials, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
 import { longRunLines, paperPnlLines, paperRealizedLine, shapeTrialLines, summarizePaper, tokenRunnerLines } from '../standalone/pnl-summary.js';
-import { chooseEntryShape, resolveEntryShape, scoreShadowScreen, shapeLabel } from '../standalone/entry-plans.js';
+import { chooseEntryPair, chooseEntryShape, pairModeLabel, resolveEntryShape, scoreShadowScreen, shapeLabel } from '../standalone/entry-plans.js';
 import { assessRebalance, prepareRebalanceTrial, rebalanceDue, REBALANCE_CHECK_MS } from '../standalone/paper-rebalance.js';
 import { prepareEntrySpot, prepareTokenRunner, sampleTokenRunner } from '../standalone/paper-token-runner.js';
 import { applyHoldCheck, canEnrollLongRun, holdEvidence, longRunSpotReady, longRunState, observeHold, prepareLongHold, updateLongRun } from '../standalone/paper-long-run.js';
@@ -188,6 +188,34 @@ test('auto shape distinguishes calm, wide, mixed and unsafe pair conditions', as
   assert.equal(chooseEntryShape(wide.slice(1), options).shape, null);
   assert.equal(chooseEntryShape(wide, { ...options, exitRatio: 0.96 }).shape, null);
   assert.deepEqual(await resolveEntryShape('spot'), { shape: 'spot', reason: 'manual' });
+});
+
+test('Pair Mode picks each funded side, rejects unsafe Auto signals and preserves the manual routes', () => {
+  const now = 1_794_200_400;
+  const price = bin => 1.01 ** bin;
+  const candles = (values, volume = 1000) => values.map((bin, i) => {
+    const open = price(values[i - 1] ?? 0), close = price(bin);
+    return { timestamp: now - (6 - i) * 300, open, close,
+      high: Math.max(open, close) * 1.001, low: Math.min(open, close) / 1.001,
+      volume: i < 3 ? 1000 : volume };
+  });
+  const plan = (data, bin = 0, time = now) => chooseEntryPair('auto', data, { now: time, price: price(bin), binStep: 100 });
+  const calm = candles([1, 0, 1, 0, 1, 0]);
+  const dual = plan(calm);
+  const single = plan(candles([4, 0, 5, 1, 5, 3]), 3);
+  assert.equal(dual.side, 'dual');
+  assert.equal(single.side, 'single');
+  assert.equal(pairModeLabel('auto', dual.side), 'Auto (Dual)');
+  assert.deepEqual(entryRange(55, 35, dual.side === 'dual'), { binsBelow: 35, binsAbove: 20 });
+  assert.deepEqual(entryRange(55, 35, single.side === 'dual'), { binsBelow: 55, binsAbove: 0 });
+  assert.match(plan(calm, -2).reason, /menembus support/);
+  assert.match(plan(candles([0, -1, -2, -4, -6, -8]), -8).reason, /turun tajam/);
+  assert.match(plan(candles([1, 0, 1, 0, 1, 0], 10)).reason, /volume/);
+  for (const incomplete of [plan(calm.slice(1)), plan(calm, 0, now + 900), plan(null)]) {
+    assert.equal(incomplete.side, null);
+  }
+  assert.deepEqual(chooseEntryPair('single'), { side: 'single', reason: 'manual' });
+  assert.deepEqual(chooseEntryPair('dual'), { side: 'dual', reason: 'manual' });
 });
 
 test('auto rebalance needs three checks, sufficient observed fees and a 30 minute cooldown', () => {
@@ -419,9 +447,11 @@ test('two-sided mirror keeps both halves in the LP across all three shapes', () 
   bins.set(0, { ...empty, supply: 1_000_000_000n, yAmount: 1_000_000_000n });
   const input = { source: 'discovery', mint: 'mint', pool: 'pool', shape: 'spot',
     capital: 0.2, decimals: 6, binStep: 100, binsBelow, binsAbove, entry: { binId: 0, price: 1, bins },
+    pairEntry: { mode: 'auto', side: 'dual', reason: 'fixture' },
     dualSide: { rawX: '97001', solLamports: 100_000_000 } };
   const model = prepareMirrorPosition(input);
   for (const trial of prepareShapeTrials(input, model)) {
+    assert.deepEqual(trial.pairEntry, input.pairEntry);
     assert.equal(trial.binSeed.reduce((n, seed) => n + BigInt(seed.x), 0n), 97001n);
     assert.equal(trial.binSeed.reduce((n, seed) => n + BigInt(seed.y), 0n), 100_000_000n);
     assert.ok(trial.binSeed.every(seed => seed.id <= 0 ? seed.x === '0' : seed.y === '0'));

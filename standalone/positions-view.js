@@ -1,4 +1,4 @@
-import { isActivePaperVariant, shapeLabel } from './entry-plans.js';
+import { isActivePaperVariant, pairModeLabel, shapeLabel } from './entry-plans.js';
 import { positionSnapshot } from './events.js';
 import { POSITION_INDEX_GRACE_MS } from '../state.js';
 
@@ -106,6 +106,8 @@ function paperLines(p, tab, now, research) {
   if (p.lower != null && p.upper != null) lines.push(`Range bin ${p.lower}–${p.upper}${p.entryBin == null ? '' : ` · Entry bin ${p.entryBin}`}`);
   const shape = shapeLabel(p.shape, p.shapeMode);
   if (shape) lines.push(`Shape ${shape}${p.shapeReason ? ` · ${safe(p.shapeReason)}` : ''}`);
+  const pairMode = pairModeLabel(p.pairEntry?.mode, p.pairEntry?.side);
+  if (pairMode) lines.push(`Pair Mode ${pairMode}${p.pairEntry.mode === 'auto' ? ` · ${safe(p.pairEntry.reason)}` : ''}`);
   const reason = p.reason ?? p.exit?.reason ?? p.manualExit ?? p.hardLowerExit;
   if (reason) lines.push(`Alasan ${safe(reason)}`);
   if (p.mint) lines.push(`Mint ${safe(p.mint)}`);
@@ -145,6 +147,9 @@ function liveLines(p, tab, now, solMode, tracked, settlement) {
   const shapeReason = p.shape_reason ?? tracked?.shape_reason;
   if (capital != null) lines.push(`Modal awal ${amount(capital, 'SOL')}`);
   if (strategy) lines.push(`Shape ${strategy}${shapeReason ? ` · ${safe(shapeReason)}` : ''}`);
+  const entry = p.pair_entry ?? tracked?.pair_entry;
+  const pairMode = pairModeLabel(entry?.mode, entry?.side);
+  if (pairMode) lines.push(`Pair Mode ${pairMode}${entry.mode === 'auto' ? ` · ${safe(entry.reason)}` : ''}`);
   const mint = p.base_mint ?? p.metrics?.base_mint;
   if (mint) lines.push(`Mint ${safe(mint)}`);
   if (p.pool) lines.push(`Pool ${safe(p.pool)}`);

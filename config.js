@@ -9,6 +9,7 @@ const u = fs.existsSync(USER_CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
   : {};
 export const MIN_SAFE_BINS_BELOW = 35;
+export const ENTRY_PAIR_MODES = ["single", "dual", "auto"];
 
 function numericConfig(value) {
   const n = Number(value);
@@ -158,7 +159,7 @@ export const config = {
     strategy:     u.strategy     ?? "bid_ask",
     autoRebalance: u.autoRebalance !== false,
     minBinsBelow: strategyMinBinsBelow,
-    dualSidedEntry: u.dualSidedEntry === true,
+    pairMode: ENTRY_PAIR_MODES.includes(u.pairMode) ? u.pairMode : u.dualSidedEntry === true ? "dual" : "single",
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
     defaultBinsAbove: strategyDefaultBinsAbove,
