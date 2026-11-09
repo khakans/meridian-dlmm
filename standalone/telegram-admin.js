@@ -94,6 +94,7 @@ const SECTIONS = [
     settings: [
       { k: "stopLossPct", path: ["management", "stopLossPct"], type: "float", min: -99, max: 0, unit: "%" },
       { k: "takeProfitPct", path: ["management", "takeProfitPct"], type: "float", min: 0, max: 1000, unit: "%" },
+      { k: "paperTokenRunner", path: ["research", "paperTokenRunner"], type: "bool", label: "Sisa token (Shadow)" },
       { k: "trailingTakeProfit", path: ["management", "trailingTakeProfit"], type: "bool" },
       { k: "trailingTriggerPct", path: ["management", "trailingTriggerPct"], type: "float", min: 0.1, max: 1000, unit: "%" },
       { k: "trailingDropPct", path: ["management", "trailingDropPct"], type: "float", min: 0.1, max: 100, unit: "%" },

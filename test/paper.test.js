@@ -7,9 +7,10 @@ import { Keypair, SystemProgram, Transaction } from '@solana/web3.js';
 import { config } from '../config.js';
 import { mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMirrorPosition, prepareShapeTrials, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
-import { paperPnlLines, paperRealizedLine, shapeTrialLines, summarizePaper } from '../standalone/pnl-summary.js';
+import { paperPnlLines, paperRealizedLine, shapeTrialLines, summarizePaper, tokenRunnerLines } from '../standalone/pnl-summary.js';
 import { chooseEntryShape, resolveEntryShape, scoreShadowScreen, shapeLabel } from '../standalone/entry-plans.js';
 import { assessRebalance, prepareRebalanceTrial, rebalanceDue, REBALANCE_CHECK_MS } from '../standalone/paper-rebalance.js';
+import { prepareTokenRunner, sampleTokenRunner } from '../standalone/paper-token-runner.js';
 import { WalletMonitor } from '../standalone/monitor.js';
 import { lowerRangeStop } from '../exit-rules.js';
 import { entryCreatedTokenAccounts, settlementCashCosts, settlementComplete, tokenDelta } from '../standalone/settlement.js';
@@ -236,6 +237,72 @@ test('Shadow screening requires two completed 5 minute candles and a fee estimat
   assert.equal(scoreShadowScreen(candles, { fee_active_tvl_ratio: null }, 0.10, now).status, 'missing');
 });
 
+function risingCandles(now) {
+  const end = Math.floor(now / 300_000) * 300;
+  return [1, 1.1, 1.2, 1.3].map((close, i) => ({
+    timestamp: end - (4 - i) * 300, close, low: close * 0.98, volume: 100 + i * 10,
+  }));
+}
+
+test('Shadow token runner compares a profitable LP exit to the same-size full sell', async () => {
+  const now = 1_800_000_000_000;
+  const p = { id: 'mirror', pool: 'pool', mint: 'mint', mirror: true, exit: { reason: 'take profit' } };
+  const args = { now, raw: 1000, sol: 0.02, fullQuote: 0.10, pnl: 0.02,
+    quote: async (_mint, raw) => raw * 0.0001, candles: async () => risingCandles(now) };
+  assert.equal(await prepareTokenRunner(p, { ...args, sol: 0.11 }), null);
+  assert.equal(await prepareTokenRunner(p, { ...args, pnl: 0 }), null);
+  assert.equal(await prepareTokenRunner({ ...p, exit: { reason: 'stop loss' } }, args), null);
+  assert.equal(await prepareTokenRunner(p, { ...args, candles: async () => risingCandles(now).slice(1) }), null);
+  const row = await prepareTokenRunner(p, args);
+  assert.equal(row.raw, 180);
+  assert.ok(Math.abs(row.initialQuote - 0.018) < 1e-9);
+  const run = (r, value, at, candles = args.candles) => sampleTokenRunner(r, { now: at, quote: async () => value, candles });
+  const { next: peak } = await run(row, 0.03, now + 15_000);
+  assert.equal(peak.peak, 0.03);
+  const { closed } = await run(peak, 0.027, now + 30_000);
+  assert.equal(closed.reason, 'trailing 10%');
+  assert.ok(Math.abs(closed.deltaSol - 0.00897) < 1e-9);
+  assert.ok(Math.abs(closed.pnl - 0.02897) < 1e-9);
+
+  const outage = await run(peak, null, row.expiresAt);
+  assert.equal(outage.next.reason, 'batas waktu');
+  assert.equal(outage.alert, true);
+  assert.equal((await run(outage.next, null, row.expiresAt + 15_000)).alert, false);
+  const recovered = await run(outage.next, 0.024, row.expiresAt + 30_000);
+  assert.equal(recovered.closed.reason, 'batas waktu');
+  assert.equal(recovered.closed.quote, 0.024);
+  const structure = await run(row, 0.019, now + 300_000, async () => {
+    const next = [...risingCandles(now).slice(1), { timestamp: now / 1000, close: 1.05, low: 1.01, volume: 130 }];
+    return next;
+  });
+  assert.equal(structure.closed.reason, 'swing low 5 menit ditembus');
+  const report = tokenRunnerLines({ tokenRunners: { open: { mirror: outage.next }, closed: [closed] } }, now, row.expiresAt, true);
+  assert.match(report[0], /1 tunggu quote.*\+0\.0090 SOL vs langsung jual/);
+  assert.match(report[1], /0\.00300 SOL/);
+  assert.match(report[2], /menunggu quote.*batas waktu/);
+});
+
+test('paper lifecycle opens a token runner alongside the original LP result', async () => {
+  const now = Date.now();
+  const position = { id: 'mirror', mint: 'mint', pool: 'pool', mirror: true, decimals: 0, range: 'volatility',
+    variant: 'discovery/volatility/mirror', capital: 0.10, costSol: 0.001, binSeed: [], openedAt: now - 60_000,
+    filledAt: now - 60_000, exit: { at: now, reason: 'take profit', inventory: { sol: 0.02, tokens: 1000, feeSol: 0, feeTokens: 0 } } };
+  const paper = { open: { mirror: position }, closed: [], realized: { [position.variant]: 0 } };
+  let saved;
+  const persisted = new Promise(resolve => { saved = resolve; });
+  const stop = startPaper({ data: { paper }, save: saved }, () => {}, {
+    schedule: () => null, quote: async (_mint, raw) => raw * 0.0001, candles: async () => risingCandles(now),
+    admitResearch: false,
+  });
+  try {
+    await persisted;
+    assert.equal(paper.closed.length, 1);
+    assert.equal(paper.tokenRunners.open.mirror.raw, 180);
+    assert.equal(paper.tokenRunners.open.mirror.baselinePnl, paper.closed[0].pnl);
+    assert.equal(paper.mirrorRealized, paper.closed[0].pnl);
+  } finally { stop(); }
+});
+
 test('settlement costs include failed transaction fees and remove refunded ATA rent', () => {
   const tx = (pre, post, fee, postTokenBalances = []) => ({
     transaction: { message: { staticAccountKeys: ['wallet'] } },
@@ -367,6 +434,8 @@ test('SQLite migrates paper and live data separately and persists paper history 
     assert.equal(live.get('monitor').paper, undefined);
     assert.equal(shadow.get('performance'), null);
     assert.equal(live.get('performance').performance[0].position, 'live1');
+    state.paper.tokenRunners = { open: {}, closed: [{ id: 'paper1', closedAt: 200, pnl: 0.035, deltaSol: 0.005 }] };
+    shadow.saveMonitor(state);
     shadow.saveMonitor(state);
     shadow.saveMonitor({ ...state, paper: { closed: [] } });
     shadow.db.close();
@@ -374,6 +443,8 @@ test('SQLite migrates paper and live data separately and persists paper history 
     assert.equal(shadow.get('monitor').paper.closed.length, 0);
     assert.equal(shadow.db.prepare("SELECT count(*) AS n FROM history WHERE kind='paper-close'").get().n, 1);
     assert.equal(live.db.prepare("SELECT count(*) AS n FROM history WHERE kind='paper-close'").get().n, 0);
+    assert.deepEqual(shadow.db.prepare("SELECT pnl FROM history WHERE kind='paper-runner-close'").all().map(row => row.pnl), [0.005]);
+    assert.equal(live.db.prepare("SELECT count(*) AS n FROM history WHERE kind='paper-runner-close'").get().n, 0);
     assert.equal(shadow.db.prepare("SELECT count(*) AS n FROM history WHERE kind='pnl-reset'").get().n, 1);
     assert.equal(live.get('monitor').pnlResetAt.live, 20);
   } finally {

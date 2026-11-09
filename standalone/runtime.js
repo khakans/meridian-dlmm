@@ -23,7 +23,7 @@ import { estimateEntryOverheadSol, estimateNetExitPct, isRetryableEntryError, po
 import { readRpc } from "./rpc.js";
 import { withWalletLock } from "./transactions.js";
 import { paperDay } from "./paper-accounting.js";
-import { paperPnlLines, paperRealizedLine, rebalanceTrialLines, shapeTrialLines, signed, summarizePaper } from "./pnl-summary.js";
+import { paperPnlLines, paperRealizedLine, rebalanceTrialLines, shapeTrialLines, signed, summarizePaper, tokenRunnerLines } from "./pnl-summary.js";
 import { openPositions, positionsPage, positionTarget } from "./positions-view.js";
 import { exposureStillPresent, recoverablePositionRent } from "./events.js";
 import { getActiveBin, getMyPositions, getPositionExitInventory, simulateEntryPosition } from "../tools/dlmm.js";
@@ -714,6 +714,7 @@ async function lifecycleStatusLines(detailed = false) {
     const trialFrom = Math.max(now - 30 * 86_400_000, resetAt);
     if (detailed) lines.push(...shapeTrialLines(paper?.closed, trialFrom));
     lines.push(...rebalanceTrialLines(paper, trialFrom, detailed));
+    lines.push(...tokenRunnerLines(paper, from, now, detailed));
     const legacy = Object.values(paper?.open ?? {}).filter(p => !p.mirror && !p.shapeTrial && !p.rebalanceTrial).length;
     if (legacy) lines.push(`Eksperimen lama · ${legacy} posisi terbuka di riwayat paper`);
   }

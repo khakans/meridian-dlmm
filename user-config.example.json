@@ -39,6 +39,7 @@
   "researchMinTokenAgeHours": 0,
   "paperCapitalSol": 0.55,
   "paperSizingExperiment": false,
+  "paperTokenRunner": true,
   "paperBankrollSol": 2,
   "paperDailyLossLimitPct": 5,
   "paperDrawdownLimitPct": 15,

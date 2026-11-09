@@ -4,8 +4,9 @@ import { log } from '../logger.js';
 import { getActiveBin, getPaperBinSnapshot } from '../tools/dlmm.js';
 import { quoteTokenToSol } from '../tools/wallet.js';
 import { markPaperBins, paperRiskBlocked, recordPaperNav, seedPaperBins } from './paper-accounting.js';
-import { ENTRY_SHAPES, isActivePaperVariant } from './entry-plans.js';
+import { ENTRY_SHAPES, entryCandles, isActivePaperVariant } from './entry-plans.js';
 import { assessRebalance, rebalanceDue, REBALANCE_CHECK_MS } from './paper-rebalance.js';
+import { prepareTokenRunner, RUNNER_POLL_MS, sampleTokenRunner } from './paper-token-runner.js';
 
 const MINUTE = 60_000;
 const COST_SOL = 0.001; // Estimated round-trip network cost, excluding refundable rent.
@@ -117,12 +118,13 @@ export function mirrorExitReason(p, active, pnlPct, now) {
 
 export function startPaper(store, notify, {
   getBin = getActiveBin, snapshot = getPaperBinSnapshot, quote = quoteTokenToSol, schedule = setInterval, admitResearch = true,
-  rebalancePlan,
+  rebalancePlan, candles = entryCandles,
 } = {}) {
   const paper = store.data.paper ??= { open: {}, closed: [], skipped: 0 };
   paper.realized ??= {};
   paper.cancelled ??= [];
   paper.legacy ??= [];
+  const runners = paper.tokenRunners ??= { open: {}, closed: [] };
   for (const p of Object.values(paper.open)) {
     if (p.binSeed && p.range === 'volatility') continue;
     paper.legacy.push({ ...p, archivedAt: Date.now(), archiveReason: p.binSeed ? 'retired strategy' : 'missing entry snapshot' });
@@ -136,6 +138,7 @@ export function startPaper(store, notify, {
       const now = Date.now();
       paper.closed = paper.closed.filter(p => now - p.closedAt < 90 * 86_400_000).slice(-10_000);
       paper.cancelled = paper.cancelled.filter(p => now - p.at < 90 * 86_400_000).slice(-10_000);
+      runners.closed = runners.closed.filter(p => now - p.closedAt < 90 * 86_400_000).slice(-2000);
       const activeReads = new Map();
       const quotes = new Map();
       const readActive = pool => {
@@ -196,7 +199,9 @@ export function startPaper(store, notify, {
           const forcedExit = p.hardLowerExit ?? p.manualExit;
           if (!p.exit && forcedExit) p.exit = { at: now, reason: forcedExit, inventory };
           const tokenAmount = inventory.tokens + inventory.feeTokens;
-          const proceeds = await sellQuote(p.mint, rawTokens(tokenAmount, p.decimals));
+          const raw = rawTokens(tokenAmount, p.decimals);
+          const proceeds = await sellQuote(p.mint, raw);
+          const quotedAt = Date.now();
           if (stopped || !config.standalone.shadow) return;
           const net = inventory.sol + inventory.feeSol + proceeds - p.capital - costSol;
           const pnl = proceeds != null && Number.isFinite(net) ? net : null;
@@ -241,6 +246,16 @@ export function startPaper(store, notify, {
             paper.realized[p.variant] -= costSol;
             delete paper.open[p.id];
           } else if (p.exit && pnl != null) {
+            const activeRunners = Object.values(runners.open);
+            if (config.research.paperTokenRunner && p.mirror && activeRunners.length < 4 &&
+                !activeRunners.some(runner => runner.mint === p.mint)) {
+              const runner = await prepareTokenRunner(p, { raw, sol: inventory.sol + inventory.feeSol,
+                fullQuote: proceeds, pnl, now: quotedAt, quote: sellQuote, candles }).catch(() => null);
+              if (stopped || !config.standalone.shadow) return;
+              if (runner && config.research.paperTokenRunner && Date.now() - quotedAt <= RUNNER_POLL_MS) {
+                runners.open[p.id] = runner;
+              }
+            }
             paper.closed.push({ id: p.id, mint: p.mint, pool: p.pool, pair: p.pair, capital: p.capital,
               lower: p.lower, upper: p.upper, entryBin: p.entryBin, shape: p.shape, range: p.range, variant: p.variant, openedAt: p.openedAt,
               closedAt: Date.now(), filledAt: p.filledAt, pnl, reason: p.exit.reason, solInventory: inventory.sol, quotedSol: proceeds,
@@ -253,7 +268,10 @@ export function startPaper(store, notify, {
             paper.realized[p.variant] += pnl;
             if (p.mirror) paper.mirrorRealized = (paper.mirrorRealized ?? 0) + pnl;
             delete paper.open[p.id];
-            if (!p.shapeTrial && !p.rebalanceTrial) closed.push(`• ${p.mint.slice(0, 8)} · ${p.variant ?? `${p.range}/${p.shape}`} · ${pnl.toFixed(4)} SOL · ${p.exit.reason}`);
+            if (!p.shapeTrial && !p.rebalanceTrial) {
+              const runner = runners.open[p.id];
+              closed.push(`• ${p.mint.slice(0, 8)} · ${p.variant ?? `${p.range}/${p.shape}`} · ${pnl.toFixed(4)} SOL · ${p.exit.reason}${runner ? ` · sisa token ${runner.initialQuote.toFixed(5)} SOL` : ''}`);
+            }
           }
         } catch { markUnavailable(p, 'Valuasi belum bisa dihitung'); }
       }
@@ -348,9 +366,39 @@ export function startPaper(store, notify, {
     finally { busy = false; }
   }
   const timer = schedule(tick, MINUTE);
+  let samplingRunners = false, nextRunnerAt = 0;
+  async function tickRunners() {
+    const now = Date.now();
+    const open = Object.values(runners.open);
+    if (samplingRunners || stopped || !config.standalone.shadow || !open.length || now < nextRunnerAt) return;
+    samplingRunners = true;
+    nextRunnerAt = now + RUNNER_POLL_MS;
+    try {
+      const notices = await Promise.all(open.map(async row => {
+        const result = await sampleTokenRunner(row, { now, candles, quote: (mint, raw) => quote(mint, raw).catch(() => null) });
+        if (stopped || !config.standalone.shadow || runners.open[row.id] !== row) return null;
+        const name = row.pair ?? row.mint.slice(0, 8);
+        if (result.closed) {
+          runners.closed.push(result.closed);
+          delete runners.open[row.id];
+          const delta = result.closed.deltaSol;
+          return `${name} · ${delta >= 0 ? '+' : ''}${delta.toFixed(5)} SOL vs langsung jual · ${result.closed.reason}`;
+        }
+        runners.open[row.id] = result.next;
+        return result.alert ? `${name} · quote jual belum tersedia, posisi simulasi masih terbuka` : null;
+      }));
+      if (stopped || !config.standalone.shadow) return;
+      store.save();
+      const lines = notices.filter(Boolean);
+      if (lines.length) await notify(['🧪 Shadow · Sisa token', ...lines.map(line => `• ${line}`)].join('\n'));
+    } catch { log('paper_warn', 'Token runner check unavailable'); }
+    finally { samplingRunners = false; }
+  }
   let watching = false;
   const fastTimer = setInterval(async () => {
-    if (watching || stopped || !config.standalone.shadow) return;
+    if (stopped || !config.standalone.shadow) return;
+    void tickRunners();
+    if (watching) return;
     if (Object.values(paper.open).some(p => p.manualExit && !p.exit && !p.manualExitCheckedAt)) void tick();
     if (!(config.management.outOfRangeBelowStopPct > 0)) return;
     watching = true;

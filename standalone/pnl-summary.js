@@ -48,6 +48,27 @@ export function rebalanceTrialLines(paper, from, detailed) {
   return lines;
 }
 
+export function tokenRunnerLines(paper, from, now, detailed) {
+  const open = Object.values(paper?.tokenRunners?.open ?? {});
+  const closed = (paper?.tokenRunners?.closed ?? []).filter(p => p.closedAt >= from && p.closedAt <= now);
+  if (!open.length && !closed.length) return [];
+  const waiting = open.filter(p => p.quoteMissingSince != null).length;
+  const delta = closed.reduce((sum, p) => sum + p.deltaSol, 0);
+  const lines = [`Sisa token Shadow · ${open.length} terbuka · ${closed.length} selesai${waiting ? ` · ${waiting} tunggu quote` : ''}${closed.length ? ` · Δ net ${signed(delta)} SOL vs langsung jual` : ''}`];
+  if (detailed) {
+    if (closed.length) {
+      const worst = Math.max(...closed.map(p => p.maxDrawdownSol ?? 0));
+      lines.push(`Penurunan terbesar sisa token dari puncak quote · ${worst.toFixed(5)} SOL`);
+    }
+    for (const p of open) {
+      const fresh = p.quoteMissingSince == null && now - p.quoteAt <= 30_000;
+      const mark = fresh ? `Δ ${signed(p.sold + p.quote - p.fullQuote - p.costSol)} SOL` : 'menunggu quote';
+      lines.push(`• ${p.pair ?? p.mint.slice(0, 8)} · ${mark}${p.reason ? ` · exit ${p.reason}` : ''}`);
+    }
+  }
+  return lines;
+}
+
 export function summarizePaper(paper, from, to = Date.now()) {
   const groups = new Map();
   const get = variant => {

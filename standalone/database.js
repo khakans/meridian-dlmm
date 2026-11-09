@@ -54,12 +54,13 @@ export function openModeDatabase(mode, root = REPO_ROOT) {
         append('pnl-reset', reset, reset, { mode, at: reset });
         added.push(`pnl-reset:${reset}`);
       }
-      for (const [kind, rows] of [['paper-close', state.paper?.closed], ['paper-cancel', state.paper?.cancelled]]) {
+      for (const [kind, rows] of [['paper-close', state.paper?.closed], ['paper-cancel', state.paper?.cancelled],
+        ['paper-runner-close', state.paper?.tokenRunners?.closed]]) {
         for (const row of rows ?? []) {
           const id = row.id ?? `${row.mint}:${row.variant}:${row.closedAt ?? row.at}`;
           const key = `${kind}:${id}`;
           if (known.has(key)) continue;
-          append(kind, id, row.closedAt ?? row.at, row, row.pnl);
+          append(kind, id, row.closedAt ?? row.at, row, row.deltaSol ?? row.pnl);
           added.push(key);
         }
       }
