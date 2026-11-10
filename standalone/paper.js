@@ -110,7 +110,7 @@ export function narrowLossExit(p, pnl, fresh) {
   return narrowNetLossStop(p.rangeTrial && fresh, Number.isFinite(pnl) && p.capital > 0 ? pnl / p.capital * 100 : null);
 }
 
-export function paperCloseRule(p, active, pnlPct, now) {
+export function paperCloseRule(p, active, pnlPct, now, { ageLimit = true } = {}) {
   const outside = active.binId < p.lower ? 'below' : active.binId > p.upper ? 'above' : null;
   if (active.binId <= p.upper) p.rangeReached = true;
   if (outside !== p.outside) {
@@ -125,7 +125,7 @@ export function paperCloseRule(p, active, pnlPct, now) {
     minutes_out_of_range: p.outsideSince ? (now - p.outsideSince) / MINUTE : 0,
   }, m);
   if (rule?.rule === 1) return rule.reason;
-  if (p.longHold?.ended || now - p.openedAt >= (p.maxHoldMinutes ?? config.research.paperMaxHoldMinutes) * MINUTE) return 'maximum hold time';
+  if (ageLimit && (p.longHold?.ended || now - p.openedAt >= (p.maxHoldMinutes ?? config.research.paperMaxHoldMinutes) * MINUTE)) return 'maximum hold time';
   if (!p.rangeReached && outside === 'above') {
     return now - p.openedAt >= (p.rangeWaitMinutes ?? config.research.paperInitialRangeWaitMinutes) * MINUTE
       ? 'entry range not reached' : null;
@@ -141,8 +141,8 @@ export function paperCloseRule(p, active, pnlPct, now) {
   return now - p.lossExitSince >= config.research.paperLossGraceMinutes * MINUTE ? reason : null;
 }
 
-export function mirrorExitReason(p, active, pnlPct, now) {
-  const reason = paperCloseRule(p, active, pnlPct, now);
+export function mirrorExitReason(p, active, pnlPct, now, options) {
+  const reason = paperCloseRule(p, active, pnlPct, now, options);
   p.exitTicks = reason && reason === p.exitSignal ? (p.exitTicks ?? 0) + 1 : Number(Boolean(reason));
   p.exitSignal = reason;
   if (reason && p.exitTicks >= Math.max(1, config.pnl.confirmTicks)) return reason;

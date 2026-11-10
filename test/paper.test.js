@@ -22,6 +22,43 @@ import { DLMM_PROGRAM, recoverablePositionRent } from '../standalone/events.js';
 import { MonitorStore, recentSignalCounts } from '../standalone/store.js';
 import { selectNarrowPool } from '../standalone/screening.js';
 import { narrowCurveEvidence, startNarrowCurveTrial } from '../standalone/narrow-curve.js';
+import { evaluateLiveHold } from '../standalone/live-hold.js';
+
+test('Live hold can extend beyond six hours and needs two distinct weak candles to close', () => {
+  const minute = 60_000, now = 1_794_200_400_000;
+  const state = { openedAt: now - 360 * minute, lower: -35, upper: 0 };
+  const observe = (at, { pnlPct = 1, stale = false } = {}) => {
+    const candleEnd = Math.floor(at / (5 * minute)) * 300;
+    const candles = Array.from({ length: 6 }, (_, i) => ({ timestamp: candleEnd - (6 - i) * 300,
+      open: 1, close: 1, high: 1.002, low: 0.998, volume: 1000 }));
+    const mark = stale ? null : { activeBin: -1, price: 1, binStep: 80, feeSol: 0.001 + (at - now) / minute * 0.00001,
+      feeTokens: 0, feeTokenPrice: 0, exitRatio: 0.99, pnlPct };
+    return evaluateLiveHold(state, { now: at, baseMinutes: 360, capital: 0.15, mark, candles });
+  };
+  for (let m = 60; m > 0; m--) assert.equal(observe(now - m * minute), null);
+  assert.equal(observe(now), null);
+  assert.equal(state.liveHold.extensions, 1);
+  assert.equal(state.liveHold.until, now + 30 * minute);
+  assert.equal(observe(now + 5 * minute, { pnlPct: -1 }), null);
+  assert.equal(observe(now + 6 * minute, { pnlPct: -1 }), null);
+  assert.match(observe(now + 10 * minute, { pnlPct: -1 }), /two candles/);
+});
+
+test('Live age handling gives stale data bounded grace while ordinary profit and loss still win', () => {
+  const minute = 60_000, now = 1_794_200_400_000;
+  const state = { id: 'live-hold-test', openedAt: now - 240 * minute, lower: -35, upper: 0 };
+  const check = at => evaluateLiveHold(state, { now: at, baseMinutes: 240, capital: 0.15, mark: null, candles: null });
+  assert.equal(check(now), null);
+  assert.equal(check(now + 9 * minute), null);
+  assert.match(check(now + 10 * minute), /expired without fresh/);
+  assert.equal(state.liveHold.extensions, 0);
+  const active = { binId: -1 };
+  const old = { ...state, openedAt: now - (config.research.paperMaxHoldMinutes + 1) * minute };
+  assert.equal(paperCloseRule({ ...old }, active, 0, now), 'maximum hold time');
+  assert.equal(paperCloseRule({ ...old }, active, 0, now, { ageLimit: false }), null);
+  assert.equal(paperCloseRule({ ...old }, active, config.management.stopLossPct - 1, now, { ageLimit: false }), 'stop loss');
+  assert.equal(paperCloseRule({ ...old }, active, config.management.takeProfitPct + 1, now, { ageLimit: false }), 'take profit');
+});
 
 test('Curve research samples matching Spot arms only for fresh, calm, liquid single-sided candidates', () => {
   const at = Date.now(), now = Math.floor(at / 1000), end = Math.floor(now / 300) * 300;

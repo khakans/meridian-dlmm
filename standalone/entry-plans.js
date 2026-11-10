@@ -65,6 +65,15 @@ export function liveNarrowEntryRange(candles, market) {
   return narrowEntryRange(candles, market, Math.min(45, maxBinsBelow), minBinsBelow);
 }
 
+export const lastClosedCandle = now => Math.floor(now / (CANDLE_SECONDS * 1000)) * CANDLE_SECONDS - CANDLE_SECONDS;
+
+export function holdCandleHealth(candles, market) {
+  const trend = entryMarket(candles, { ...market, now: Math.floor(market.now / 1000) });
+  if (!trend || trend.rows.at(-1).timestamp !== lastClosedCandle(market.now)) return null;
+  const support = Math.min(...trend.rows.slice(0, -1).map(c => c.low));
+  return !trend.falling && !trend.thin && Math.min(market.price, trend.rows.at(-1).close) >= support;
+}
+
 export function chooseEntryPair(mode, candles, market) {
   if (mode === 'single' || mode === 'dual') return { side: mode, reason: 'manual' };
   if (mode !== 'auto') return { side: null, reason: 'pengaturan pair mode tidak valid' };

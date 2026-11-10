@@ -15,7 +15,8 @@ import { MonitorStore, entryDeadlineReason, finishSignal, recentSignalCounts } f
 import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
-import { chooseEntryPair, entryCandles, isActivePaperVariant, liveNarrowEntryRange, pairModeLabel, resolveEntryShape, scoreShadowScreen, shapeLabel } from "./entry-plans.js";
+import { chooseEntryPair, entryCandles, isActivePaperVariant, lastClosedCandle, liveNarrowEntryRange, pairModeLabel, resolveEntryShape, scoreShadowScreen, shapeLabel } from "./entry-plans.js";
+import { evaluateLiveHold } from "./live-hold.js";
 import { entryRange, mirrorExitReason, prepareMirrorPosition, prepareNarrowRangeTrial, prepareShapeTrials, startPaper, validateExitQuote } from "./paper.js";
 import { prepareRebalanceTrial } from "./paper-rebalance.js";
 import { canEnrollLongRun, longRunSpotReady, longRunState, prepareLongHold } from "./paper-long-run.js";
@@ -728,6 +729,20 @@ function startPnlPoller() {
   }, pollMs);
 
   let lastDecisionAt = 0, lastNarrowCheckAt = 0;
+  const holdCandles = new Map();
+  function readHoldCandles(pool, now) {
+    const candle = lastClosedCandle(now);
+    const cached = holdCandles.get(pool);
+    if (cached?.candle === candle && cached.rows) return cached.rows;
+    if (cached?.candle !== candle || (!cached.pending && now - cached.at >= 30_000)) {
+      const request = { candle, at: now, pending: true };
+      holdCandles.set(pool, request);
+      void entryCandles(pool, Math.floor(now / 1000)).then(rows => {
+        if (Array.isArray(rows) && rows.some(row => row?.timestamp === candle)) request.rows = rows;
+      }).catch(() => {}).finally(() => { request.pending = false; });
+    }
+    return null;
+  }
   timers.pnl = setInterval(async () => {
     const now = Date.now();
     if (pollBusy || manageBusy || shuttingDown) return;
@@ -742,8 +757,10 @@ function startPnlPoller() {
       const live = await getMyPositions({ force: true, silent: true }).catch(() => null);
       if (!live || live.error || !Array.isArray(live.positions)) return;
       const states = store.data.mirrorExits ??= {};
-      const openIds = new Set(live.positions.map(p => p.position));
+      const openIds = new Set([...live.positions, ...tracked].map(p => p.position));
       for (const id of Object.keys(states)) if (!openIds.has(id)) delete states[id];
+      const pools = new Set([...live.positions, ...tracked].map(p => p.pool));
+      for (const pool of holdCandles.keys()) if (!pools.has(pool)) holdCandles.delete(pool);
       for (const p of live.positions) {
         if (![p.active_bin, p.lower_bin, p.upper_bin].every(Number.isSafeInteger)) continue;
         const trackedPosition = getTrackedPosition(p.position);
@@ -758,27 +775,46 @@ function startPnlPoller() {
         state.lower = p.lower_bin;
         state.upper = p.upper_bin;
         const capital = trackedPosition?.amount_sol;
+        const adaptive = capital > 0 && Boolean(p.pool && p.base_mint);
         if (state.entryOverheadSol == null && capital > 0) {
           state.entryOverheadSol = await estimateEntryOverheadSol(p.position, live.wallet, capital).catch(() => null);
         }
         const gross = Number.isFinite(p.strategy_pnl_pct) ? p.strategy_pnl_pct : null;
         let pnlPct = gross != null && gross <= config.management.stopLossPct ? gross : null;
-        const netExitPct = async () => {
+        const quoteExit = async () => {
           if (!(capital > 0) || !Number.isFinite(state.entryOverheadSol)) return null;
+          const startedAt = Date.now();
           const inventory = await getPositionExitInventory(p.position, p.pool, p.base_mint, live.wallet);
           const proceeds = inventory.tokenRaw > 0n ? await quoteTokenToSol(p.base_mint, inventory.tokenRaw) : 0;
           const exitValue = inventory.sol + (proceeds > SETTLEMENT_DUST_SOL ? proceeds : 0);
-          return estimateNetExitPct((exitValue / capital - 1) * 100, capital, state.entryOverheadSol);
+          const pnlPct = estimateNetExitPct((exitValue / capital - 1) * 100, capital, state.entryOverheadSol);
+          const amount = Number(inventory.tokenRaw) / inventory.tokenUnit;
+          const feeTokenPrice = amount > 0 ? Math.min(inventory.price, proceeds / amount) : 0;
+          const exitRatio = amount > 0 ? proceeds / (amount * inventory.price) : 1;
+          return { ...inventory, pnlPct, feeTokenPrice, exitRatio, fresh: Date.now() - startedAt <= 15_000 };
         };
-        let narrowStop;
+        let narrowStop, mark;
         if (!state.closeReason) {
-          const quoteStartedAt = Date.now();
-          const net = await netExitPct().catch(() => null);
-          if (Date.now() - quoteStartedAt <= 15_000) narrowStop = narrowNetLossStop(trackedPosition?.narrow_range, net);
-          pnlPct = net ?? pnlPct;
+          const quote = await quoteExit().catch(() => null);
+          if (quote?.fresh) {
+            mark = quote;
+            narrowStop = narrowNetLossStop(trackedPosition?.narrow_range, quote.pnlPct);
+          }
+          pnlPct = quote?.pnlPct ?? pnlPct;
         }
-        const reason = state.closeReason ?? narrowStop ??
-          (routineDue ? mirrorExitReason(state, { binId: p.active_bin }, pnlPct, now) : null);
+        let reason = state.closeReason ?? narrowStop ??
+          (routineDue ? mirrorExitReason(state, { binId: p.active_bin }, pnlPct, now, { ageLimit: !adaptive }) : null);
+        if (routineDue && adaptive && !reason && !trackedPosition.hard_lower_exit) {
+          const checkedAt = Date.now();
+          const baseMinutes = config.research.paperMaxHoldMinutes;
+          const reviewAt = state.liveHold?.reviewAt ?? state.openedAt + baseMinutes * 60_000;
+          const candles = checkedAt >= reviewAt - 120_000 ? readHoldCandles(p.pool, checkedAt) : null;
+          const extensions = state.liveHold?.extensions ?? 0;
+          reason = evaluateLiveHold(state, { now: checkedAt, baseMinutes, capital, mark, candles, canDecide: !state.exitSignal });
+          if (state.liveHold.extensions > extensions) {
+            log("hold", `${p.position.slice(0, 8)}: +30m after productive candle · extension #${state.liveHold.extensions}`);
+          }
+        }
         if (!reason) continue;
         if (shuttingDown || manageBusy || getTrackedPosition(p.position)?.hard_lower_exit) continue;
         const profitExit = reason === "take profit" || reason === "trailing take profit";
@@ -790,7 +826,7 @@ function startPnlPoller() {
           const res = await executeTool("close_position", {
             position_address: p.position, reason,
             verifyProfit: profitExit ? async () => {
-              const fresh = await netExitPct();
+              const fresh = (await quoteExit())?.pnlPct;
               const m = config.management;
               const valid = reason === "take profit" ? fresh >= m.takeProfitPct :
                 m.trailingTakeProfit && state.peakPct >= m.trailingTriggerPct && fresh <= state.peakPct - m.trailingDropPct;
@@ -866,8 +902,10 @@ async function lifecycleStatusLines(detailed = false) {
       const shape = shapeLabel(tracked?.strategy ?? attempt?.strategy, tracked?.shape_mode ?? attempt?.shapeMode);
       const entry = tracked?.pair_entry ?? attempt?.pairEntry;
       const pairMode = pairModeLabel(entry?.mode, entry?.side);
+      const hold = detailed ? store.data.mirrorExits?.[p.position]?.liveHold : null;
+      const extended = hold?.extensions && hold.until > Date.now();
       lines.push([`• ${String(p.pair || p.position).replace(/[<>&\r\n]/g, " ").slice(0, 80)}`, pct, range, shape,
-        pairMode && `Pair ${pairMode}`].filter(Boolean).join(" · "));
+        pairMode && `Pair ${pairMode}`, extended && `hold +30m ×${hold.extensions}`].filter(Boolean).join(" · "));
     }
     if (book.positions.length > 10) lines.push(`+${book.positions.length - 10} posisi lainnya`);
   }
@@ -904,6 +942,7 @@ async function lifecycleStatusLines(detailed = false) {
   if (resetAt > now - 86_400_000) lines.push(`Periode PnL sejak reset ${new Date(resetAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })} WIB`);
   if (!config.standalone.shadow) {
     if (config.strategy.liveNarrowRange) lines.push(`Range sempit Live · 35/45 bin otomatis · step ${config.strategy.narrowRangeMinBinStep}–${config.strategy.narrowRangeMaxBinStep} bps`);
+    if (detailed) lines.push(`Hold adaptif · mulai evaluasi setelah ${config.research.paperMaxHoldMinutes}m · candle 5m`);
     const recovering = Object.values(store.data.attempts).filter(row => row.status === "submitting").length;
     const review = Object.values(store.data.attempts).filter(row => row.status === "review_required").length;
     if (recovering || review) lines.push(`Recovery entry · ${recovering} rekonsiliasi · ${review} perlu diperiksa`);

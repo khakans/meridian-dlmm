@@ -1182,9 +1182,15 @@ export async function getPositionExitInventory(positionAddress, poolAddress, min
     }
     const { positionData: p } = await pool.getPosition(new PublicKey(positionAddress));
     if (String(p.owner) !== owner) throw Error("Unexpected position owner");
+    const { activeId: activeBin, binStep } = pool.lbPair;
+    const tokenUnit = 10 ** pool.tokenX.mint.decimals;
     return {
       tokenRaw: BigInt(p.totalXAmountExcludeTransferFee.toString()) + BigInt(p.feeXExcludeTransferFee.toString()),
       sol: Number(BigInt(p.totalYAmountExcludeTransferFee.toString()) + BigInt(p.feeYExcludeTransferFee.toString())) / 1e9,
+      activeBin, binStep, tokenUnit,
+      price: Number(pool.fromPricePerLamport(_getPriceOfBinByBinId(activeBin, binStep).toNumber())),
+      feeSol: Number(p.feeY.add(p.totalClaimedFeeYAmount).toString()) / 1e9,
+      feeTokens: Number(p.feeX.add(p.totalClaimedFeeXAmount).toString()) / tokenUnit,
     };
   });
 }
