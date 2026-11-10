@@ -97,17 +97,18 @@ export function qualifyingEvents(events, mint, options, now = Date.now()) {
 
 export function entrySignalRoute(signal, wallets, options, now = Date.now()) {
   const discovery = signal.source === 'discovery' ? signal : signal.discovery;
+  const requiredWallets = discovery ? 1 : options.walletThreshold;
   const proof = signal.convergence ?? (signal.source !== 'discovery' ? { events: signal.events, updatedAt: signal.createdAt } : null);
   const events = proof && proof.updatedAt !== signal.rejectedConfirmationAt
     ? qualifyingEvents(proof.events.filter(e => wallets[e.wallet]), signal.mint, options, now) : [];
-  if (events.length < options.walletThreshold && discovery) {
+  if (events.length < requiredWallets && discovery) {
     return { source: 'discovery', pool: discovery.pool, events: [] };
   }
-  return { source: 'convergence', pool: signal.pool, events,
+  return { source: 'convergence', pool: signal.pool, events, requiredWallets,
     confirmationAt: proof?.updatedAt, corroborated: Boolean(discovery) };
 }
 
-export function registerDiscoverySignal(store, mint, pool, sources, deadlineMs, now = Date.now()) {
+export function registerDiscoverySignal(store, mint, pool, sources, options, now = Date.now()) {
   if (store.data.paused) return null;
   const prior = store.data.signals[mint];
   if (prior && !prior.done) {
@@ -117,7 +118,10 @@ export function registerDiscoverySignal(store, mint, pool, sources, deadlineMs, 
   const cooldownUntil = prior?.cooldownUntil ?? ((prior?.closedAt ?? prior?.deadline ?? now) + 300_000);
   if (prior && now < cooldownUntil) return null;
   const signal = { mint, pool, source: 'discovery', sources, events: [],
-    createdAt: now, deadline: now + deadlineMs, done: false };
+    createdAt: now, deadline: now + options.screeningDeadlineSec * 1000, done: false };
+  const minAt = Math.max(store.data.entryResumedAt ?? 0, prior?.closedAt ?? 0);
+  const fresh = qualifyingEvents(store.data.events.filter(e => e.at > minAt && store.data.wallets[e.wallet]), mint, options, now);
+  if (fresh.length) signal.convergence = { at: now, updatedAt: now, events: fresh };
   store.data.signals[mint] = signal;
   return signal;
 }
@@ -128,7 +132,9 @@ export function acceptEvents(store, events, options, now = Date.now()) {
   const triggered = [];
   for (const mint of new Set(events.map(e => e.mint))) {
     const existing = store.data.signals[mint];
-    const recent = qualifyingEvents(store.data.events, mint, options, now);
+    const corroborated = existing && !existing.done && (existing.source === 'discovery' || existing.discovery);
+    const candidates = corroborated ? store.data.events.filter(e => store.data.wallets[e.wallet]) : store.data.events;
+    const recent = qualifyingEvents(candidates, mint, options, now);
     const wider = qualifyingEvents(store.data.events, mint, { ...options, windowSec: Math.max(options.windowSec, 300) }, now);
     const times = wider.map(e => e.at);
     store.data.convergenceDiagnostics ??= {};
@@ -141,14 +147,14 @@ export function acceptEvents(store, events, options, now = Date.now()) {
     if (store.data.paused) continue;
     const minAt = Math.max(store.data.entryResumedAt ?? 0, existing?.done ? existing.closedAt : 0);
     const fresh = recent.filter(e => e.at > minAt);
-    if (fresh.length < options.walletThreshold) continue;
+    if (fresh.length < (corroborated ? 1 : options.walletThreshold)) continue;
     if (existing && !existing.done) {
       const previous = existing.convergence?.events ?? existing.events ?? [];
       if (existing.deadline > now && fresh.some(event => !previous.some(e => e.id === event.id))) {
         const at = existing.convergence?.at ?? (existing.source === 'discovery' ? now : existing.createdAt);
         const updatedAt = Math.max(now, (existing.convergence?.updatedAt ?? existing.createdAt) + 1);
         existing.convergence = { at, updatedAt, events: fresh };
-        store.data.convergenceDiagnostics[mint].reason = existing.source === 'discovery' ? 'Discovery + Convergence' : 'Convergence wallets updated';
+        store.data.convergenceDiagnostics[mint].reason = corroborated ? 'Discovery + Convergence' : 'Convergence wallets updated';
       }
       continue;
     }

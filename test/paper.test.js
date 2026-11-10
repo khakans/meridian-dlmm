@@ -841,7 +841,7 @@ test('rolling signal counts include prior same-mint signals and live queue witho
   }
 });
 
-test('Discovery and Convergence share one pending entry in either order and keep each signal timestamp', () => {
+test('Discovery and Convergence share one pending entry with one wallet in either order', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-overlap-'));
   const database = openModeDatabase('live', dir);
   try {
@@ -851,33 +851,41 @@ test('Discovery and Convergence share one pending entry in either order and keep
     data.wallets = { a: {}, b: {}, c: {} };
     const store = { data, database, save: () => database.saveMonitor(data), prune() {} };
     const event = (mint, wallet, at) => ({ id: `${mint}:${wallet}:${at}`, mint, wallet, at, depositSol: 1 });
-    const discovery = registerDiscoverySignal(store, 'first', 'screened-pool', ['Meteora'], 120_000, now);
+    const discovery = registerDiscoverySignal(store, 'first', 'screened-pool', ['Meteora'], options, now);
     const alreadyRunning = entrySignalRoute(discovery, data.wallets, options, now);
     assert.equal(alreadyRunning.source, 'discovery');
-    assert.equal(acceptEvents(store, [event('first', 'a', now + 1000), event('first', 'b', now + 2000)], options, now + 2000).length, 0);
+    assert.equal(acceptEvents(store, [event('first', 'a', now + 1000)], options, now + 2000).length, 0);
     assert.equal(discovery.deadline, now + 120_000);
     const shared = entrySignalRoute(discovery, data.wallets, options, now + 2000);
     assert.equal(shared.source, 'convergence');
     assert.equal(shared.corroborated, true);
     assert.equal(shared.pool, 'screened-pool');
-    assert.deepEqual(shared.events.map(e => e.wallet), ['a', 'b']);
+    assert.equal(shared.requiredWallets, 1);
+    assert.deepEqual(shared.events.map(e => e.wallet), ['a']);
     assert.equal(alreadyRunning.events.length, 0);
     discovery.rejectedConfirmationAt = shared.confirmationAt;
     assert.equal(entrySignalRoute(discovery, data.wallets, options, now + 3000).source, 'discovery');
     acceptEvents(store, [event('first', 'c', now + 4000)], options, now + 4000);
-    assert.equal(entrySignalRoute(discovery, data.wallets, options, now + 4000).events.length, 3);
+    assert.equal(entrySignalRoute(discovery, data.wallets, options, now + 4000).events.length, 2);
 
-    const [convergence] = acceptEvents(store, [event('second', 'a', now + 4000), event('second', 'b', now + 4500)], options, now + 4500);
-    assert.equal(registerDiscoverySignal(store, 'second', 'alternative-pool', ['Meteora'], 120_000, now + 5000), null);
-    assert.equal(entrySignalRoute(convergence, data.wallets, options, now + 5000).source, 'convergence');
-    assert.equal(entrySignalRoute(convergence, { a: {} }, options, now + 5000).pool, 'alternative-pool');
-    assert.equal(convergence.deadline, now + 124_500);
+    assert.equal(acceptEvents(store, [event('second', 'a', now + 4500)], options, now + 4500).length, 0);
+    assert.equal(data.signals.second, undefined);
+    const second = registerDiscoverySignal(store, 'second', 'alternative-pool', ['Meteora'], options, now + 5000);
+    assert.equal(entrySignalRoute(second, data.wallets, options, now + 5000).requiredWallets, 1);
+    assert.equal(entrySignalRoute(second, {}, options, now + 5000).source, 'discovery');
+    assert.equal(entrySignalRoute(second, data.wallets, options, now + 185_000).source, 'discovery');
+    assert.equal(second.deadline, now + 125_000);
     finishSignal(store, discovery, 'entered', options, now + 6000);
-    finishSignal(store, convergence, 'entered', options, now + 6000);
-    assert.equal(registerDiscoverySignal(store, 'second', 'alternative-pool', ['Meteora'], 120_000, now + 7000), null);
+    finishSignal(store, second, 'entered', options, now + 6000);
+    assert.equal(registerDiscoverySignal(store, 'second', 'alternative-pool', ['Meteora'], options, now + 7000), null);
     assert.deepEqual(recentSignalCounts(store, now + 7000), { discovery: 2, convergence: 2 });
     assert.deepEqual(recentSignalCounts({ database, data: emptyMonitor() }, now + 7000), { discovery: 2, convergence: 2 });
     assert.deepEqual(recentSignalCounts({ database, data: emptyMonitor() }, now + 86_401_000), { discovery: 1, convergence: 2 });
+
+    const [independent] = acceptEvents(store, [event('third', 'a', now + 7000), event('third', 'b', now + 7000)], options, now + 7000);
+    assert.equal(entrySignalRoute(independent, { a: {} }, options, now + 7000).requiredWallets, 2);
+    assert.equal(registerDiscoverySignal(store, 'third', 'screened-pool', ['Meteora'], options, now + 8000), null);
+    assert.equal(entrySignalRoute(independent, { a: {} }, options, now + 8000).requiredWallets, 1);
   } finally {
     database.db.close();
     fs.rmSync(dir, { recursive: true, force: true });

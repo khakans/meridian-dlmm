@@ -348,8 +348,8 @@ async function attemptEntry(signal, stage, route) {
   // A failed position read is unavailable data, never "no positions".
   const shadow = config.standalone.shadow;
   const { source, events } = route;
-  if (source === "convergence" && events.length < config.standalone.walletThreshold) {
-    return `wallet exposure gone (${events.length}/${config.standalone.walletThreshold} remain)`;
+  if (source === "convergence" && events.length < route.requiredWallets) {
+    return `wallet exposure gone (${events.length}/${route.requiredWallets} remain)`;
   }
   const paper = store.data.paper;
   const lossCutoff = Date.now() - config.management.repeatDeployCooldownHours * 3_600_000;
@@ -666,7 +666,7 @@ async function finalRecheck(signal, route, screened, simulatedSol = null) {
   }
   if (route.source === "convergence") {
     const current = qualifyingEvents(present.filter(e => store.data.wallets[e.wallet]), signal.mint, config.standalone).length;
-    if (current < config.standalone.walletThreshold) return `wallet exposure gone (${current}/${route.events.length} remain)`;
+    if (current < route.requiredWallets) return `wallet exposure gone (${current}/${route.requiredWallets} remain)`;
   }
   try {
     const fresh = await poolDetail(screened.pool.pool_address);
@@ -978,7 +978,7 @@ async function lifecycleStatusLines(detailed = false) {
   const walletMints = Object.values(store.data.convergenceDiagnostics ?? {}).filter(d => now - d.at < 86_400_000);
   const qualifyingMints = walletMints.filter(d => d.current > 0).length;
   lines.push(`${Object.keys(store.data.wallets).length} wallet dipantau · ${qualifyingMints} mint dengan deposit yang lolos`,
-    `Trigger Convergence ${config.standalone.walletThreshold} wallet pada token yang sama dalam ${config.standalone.windowSec} detik`);
+    `Convergence mandiri ${config.standalone.walletThreshold} wallet · dengan Discovery 1 wallet · jendela ${config.standalone.windowSec} detik`);
   const coverage = monitor?.coverage(now);
   if (coverage) lines.push(`Monitor wallet · ${coverage.fresh}/${coverage.total} segar · ${coverage.stale} kedaluwarsa/baseline · ${coverage.errors} error`);
   if (config.standalone.shadow) {
@@ -1209,7 +1209,7 @@ export async function startStandalone() {
     onMatch: (mint, screened, sources) => {
       store.data.preflightCandidate = { mint, pool: screened.pool.pool_address, at: Date.now() };
       const signal = !shuttingDown && registerDiscoverySignal(store, mint, screened.pool.pool_address, sources,
-        config.standalone.screeningDeadlineSec * 1000);
+        config.standalone);
       store.save();
       if (signal) onSignal(signal);
     },
