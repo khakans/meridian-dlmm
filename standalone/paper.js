@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { getDeterministicCloseRule, lowerRangeStop } from '../exit-rules.js';
+import { getDeterministicCloseRule, lowerRangeStop, narrowNetLossStop } from '../exit-rules.js';
 import { log } from '../logger.js';
 import { getActiveBin, getPaperBinSnapshot } from '../tools/dlmm.js';
 import { quoteTokenToSol } from '../tools/wallet.js';
@@ -89,7 +89,7 @@ export function prepareShapeTrials(input, mirror) {
 export function prepareNarrowRangeTrial(input, mirror, candles, now) {
   if (input.pairEntry?.side !== 'single' || input.shape !== 'spot' || input.binsAbove > 0) return null;
   const binsBelow = narrowEntryRange(candles, { now, price: Number(input.entry.price), binStep: input.binStep },
-    input.binsBelow, config.strategy.minBinsBelow);
+    input.binsBelow - 1, config.strategy.minBinsBelow);
   if (!binsBelow) return null;
   const trial = prepareMirrorPosition({ ...input, binsBelow }, mirror.openedAt);
   mirror.rangeComparison = true;
@@ -102,14 +102,12 @@ function tracksRange(p) {
 }
 
 export function paperLowerExit(p, active) {
-  if (p.rangeTrial && Number.isSafeInteger(active.binId) && active.binId < p.lower) return 'narrow range lower bound breached';
   return lowerRangeStop(active.binId, p.lower, active.binStep ?? (p.ratio - 1) * 10_000,
-    config.management.outOfRangeBelowStopPct);
+    config.management.outOfRangeBelowStopPct, Boolean(p.rangeTrial));
 }
 
 export function narrowLossExit(p, pnl, fresh) {
-  return p.rangeTrial && fresh && Number.isFinite(pnl) && p.capital > 0 && pnl <= -0.03 * p.capital
-    ? 'narrow range net loss stop (3%)' : null;
+  return narrowNetLossStop(p.rangeTrial && fresh, Number.isFinite(pnl) && p.capital > 0 ? pnl / p.capital * 100 : null);
 }
 
 export function paperCloseRule(p, active, pnlPct, now) {

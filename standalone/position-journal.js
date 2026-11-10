@@ -48,6 +48,7 @@ export function isRetryableEntryError(error) {
     /^Transaction simulation rejected: \{"InstructionError":\[\d+,\{"Custom":6004\}\]\}$/.test(error) ||
     error === 'Active bin changed after entry validation' ||
     error === 'Active bin changed before entry' ||
+    error === 'Narrow range changed before entry' ||
     error === '50/50 buy quote moved too far or could not fill at the required price' ||
     error === 'Insufficient liquidity in binArrays for swapQuote' ||
     error === 'Entry stopped or expired before broadcast' ||

@@ -15,7 +15,7 @@ import { MonitorStore, entryDeadlineReason, finishSignal, recentSignalCounts } f
 import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
-import { chooseEntryPair, entryCandles, isActivePaperVariant, pairModeLabel, resolveEntryShape, scoreShadowScreen, shapeLabel } from "./entry-plans.js";
+import { chooseEntryPair, entryCandles, isActivePaperVariant, liveNarrowEntryRange, pairModeLabel, resolveEntryShape, scoreShadowScreen, shapeLabel } from "./entry-plans.js";
 import { entryRange, mirrorExitReason, prepareMirrorPosition, prepareNarrowRangeTrial, prepareShapeTrials, startPaper, validateExitQuote } from "./paper.js";
 import { prepareRebalanceTrial } from "./paper-rebalance.js";
 import { canEnrollLongRun, longRunSpotReady, longRunState, prepareLongHold } from "./paper-long-run.js";
@@ -34,7 +34,7 @@ import { getWalletBalances, quoteSolToToken, quoteTokenToSol } from "../tools/wa
 import { getTrackedPosition, getTrackedPositions, syncOpenPositions, trackPosition } from "../state.js";
 import { latchLowerRangeExit } from "../state.js";
 import { recordPositionSnapshot } from "../pool-memory.js";
-import { computeBinsBelow, lowerRangeStop } from "../exit-rules.js";
+import { computeBinsBelow, lowerRangeStop, narrowNetLossStop } from "../exit-rules.js";
 import { startAdmin } from "./telegram-admin.js";
 import { startSlackAdmin } from "./slack-admin.js";
 import { analyzePoolWithChronos, startChronosKeepalive, stopChronosKeepalive } from "./chronos.js";
@@ -81,6 +81,7 @@ async function reconcileEntries() {
           position: attempt.position, pool: position.pool, pool_name: position.pair,
           strategy: attempt.strategy, shape_mode: attempt.shapeMode, shape_reason: attempt.shapeReason, amount_sol: attempt.amountSol,
           pair_entry: attempt.pairEntry,
+          narrow_range: attempt.narrowRange,
           bin_step: attempt.binStep, bin_range: { min: position.lower_bin, max: position.upper_bin },
         });
         attempt.status = "entered";
@@ -168,39 +169,61 @@ async function resolveEntryPair(mode, pool, candles, now) {
   return { mode, ...chooseEntryPair(mode, candles, { now, price: Number(active?.price), binStep: active?.binStep }) };
 }
 
+function narrowWidth(candles, active, now = Math.floor(Date.now() / 1000)) {
+  return liveNarrowEntryRange(candles, { now, price: Number(active?.price), binStep: active?.binStep });
+}
+
 async function refreshPreflight() {
   const { strategy: shapeMode, pairMode } = config.strategy;
-  if (preflight?.shapeMode === shapeMode && preflight.pairMode === pairMode && Date.now() - preflight.at < 60_000) return preflight;
+  const narrow = !config.standalone.shadow && config.strategy.liveNarrowRange;
+  if (preflight?.shapeMode === shapeMode && preflight.pairMode === pairMode && preflight.narrow === narrow &&
+      Date.now() - preflight.at < 60_000) return preflight;
   const sample = [store.data.preflightCandidate, ...Object.values(store.data.research ?? {})].filter(c => c && Date.now() - c.at < 300_000)
     .sort((a,b) => b.at - a.at)[0];
-  const result = { at: Date.now(), shapeMode, pairMode, pool: "belum ada sampel segar", quote: "belum diuji", simulation: "belum diuji" };
+  const result = { at: Date.now(), shapeMode, pairMode, narrow, pool: "belum ada sampel segar", quote: "belum diuji", simulation: "belum diuji" };
   if (sample) {
     try {
       const screened = await screenMint(sample.mint, { poolAddress: sample.pool });
       result.pool = screened.pass ? "lolos screening ulang" : screened.reason;
       if (screened.pass) {
-        const now = Math.floor(Date.now() / 1000);
-        const candles = pairMode === "auto" || shapeMode === "auto" ? await entryCandles(sample.pool, now) ?? [] : [];
+        const now = screened.narrowSetup?.at ?? Math.floor(Date.now() / 1000);
+        const candles = narrow ? screened.narrowSetup?.candles ?? [] :
+          pairMode === "auto" || shapeMode === "auto" ? await entryCandles(sample.pool, now) ?? [] : [];
         const pair = await resolveEntryPair(pairMode, sample.pool, candles, now);
         const dual = pair.side === "dual";
-        const { binsBelow, binsAbove } = entryRange(computeBinsBelow(screened.pool.volatility), config.strategy.minBinsBelow, dual);
+        let { binsBelow, binsAbove } = entryRange(computeBinsBelow(screened.pool.volatility), config.strategy.minBinsBelow, dual);
         if (!pair.side || (dual && !binsAbove)) {
           result.simulation = `Pair Mode skip: ${pair.side ? "range atas tidak tersedia" : pair.reason}`;
           return preflight = result;
+        }
+        if (narrow) {
+          binsBelow = pair.side === "single" ? screened.narrowSetup?.width : null;
+          if (!binsBelow) {
+            result.simulation = "Range sempit skip: perlu Single SOL, support dan bin step yang sesuai";
+            return preflight = result;
+          }
         }
         let shape;
         try {
           const entry = await validateExitQuote({ mint: sample.mint, pool: sample.pool, decimals: screened.decimals,
             binStep: Number(screened.pool.dlmm_params?.bin_step), binsBelow, binsAbove,
-            capital: config.risk.maxDeployAmount });
+            capital: config.risk.maxDeployAmount, verifyRange: narrow });
           if (chooseEntryPair(pairMode, candles, { now, price: Number(entry.price), binStep: entry.binStep }).side !== pair.side) {
             result.simulation = "Pair Mode skip: kondisi berubah sebelum simulasi";
+            return preflight = result;
+          }
+          if (narrow && narrowWidth(candles, entry) !== binsBelow) {
+            result.simulation = "Range sempit skip: kondisi berubah sebelum simulasi";
             return preflight = result;
           }
           result.quote = "lolos ukuran maksimum";
           const plan = await resolveEntryShape(shapeMode, screened.pool, binsBelow, entry, { candles, now });
           shape = plan.shape;
           if (!shape) result.simulation = `Auto Shape skip: ${plan.reason}`;
+          if (narrow && shape && shape !== "spot") {
+            result.simulation = "Range sempit skip: perlu Spot";
+            return preflight = result;
+          }
         } catch { result.quote = "tidak lolos atau provider gagal"; }
         try {
           if (shape) {
@@ -365,14 +388,21 @@ async function attemptEntry(signal, stage) {
   const pool = screened.pool;
   stage("pair mode and candles");
   const { strategy: shapeMode, pairMode } = config.strategy;
-  const candleTime = Math.floor(Date.now() / 1000);
-  const candles = shadow || pairMode === "auto" || shapeMode === "auto"
+  const narrowRange = !shadow && config.strategy.liveNarrowRange;
+  const candleTime = screened.narrowSetup?.at ?? Math.floor(Date.now() / 1000);
+  const candles = narrowRange ? screened.narrowSetup?.candles ?? [] : shadow || pairMode === "auto" || shapeMode === "auto"
     ? await entryCandles(pool.pool_address, candleTime) ?? [] : [];
   const pairEntry = await resolveEntryPair(pairMode, pool.pool_address, candles, candleTime);
   if (!pairEntry.side) return `Pair Mode: ${pairEntry.reason}`;
   const dual = pairEntry.side === "dual";
   let { binsBelow, binsAbove } = entryRange(computeBinsBelow(pool.volatility), config.strategy.minBinsBelow, dual);
   if (dual && binsAbove < 1) return "50/50 range has no room above active bin";
+  if (narrowRange) {
+    if (dual || !["spot", "auto"].includes(shapeMode)) return "Range sempit perlu Single SOL + Spot";
+    stage("narrow range support");
+    binsBelow = screened.narrowSetup?.width;
+    if (!binsBelow) return "Range sempit: support, candle, atau bin step tidak memenuhi syarat";
+  }
   if (Date.now() >= signal.deadline) return "entry stopped or expired";
 
   // Chronos AI Pre-Deploy Gate & Dynamic Bin Calibration (InstaBox 5-Node Cluster + Fallback)
@@ -391,7 +421,7 @@ async function attemptEntry(signal, stage) {
       log("chronos_gate", `Deferred ${mint.slice(0, 8)} (${pool.pool_address.slice(0, 8)}): ${chronos.gate.reason}`);
       return `chronos gate: ${chronos.gate.reason}`;
     }
-    if (chronos.recommended_bins?.bins_below > 0) {
+    if (!narrowRange && chronos.recommended_bins?.bins_below > 0) {
       if (dual) {
         binsBelow = Math.min(69 - Math.min(binsAbove, 12), Math.max(binsBelow, chronos.recommended_bins.bins_below));
         binsAbove = Math.min(binsAbove, 69 - binsBelow);
@@ -425,12 +455,14 @@ async function attemptEntry(signal, stage) {
       binStep: Number(pool.dlmm_params?.bin_step), binsBelow, binsAbove, capital: amountY, verifyRange: true,
     });
   } catch { return "exit quote or entry range unavailable"; }
+  if (narrowRange && narrowWidth(candles, entry) !== binsBelow) return "Range sempit berubah saat validasi";
   const currentPair = chooseEntryPair(pairMode, candles, { now: candleTime, price: Number(entry.price), binStep: entry.binStep });
   if (currentPair.side !== pairEntry.side) return `Pair Mode berubah saat validasi: ${currentPair.reason}`;
   pairEntry.reason = currentPair.reason;
   const compareShapes = shadow && shapeMode === "auto" && Object.values(paper.open).filter(p => p.shapeTrial).length < 24;
   const plan = await resolveEntryShape(shapeMode, pool, binsBelow, entry, { candles, now: candleTime });
   if (!plan.shape) return `Auto Shape: ${plan.reason}`;
+  if (narrowRange && plan.shape !== "spot") return "Range sempit perlu Spot";
   const modelInput = { source, mint, pool: pool.pool_address, pair: pool.name,
     decimals: screened.decimals, binStep: entry.binStep, binsBelow, binsAbove, capital: amountY, shape: plan.shape, entry, pairEntry };
   if (shadow && dual) {
@@ -513,7 +545,7 @@ async function attemptEntry(signal, stage) {
   store.data.attempts[mint] = {
     at: Date.now(), mint, pool: pool.pool_address, source, wallets: signal.events.map(e => e.wallet),
     status: "submitting", failures: retryablePrior ? 0 : attempt?.failures ?? 0, position: null, txs: [],
-    amountSol: amountY, strategy: plan.shape, shapeMode, shapeReason: plan.reason, pairEntry, binStep: entry.binStep, journalVersion: 1,
+    amountSol: amountY, strategy: plan.shape, shapeMode, shapeReason: plan.reason, pairEntry, narrowRange, binStep: entry.binStep, journalVersion: 1,
   };
   store.save();
 
@@ -533,6 +565,7 @@ async function attemptEntry(signal, stage) {
     bins_above: binsAbove,
     entry_split_50_50: dual,
     pair_entry: pairEntry,
+    narrow_range: narrowRange,
     expected_active_bin: entry.binId,
     strategy: plan.shape,
     shape_mode: shapeMode,
@@ -549,6 +582,7 @@ async function attemptEntry(signal, stage) {
       if (fresh) throw new Error(`Pre-submit recheck failed: ${fresh}`);
       const active = await getActiveBin({ pool_address: pool.pool_address });
       if (active.binId !== entry.binId) throw new Error("Active bin changed before entry");
+      if (narrowRange && narrowWidth(candles, active) !== binsBelow) throw new Error("Narrow range changed before entry");
       stage("transaction simulation and submit");
     },
     on_prepared: position => {
@@ -571,7 +605,7 @@ async function attemptEntry(signal, stage) {
     finishSignal(store, signal, record.status === "proposed" ? "shadow proposal recorded" : "entered");
     const label = result.dry_run ? "[SHADOW] Would deploy" : "Deployed";
     log("entry", `${label} ${amountY} SOL → pool ${pool.pool_address.slice(0, 8)} mint ${mint.slice(0, 8)} (${binsBelow} bins below, ${source}, ${plan.shape}: ${plan.reason})`);
-    void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.pool_address.slice(0, 8)} (mint ${mint.slice(0, 8)}, ${signal.events.length} wallets)\nPair Mode ${pairModeLabel(pairMode, pairEntry.side)}${pairMode === "auto" ? ` · ${pairEntry.reason}` : ""}\nShape ${shapeLabel(plan.shape, shapeMode)}${shapeMode === "auto" ? ` · ${plan.reason}` : ""}`);
+    void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.pool_address.slice(0, 8)} (mint ${mint.slice(0, 8)}, ${signal.events.length} wallets)\nPair Mode ${pairModeLabel(pairMode, pairEntry.side)}${pairMode === "auto" ? ` · ${pairEntry.reason}` : ""}\nShape ${shapeLabel(plan.shape, shapeMode)}${shapeMode === "auto" ? ` · ${plan.reason}` : ""}${narrowRange ? `\nRange sempit ${binsBelow} bin · step ${entry.binStep} bps` : ""}`);
     return null;
   }
 
@@ -658,16 +692,18 @@ function startPnlPoller() {
   const pollMs = Math.max(1, Number(config.pnl.pollIntervalSec ?? 3)) * 1000;
   let lowerRangeBusy = false;
   timers.lowerRange = setInterval(async () => {
-    if (lowerRangeBusy || shuttingDown || !(config.management.outOfRangeBelowStopPct > 0)) return;
+    if (lowerRangeBusy || shuttingDown) return;
     lowerRangeBusy = true;
     try {
       const pools = new Map();
       const breaches = await Promise.all(getTrackedPositions(true).map(async p => {
         if (p.hard_lower_exit) return { p, reason: p.hard_lower_exit };
+        if (!p.narrow_range && !(config.management.outOfRangeBelowStopPct > 0)) return null;
         if (!p.pool || !Number.isSafeInteger(p.bin_range?.min)) return null;
         if (!pools.has(p.pool)) pools.set(p.pool, getActiveBin({ pool_address: p.pool }).catch(() => null));
         const active = await pools.get(p.pool);
-        const reason = lowerRangeStop(active?.binId, p.bin_range.min, active?.binStep, config.management.outOfRangeBelowStopPct);
+        const reason = lowerRangeStop(active?.binId, p.bin_range.min, active?.binStep,
+          config.management.outOfRangeBelowStopPct, Boolean(p.narrow_range));
         if (!reason || shuttingDown) return null;
         const latched = latchLowerRangeExit(p.position, reason);
         return latched ? { p, reason: latched } : null;
@@ -683,12 +719,17 @@ function startPnlPoller() {
     } finally { lowerRangeBusy = false; }
   }, pollMs);
 
-  let lastDecisionAt = 0;
+  let lastDecisionAt = 0, lastNarrowCheckAt = 0;
   timers.pnl = setInterval(async () => {
     const now = Date.now();
-    if (pollBusy || manageBusy || shuttingDown || now - lastDecisionAt < 60_000 || !getTrackedPositions(true).length) return;
+    if (pollBusy || manageBusy || shuttingDown) return;
+    const tracked = getTrackedPositions(true);
+    const routineDue = now - lastDecisionAt >= 60_000;
+    const narrowDue = now - lastNarrowCheckAt >= 15_000 && tracked.some(p => p.narrow_range);
+    if (!tracked.length || (!routineDue && !narrowDue)) return;
     pollBusy = true;
-    lastDecisionAt = now;
+    if (routineDue) lastDecisionAt = now;
+    if (narrowDue) lastNarrowCheckAt = now;
     try {
       const live = await getMyPositions({ force: true, silent: true }).catch(() => null);
       if (!live || live.error || !Array.isArray(live.positions)) return;
@@ -698,6 +739,7 @@ function startPnlPoller() {
       for (const p of live.positions) {
         if (![p.active_bin, p.lower_bin, p.upper_bin].every(Number.isSafeInteger)) continue;
         const trackedPosition = getTrackedPosition(p.position);
+        if (!routineDue && !trackedPosition?.narrow_range) continue;
         const openedAt = Date.parse(p.opened_at ?? trackedPosition?.deployed_at);
         const state = states[p.position] ??= {
           id: p.position,
@@ -720,8 +762,15 @@ function startPnlPoller() {
           const exitValue = inventory.sol + (proceeds > SETTLEMENT_DUST_SOL ? proceeds : 0);
           return estimateNetExitPct((exitValue / capital - 1) * 100, capital, state.entryOverheadSol);
         };
-        if (!state.closeReason) pnlPct = await netExitPct().catch(() => null) ?? pnlPct;
-        const reason = state.closeReason ?? mirrorExitReason(state, { binId: p.active_bin }, pnlPct, now);
+        let narrowStop;
+        if (!state.closeReason) {
+          const quoteStartedAt = Date.now();
+          const net = await netExitPct().catch(() => null);
+          if (Date.now() - quoteStartedAt <= 15_000) narrowStop = narrowNetLossStop(trackedPosition?.narrow_range, net);
+          pnlPct = net ?? pnlPct;
+        }
+        const reason = state.closeReason ?? narrowStop ??
+          (routineDue ? mirrorExitReason(state, { binId: p.active_bin }, pnlPct, now) : null);
         if (!reason) continue;
         if (shuttingDown || manageBusy || getTrackedPosition(p.position)?.hard_lower_exit) continue;
         const profitExit = reason === "take profit" || reason === "trailing take profit";
@@ -834,7 +883,7 @@ async function lifecycleStatusLines(detailed = false) {
     }
     const trialFrom = Math.max(now - 30 * 86_400_000, resetAt);
     if (detailed) lines.push(...shapeTrialLines(paper?.closed, trialFrom));
-    if (detailed) lines.push(`Uji range sempit · Single SOL + Spot · bin step ≤${config.research.paperNarrowRangeMaxBinStep} bps`);
+    if (detailed) lines.push(`Uji range sempit · Single SOL + Spot · bin step ≤${config.strategy.narrowRangeMaxBinStep} bps`);
     lines.push(...narrowRangeLines(paper, trialFrom, detailed));
     lines.push(...rebalanceTrialLines(paper, trialFrom, detailed));
     lines.push(...tokenRunnerLines(paper, from, now, detailed));
@@ -844,6 +893,7 @@ async function lifecycleStatusLines(detailed = false) {
   }
   if (resetAt > now - 86_400_000) lines.push(`Periode PnL sejak reset ${new Date(resetAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })} WIB`);
   if (!config.standalone.shadow) {
+    if (config.strategy.liveNarrowRange) lines.push(`Range sempit Live · 35/45 bin otomatis · step ${config.strategy.narrowRangeMinBinStep}–${config.strategy.narrowRangeMaxBinStep} bps`);
     const recovering = Object.values(store.data.attempts).filter(row => row.status === "submitting").length;
     const review = Object.values(store.data.attempts).filter(row => row.status === "review_required").length;
     if (recovering || review) lines.push(`Recovery entry · ${recovering} rekonsiliasi · ${review} perlu diperiksa`);

@@ -4,11 +4,16 @@ import { config } from "./config.js";
 import { log } from "./logger.js";
 import { getTrackedPosition } from "./state.js";
 
-export function lowerRangeStop(activeBin, lowerBin, binStep, threshold) {
-  if (!(threshold > 0) || !(binStep > 0) || !Number.isSafeInteger(activeBin) ||
-      !Number.isSafeInteger(lowerBin) || activeBin >= lowerBin) return null;
+export function lowerRangeStop(activeBin, lowerBin, binStep, threshold, narrow = false) {
+  if (!Number.isSafeInteger(activeBin) || !Number.isSafeInteger(lowerBin) || activeBin >= lowerBin) return null;
+  if (narrow) return "narrow range lower bound breached";
+  if (!(threshold > 0) || !(binStep > 0)) return null;
   const drop = -100 * Math.expm1((activeBin - lowerBin) * Math.log1p(binStep / 10_000));
   return drop >= threshold ? `Below-range hard exit (${drop.toFixed(2)}% below lower bound)` : null;
+}
+
+export function narrowNetLossStop(narrow, pnlPct) {
+  return narrow && Number.isFinite(pnlPct) && pnlPct <= -3 + 1e-9 ? "narrow range stop loss (3% estimated net)" : null;
 }
 
 /**

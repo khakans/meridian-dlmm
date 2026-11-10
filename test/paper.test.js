@@ -13,13 +13,14 @@ import { assessRebalance, prepareRebalanceTrial, rebalanceDue, REBALANCE_CHECK_M
 import { prepareEntrySpot, prepareTokenRunner, sampleTokenRunner } from '../standalone/paper-token-runner.js';
 import { applyHoldCheck, canEnrollLongRun, holdEvidence, longRunSpotReady, longRunState, observeHold, prepareLongHold, updateLongRun } from '../standalone/paper-long-run.js';
 import { WalletMonitor } from '../standalone/monitor.js';
-import { lowerRangeStop } from '../exit-rules.js';
+import { lowerRangeStop, narrowNetLossStop } from '../exit-rules.js';
 import { entryCreatedTokenAccounts, settlementCashCosts, settlementComplete, tokenDelta } from '../standalone/settlement.js';
 import { meetsSettlementMinimum } from '../tools/wallet.js';
 import { positionsPage, readLiveReportBook } from '../standalone/positions-view.js';
 import { canRetryUnsignedEntry, estimateNetExitPct, isRetryableEntryError, netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
 import { DLMM_PROGRAM, recoverablePositionRent } from '../standalone/events.js';
 import { MonitorStore, recentSignalCounts } from '../standalone/store.js';
+import { selectNarrowPool } from '../standalone/screening.js';
 
 test('settlement only attributes the closed mint balance change to the specified wallet', () => {
   const token = (owner, mint, amount) => ({ owner, mint, uiTokenAmount: { amount } });
@@ -34,6 +35,29 @@ test('hard lower-range stop measures price beyond the lower bin, not position Pn
   assert.equal(lowerRangeStop(98, 100, 100, 2), null);
   assert.match(lowerRangeStop(97, 100, 100, 2), /2\.94% below lower bound/);
   assert.equal(lowerRangeStop(97, null, 100, 2), null);
+  assert.equal(lowerRangeStop(99, 100, 80, 2), null);
+  assert.match(lowerRangeStop(99, 100, 80, 2, true), /narrow range lower bound/);
+  assert.equal(lowerRangeStop(100, 100, 80, 2, true), null);
+  assert.match(narrowNetLossStop(true, -3), /3%/);
+  assert.equal(narrowNetLossStop(true, -2.99), null);
+  assert.equal(narrowNetLossStop(true, null), null);
+  assert.equal(narrowNetLossStop(false, -5), null);
+});
+
+test('Live narrow pool selection tries the next pool and adapts width to support and bin step', async () => {
+  const now = 1_794_200_400;
+  const candles = low => Array.from({ length: 6 }, (_, i) => ({
+    timestamp: now - (6 - i) * 300, open: 1, close: 1, low, high: 1.01, volume: 1000,
+  }));
+  const pools = [['break', 80, 0.5], ['fits', 50, 0.83], ['too-wide', 81, 0.95]]
+    .map(([pool_address, bin_step, low]) => ({ pool_address, dlmm_params: { bin_step }, low }));
+  const sample = async p => ({ active: { price: 1, binStep: p.dlmm_params.bin_step }, candles: candles(p.low) });
+  const result = await selectNarrowPool(pools, now, sample);
+  assert.equal(result.pool.pool_address, 'fits');
+  assert.equal(result.narrowSetup.width, 45);
+  assert.equal((await selectNarrowPool([{ ...pools[1], low: 0.9 }], now, sample)).narrowSetup.width, 35);
+  assert.equal(await selectNarrowPool([pools[2]], now, sample), null);
+  assert.equal(await selectNarrowPool([pools[1]], now, async p => ({ ...await sample(p), active: { price: 1, binStep: 51 } })), null);
 });
 import { emptyMonitor, openModeDatabase } from '../standalone/database.js';
 

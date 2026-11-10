@@ -44,12 +44,18 @@ function nonEmptyString(...values) {
   return null;
 }
 
+const shadowMode = u.shadowMode !== false || process.env.DRY_RUN === "true";
+const liveNarrowRange = u.liveNarrowRange === true;
+const narrowRangeMaxBinStep = Math.max(1, Math.floor(numericConfig(u.narrowRangeMaxBinStep ?? u.paperNarrowRangeMaxBinStep) ?? 80));
+const narrowRangeMinBinStep = Math.min(narrowRangeMaxBinStep,
+  Math.max(1, Math.floor(numericConfig(u.narrowRangeMinBinStep) ?? 50)));
+
 export const config = {
   // The standalone wallet-triggered bot IS the app — there is no mode toggle.
   // The LLM/server-driven flow lives on the `legacy` branch.
   // Shadow mode never submits transactions.
   standalone: {
-    shadow: u.shadowMode !== false || process.env.DRY_RUN === "true",
+    shadow: shadowMode,
     monitorRpcUrl: nonEmptyString(process.env.MONITOR_RPC_URL, u.monitorRpcUrl, process.env.RPC_URL),
     monitorWsUrl: nonEmptyString(process.env.MONITOR_WS_URL, u.monitorWsUrl),
     balanceRpcUrl: nonEmptyString(process.env.BALANCE_RPC_URL, u.balanceRpcUrl, process.env.RPC_URL),
@@ -83,8 +89,8 @@ export const config = {
     minHolders:        u.minHolders        ?? 500,
     minMcap:           u.minMcap           ?? 150_000,
     maxMcap:           u.maxMcap           ?? 10_000_000,
-    minBinStep:        u.minBinStep        ?? 80,
-    maxBinStep:        u.maxBinStep        ?? 125,
+    minBinStep:        !shadowMode && liveNarrowRange ? narrowRangeMinBinStep : u.minBinStep ?? 80,
+    maxBinStep:        !shadowMode && liveNarrowRange ? Math.min(u.maxBinStep ?? 125, narrowRangeMaxBinStep) : u.maxBinStep ?? 125,
     timeframe:         u.timeframe         ?? "5m",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
     maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
@@ -107,7 +113,6 @@ export const config = {
     paperTokenRunner: u.paperTokenRunner !== false,
     paperLongRun: u.paperLongRun !== false,
     paperLongRunSpot: u.paperLongRunSpot !== false,
-    paperNarrowRangeMaxBinStep: Math.max(1, Math.floor(numericConfig(u.paperNarrowRangeMaxBinStep) ?? 80)),
     paperBankrollSol: Math.max(0.1, numericConfig(u.paperBankrollSol) ?? 2),
     paperDailyLossLimitPct: Math.min(100, Math.max(0.1, numericConfig(u.paperDailyLossLimitPct) ?? 5)),
     paperDrawdownLimitPct: Math.min(100, Math.max(0.1, numericConfig(u.paperDrawdownLimitPct) ?? 15)),
@@ -161,6 +166,9 @@ export const config = {
     autoRebalance: u.autoRebalance !== false,
     minBinsBelow: strategyMinBinsBelow,
     pairMode: ENTRY_PAIR_MODES.includes(u.pairMode) ? u.pairMode : u.dualSidedEntry === true ? "dual" : "single",
+    liveNarrowRange,
+    narrowRangeMinBinStep,
+    narrowRangeMaxBinStep,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
     defaultBinsAbove: strategyDefaultBinsAbove,

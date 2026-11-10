@@ -6,6 +6,8 @@ import { isBaseMintOnCooldown, isPoolOnCooldown } from '../pool-memory.js';
 import { fetchJson, readRpc } from './rpc.js';
 import { TOKEN_PROGRAMS } from './balances.js';
 import { analyzePoolWithChronos } from './chronos.js';
+import { entryCandles, liveNarrowEntryRange } from './entry-plans.js';
+import { getActiveBin } from '../tools/dlmm.js';
 
 const number = value => value == null || value === '' ? null : Number.isFinite(Number(value)) ? Number(value) : null;
 const discovery = 'https://pool-discovery-api.datapi.meteora.ag/pools';
@@ -72,6 +74,25 @@ export async function checkMintOnChain(mint) {
   }
   return info.decimals;
 }
+export async function selectNarrowPool(candidates, now, sample = async pool => {
+  const [active, candles] = await Promise.all([
+    getActiveBin({ pool_address: pool.pool_address }),
+    entryCandles(pool.pool_address, now),
+  ]);
+  return { active, candles };
+}) {
+  const plans = await Promise.all(candidates.slice(0, 3).map(async pool => {
+    try {
+      const { active, candles } = await sample(pool);
+      const binStep = Number(pool.dlmm_params?.bin_step);
+      if (active.binStep !== binStep) return null;
+      const width = liveNarrowEntryRange(candles, { now, price: Number(active.price), binStep });
+      return width ? { pool, narrowSetup: { width, candles, at: now } } : null;
+    } catch { return null; }
+  }));
+  return plans.find(Boolean) ?? null;
+}
+
 export async function screenMint(mint, { poolAddress = null, thresholds = config.screening } = {}) {
   if (isBlacklisted(mint) || isBaseMintOnCooldown(mint)) return { pass: false, terminal: true, reason: 'Token is blocked or on cooldown' };
   const assets = await fetchJson(`https://datapi.jup.ag/v1/assets/search?query=${mint}`);
@@ -86,11 +107,16 @@ export async function screenMint(mint, { poolAddress = null, thresholds = config
     return { pass: false, terminal: true, reason: error.message };
   }
   let addresses;
+  const narrow = !config.standalone.shadow && config.strategy.liveNarrowRange;
   if (poolAddress) addresses = [poolAddress];
   else {
     const pools = await fetchJson(`https://dlmm.datapi.meteora.ag/pools?${new URLSearchParams({ query: mint, page_size: '50', sort_by: 'tvl:desc' })}`);
     if (!Array.isArray(pools.data)) throw new Error('Invalid pool search response');
-    addresses = pools.data.filter(p => p.token_x?.address === mint && p.token_y?.address === config.tokens.SOL).map(p => p.address).slice(0, 10);
+    addresses = pools.data.filter(p => {
+      if (p.token_x?.address !== mint || p.token_y?.address !== config.tokens.SOL) return false;
+      const step = number(p.bin_step ?? p.dlmm_params?.bin_step);
+      return !narrow || step == null || (step >= thresholds.minBinStep && step <= thresholds.maxBinStep);
+    }).map(p => p.address).slice(0, 10);
   }
   const candidates = [], rejected = [];
   for (const address of addresses) {
@@ -106,7 +132,7 @@ export async function screenMint(mint, { poolAddress = null, thresholds = config
     } catch (e) { rejected.push(e.message); }
   }
   candidates.sort((a, b) => b.fee_active_tvl_ratio - a.fee_active_tvl_ratio || b.active_tvl - a.active_tvl || a.pool_address.localeCompare(b.pool_address));
-  if (candidates.length > 1) {
+  if (candidates.length > 1 && !narrow) {
     const chronos = await analyzePoolWithChronos(candidates[0].pool_address, {
       binStep: candidates[0].dlmm_params?.bin_step ?? 100,
       activePrice: candidates[0].pool_price,
@@ -119,6 +145,11 @@ export async function screenMint(mint, { poolAddress = null, thresholds = config
       return base * mult;
     };
     candidates.sort((a, b) => scoreCandidate(b) - scoreCandidate(a) || b.active_tvl - a.active_tvl || a.pool_address.localeCompare(b.pool_address));
+  }
+  if (narrow && candidates.length) {
+    const selected = await selectNarrowPool(candidates, Math.floor(Date.now() / 1000));
+    return selected ? { pass: true, ...selected, token, decimals, fetchedAt: Date.now() }
+      : { pass: false, reason: 'Range sempit: support, candle, atau bin step tidak memenuhi syarat' };
   }
   return candidates.length ? { pass: true, pool: candidates[0], token, decimals, fetchedAt: Date.now() } : { pass: false, reason: rejected.slice(0, 3).join('; ') || 'No eligible token/SOL pool' };
 }

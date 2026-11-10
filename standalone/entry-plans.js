@@ -48,15 +48,21 @@ function entryMarket(candles, { now, binStep, price }) {
   return { rows, bins, drift, path, directionality, recentDrift, moveSinceClose, falling, thin, recentVolume, priorVolume };
 }
 
-export function narrowEntryRange(candles, market, baselineWidth, minimumWidth) {
-  if (!Number.isSafeInteger(market.binStep) || market.binStep > config.research.paperNarrowRangeMaxBinStep) return null;
+export function narrowEntryRange(candles, market, maximumWidth, minimumWidth) {
+  if (!Number.isSafeInteger(market.binStep) || market.binStep > config.strategy.narrowRangeMaxBinStep) return null;
   const trend = entryMarket(candles, market);
   if (!trend || trend.falling || trend.thin) return null;
   const support = Math.min(...trend.rows.slice(0, -1).map(c => c.low));
   if (Math.min(market.price, trend.rows.at(-1).close) < support) return null;
   const ratio = 1 + market.binStep / 10_000;
-  return [35, 45].find(width => width >= minimumWidth && width < baselineWidth &&
+  return [35, 45].find(width => width >= minimumWidth && width <= maximumWidth &&
     market.price / ratio ** width <= support * 0.98) ?? null;
+}
+
+export function liveNarrowEntryRange(candles, market) {
+  const { minBinsBelow, maxBinsBelow, narrowRangeMinBinStep } = config.strategy;
+  if (market.binStep < narrowRangeMinBinStep) return null;
+  return narrowEntryRange(candles, market, Math.min(45, maxBinsBelow), minBinsBelow);
 }
 
 export function chooseEntryPair(mode, candles, market) {
