@@ -49,6 +49,7 @@ function entryMarket(candles, { now, binStep, price }) {
 }
 
 export function narrowEntryRange(candles, market, baselineWidth, minimumWidth) {
+  if (!Number.isSafeInteger(market.binStep) || market.binStep > config.research.paperNarrowRangeMaxBinStep) return null;
   const trend = entryMarket(candles, market);
   if (!trend || trend.falling || trend.thin) return null;
   const support = Math.min(...trend.rows.slice(0, -1).map(c => c.low));

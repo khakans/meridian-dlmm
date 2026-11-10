@@ -834,6 +834,7 @@ async function lifecycleStatusLines(detailed = false) {
     }
     const trialFrom = Math.max(now - 30 * 86_400_000, resetAt);
     if (detailed) lines.push(...shapeTrialLines(paper?.closed, trialFrom));
+    if (detailed) lines.push(`Uji range sempit · Single SOL + Spot · bin step ≤${config.research.paperNarrowRangeMaxBinStep} bps`);
     lines.push(...narrowRangeLines(paper, trialFrom, detailed));
     lines.push(...rebalanceTrialLines(paper, trialFrom, detailed));
     lines.push(...tokenRunnerLines(paper, from, now, detailed));

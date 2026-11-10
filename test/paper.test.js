@@ -242,14 +242,16 @@ test('narrow Shadow range keeps a support buffer and exits before the baseline l
   }));
   const bin = { supply: 0n, xAmount: 0n, yAmount: 0n, pricePerToken: 1,
     feeAmountXPerTokenStored: 0n, feeAmountYPerTokenStored: 0n };
-  const input = { source: 'discovery', mint: 'mint', pool: 'pool', decimals: 6, binStep: 100, binsBelow: 69,
+  const input = { source: 'discovery', mint: 'mint', pool: 'pool', decimals: 6, binStep: 80, binsBelow: 69,
     capital: 0.15, shape: 'spot', pairEntry: { mode: 'auto', side: 'single' },
     entry: { binId: 0, price: 1, bins: new Map(Array.from({ length: 70 }, (_, i) => [-i, bin])) } };
   const mirror = prepareMirrorPosition(input, now * 1000);
   const narrow = prepareNarrowRangeTrial(input, mirror, candles(0.85), now);
   assert.deepEqual([narrow.lower, narrow.upper, narrow.openedAt, narrow.capital, narrow.rangeTrial],
     [-35, 0, mirror.openedAt, mirror.capital, mirror.id]);
-  assert.equal(prepareNarrowRangeTrial(input, mirror, candles(0.68), now).lower, -45);
+  assert.equal(prepareNarrowRangeTrial(input, mirror, candles(0.75), now).lower, -45);
+  assert.equal(prepareNarrowRangeTrial({ ...input, binStep: 81 }, mirror, candles(0.85), now), null);
+  assert.equal(prepareNarrowRangeTrial({ ...input, binStep: 100 }, mirror, candles(0.85), now), null);
   assert.equal(prepareNarrowRangeTrial(input, mirror, candles(0.5), now), null);
   assert.equal(prepareNarrowRangeTrial(input, mirror, candles(0.85).slice(1), now), null);
   assert.equal(prepareNarrowRangeTrial({ ...input, binsBelow: 35 }, mirror, candles(0.85), now), null);

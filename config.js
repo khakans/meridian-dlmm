@@ -107,6 +107,7 @@ export const config = {
     paperTokenRunner: u.paperTokenRunner !== false,
     paperLongRun: u.paperLongRun !== false,
     paperLongRunSpot: u.paperLongRunSpot !== false,
+    paperNarrowRangeMaxBinStep: Math.max(1, Math.floor(numericConfig(u.paperNarrowRangeMaxBinStep) ?? 80)),
     paperBankrollSol: Math.max(0.1, numericConfig(u.paperBankrollSol) ?? 2),
     paperDailyLossLimitPct: Math.min(100, Math.max(0.1, numericConfig(u.paperDailyLossLimitPct) ?? 5)),
     paperDrawdownLimitPct: Math.min(100, Math.max(0.1, numericConfig(u.paperDrawdownLimitPct) ?? 15)),

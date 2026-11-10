@@ -42,6 +42,7 @@
   "paperTokenRunner": true,
   "paperLongRun": true,
   "paperLongRunSpot": true,
+  "paperNarrowRangeMaxBinStep": 80,
   "paperBankrollSol": 2,
   "paperDailyLossLimitPct": 5,
   "paperDrawdownLimitPct": 15,
