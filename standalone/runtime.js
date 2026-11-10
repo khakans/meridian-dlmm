@@ -11,7 +11,7 @@ import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import { repoPath } from "../repo-root.js";
 import { sendNotification as notify, setNotificationMirror } from "../telegram.js";
-import { MonitorStore, entryDeadlineReason, finishSignal, recentSignalCounts } from "./store.js";
+import { MonitorStore, entryDeadlineReason, entrySignalRoute, finishSignal, qualifyingEvents, recentSignalCounts, registerDiscoverySignal } from "./store.js";
 import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
@@ -255,7 +255,12 @@ async function drainSignals() {
   pursuing = true;
   try {
     while (signalQueue.length && !shuttingDown) {
-      const signal = signalQueue.shift();
+      const priority = signalQueue.findIndex(signal => {
+        if (signal.done || signal.deadline <= Date.now()) return false;
+        const route = entrySignalRoute(signal, store.data.wallets, config.standalone);
+        return route.corroborated && route.source === "convergence";
+      });
+      const [signal] = signalQueue.splice(Math.max(0, priority), 1);
       if (signal.done || store.data.paused) continue;
       try {
         await pursueSignal(signal);
@@ -272,16 +277,20 @@ async function drainSignals() {
 // Run one attempt per turn so the retry delay never holds up other signals.
 async function pursueSignal(signal) {
   if (Date.now() < signal.deadline) {
+    const route = entrySignalRoute(signal, store.data.wallets, config.standalone);
     if (!signal.entryStage) {
-      const wallets = signal.events.map(e => `${e.wallet.slice(0, 6)}(◎${e.depositSol.toFixed(1)})`).join(", ");
-      log("signal", `${signal.source ?? "convergence"} on ${signal.mint.slice(0, 8)}: ${signal.events.length} wallets [${wallets}] — screening with ${config.standalone.screeningDeadlineSec}s deadline`);
+      const wallets = route.events.map(e => `${e.wallet.slice(0, 6)}(◎${e.depositSol.toFixed(1)})`).join(", ");
+      log("signal", `${route.source} on ${signal.mint.slice(0, 8)}: ${route.events.length} wallets [${wallets}] — screening with ${config.standalone.screeningDeadlineSec}s deadline`);
     }
     const stage = name => {
       signal.entryStage = name;
       signal.entryStageAt = Date.now();
     };
-    const reason = await attemptEntry(signal, stage);
+    const reason = await attemptEntry(signal, stage, route);
     if (reason == null || signal.done || shuttingDown || store.data.paused) return;
+    if (route.corroborated && /^(wallet exposure gone|deploy failed \(Pre-submit recheck failed: wallet exposure gone)/.test(reason)) {
+      signal.rejectedConfirmationAt = route.confirmationAt;
+    }
     if (reason !== "entry stopped or expired") {
       const safe = reason.replace(/https?:\/\/\S+/g, "[endpoint]");
       if (safe !== signal.lastEntryReason) {
@@ -310,7 +319,7 @@ async function pursueSignal(signal) {
 
 // One entry attempt. Returns null when the signal is finished (entered,
 // terminal rejection, or fatal condition), or a reason string to retry.
-async function attemptEntry(signal, stage) {
+async function attemptEntry(signal, stage, route) {
   if (store.data.paused || signal.done) return null;
   stage("entry guards");
   const mint = signal.mint;
@@ -338,7 +347,10 @@ async function attemptEntry(signal, stage) {
 
   // A failed position read is unavailable data, never "no positions".
   const shadow = config.standalone.shadow;
-  const source = signal.source ?? "convergence";
+  const { source, events } = route;
+  if (source === "convergence" && events.length < config.standalone.walletThreshold) {
+    return `wallet exposure gone (${events.length}/${config.standalone.walletThreshold} remain)`;
+  }
   const paper = store.data.paper;
   const lossCutoff = Date.now() - config.management.repeatDeployCooldownHours * 3_600_000;
   const recentNetLoss = config.management.repeatDeployCooldownEnabled && (shadow
@@ -353,17 +365,17 @@ async function attemptEntry(signal, stage) {
   stage("portfolio positions");
   const positions = shadow ? { positions: mirror } : await getMyPositions({ force: true }).catch(() => null);
   if (!positions || positions.error || !Array.isArray(positions.positions)) return "position read unavailable";
-  if (positions.positions.length >= config.risk.maxPositions ||
-      positions.positions.some(p => (p.mint ?? p.base_mint) === mint)) {
-    finishSignal(store, signal, "portfolio full or mint already open");
+  if (positions.positions.some(p => (p.mint ?? p.base_mint) === mint)) {
+    finishSignal(store, signal, "mint already open");
     return null;
   }
+  if (positions.positions.length >= config.risk.maxPositions) return "portfolio full; waiting for slot";
 
   // Focused screening: this mint and its eligible pools only.
   stage("screening");
   let screened;
   try {
-    screened = await screenMint(mint, { poolAddress: signal.pool });
+    screened = await screenMint(mint, { poolAddress: route.pool });
   } catch (e) {
     return `screening error: ${e.message}`;
   }
@@ -378,7 +390,7 @@ async function attemptEntry(signal, stage) {
   const simulatedSol = shadow ? config.research.paperBankrollSol + (paper?.mirrorRealized ?? 0) -
     mirror.reduce((total, p) => total + p.capital, 0) : null;
   stage("market and wallet recheck");
-  const gate = await finalRecheck(signal, screened, simulatedSol);
+  const gate = await finalRecheck(signal, route, screened, simulatedSol);
   if (gate) return gate;
 
   const balances = shadow ? { sol: simulatedSol } : await getWalletBalances({ force: true, nativeOnly: true });
@@ -522,7 +534,7 @@ async function attemptEntry(signal, stage) {
     } catch { return "entry range unavailable for selected shape"; }
   }
   stage("final market recheck");
-  const fresh = await finalRecheck(signal, screened, simulatedSol);
+  const fresh = await finalRecheck(signal, route, screened, simulatedSol);
   if (fresh) return fresh;
   if (shadow) {
     if (!Number.isSafeInteger(entry.binId) || (await getActiveBin({ pool_address: pool.pool_address })).binId !== entry.binId) {
@@ -548,7 +560,8 @@ async function attemptEntry(signal, stage) {
   // Checkpoint before building anything: a crash mid-sequence leaves a
   // recovery pointer instead of a silent duplicate-entry risk.
   store.data.attempts[mint] = {
-    at: Date.now(), mint, pool: pool.pool_address, source, wallets: signal.events.map(e => e.wallet),
+    at: Date.now(), mint, pool: pool.pool_address, source, wallets: events.map(e => e.wallet),
+    discoverySources: route.corroborated ? (signal.discovery?.sources ?? signal.sources) : undefined,
     status: "submitting", failures: retryablePrior ? 0 : attempt?.failures ?? 0, position: null, txs: [],
     amountSol: amountY, strategy: plan.shape, shapeMode, shapeReason: plan.reason, pairEntry, narrowRange, binStep: entry.binStep, journalVersion: 1,
   };
@@ -583,7 +596,7 @@ async function attemptEntry(signal, stage) {
       // Subsequent chunks of a multi-tx LP creation skip recheck so a half-built position completes.
       if (step !== "swap" && submitted++ > 0) return;
       stage("pre-submit recheck");
-      const fresh = await finalRecheck(signal, screened);
+      const fresh = await finalRecheck(signal, route, screened);
       if (fresh) throw new Error(`Pre-submit recheck failed: ${fresh}`);
       const active = await getActiveBin({ pool_address: pool.pool_address });
       if (active.binId !== entry.binId) throw new Error("Active bin changed before entry");
@@ -614,7 +627,8 @@ async function attemptEntry(signal, stage) {
     finishSignal(store, signal, record.status === "proposed" ? "shadow proposal recorded" : "entered");
     const label = result.dry_run ? "[SHADOW] Would deploy" : "Deployed";
     log("entry", `${label} ${amountY} SOL → pool ${pool.pool_address.slice(0, 8)} mint ${mint.slice(0, 8)} (${binsBelow} bins below, ${source}, ${plan.shape}: ${plan.reason})`);
-    void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.pool_address.slice(0, 8)} (mint ${mint.slice(0, 8)}, ${signal.events.length} wallets)\nPair Mode ${pairModeLabel(pairMode, pairEntry.side)}${pairMode === "auto" ? ` · ${pairEntry.reason}` : ""}\nShape ${shapeLabel(plan.shape, shapeMode)}${shapeMode === "auto" ? ` · ${plan.reason}` : ""}${narrowRange ? `\nRange sempit ${binsBelow} bin · step ${entry.binStep} bps` : ""}`);
+    const entrySource = source === "convergence" ? (route.corroborated ? "Discovery + Convergence" : "Convergence") : "Discovery";
+    void notify(`${result.dry_run ? "🕯️ Shadow proposal" : "✅ Entry"}: ${amountY} SOL → ${pool.pool_address.slice(0, 8)} (mint ${mint.slice(0, 8)})\nSumber ${entrySource}${events.length ? ` · ${events.length} wallet` : ""}\nPair Mode ${pairModeLabel(pairMode, pairEntry.side)}${pairMode === "auto" ? ` · ${pairEntry.reason}` : ""}\nShape ${shapeLabel(plan.shape, shapeMode)}${shapeMode === "auto" ? ` · ${plan.reason}` : ""}${narrowRange ? `\nRange sempit ${binsBelow} bin · step ${entry.binStep} bps` : ""}`);
     return null;
   }
 
@@ -642,16 +656,17 @@ async function attemptEntry(signal, stage) {
 // Immediate pre-entry conditions: the triggering wallets still hold their
 // exposure, the market has not run away since screening, and spendable funds
 // cover the entry. Returns null when everything holds, else the reason.
-async function finalRecheck(signal, screened, simulatedSol = null) {
+async function finalRecheck(signal, route, screened, simulatedSol = null) {
   if (shuttingDown || store.data.paused || signal.done || Date.now() >= signal.deadline) return "entry stopped or expired";
-  let present = 0;
+  const present = [];
   const checkedAt = Date.now();
-  for (const e of signal.events) {
+  for (const e of route.events) {
     if (!store.data.wallets[e.wallet] || checkedAt - e.at > config.standalone.windowSec * 1000) continue;
-    try { if (await exposureStillPresent(e)) present++; } catch { /* unreadable position = not confirmed */ }
+    try { if (await exposureStillPresent(e)) present.push(e); } catch { /* unreadable position = not confirmed */ }
   }
-  if (signal.source !== "discovery" && present < config.standalone.walletThreshold) {
-    return `wallet exposure gone (${present}/${signal.events.length} remain)`;
+  if (route.source === "convergence") {
+    const current = qualifyingEvents(present.filter(e => store.data.wallets[e.wallet]), signal.mint, config.standalone).length;
+    if (current < config.standalone.walletThreshold) return `wallet exposure gone (${current}/${route.events.length} remain)`;
   }
   try {
     const fresh = await poolDetail(screened.pool.pool_address);
@@ -1193,16 +1208,10 @@ export async function startStandalone() {
     notify,
     onMatch: (mint, screened, sources) => {
       store.data.preflightCandidate = { mint, pool: screened.pool.pool_address, at: Date.now() };
-      const now = Date.now();
-      const prior = store.data.signals[mint];
-      const cooldownUntil = prior?.cooldownUntil ?? ((prior?.closedAt ?? prior?.deadline ?? now) + 300_000);
-      if (!shuttingDown && !store.data.paused && (!prior || (prior.done && now >= cooldownUntil))) {
-        const signal = { mint, pool: screened.pool.pool_address, source: "discovery", sources, events: [],
-          createdAt: now, deadline: now + config.standalone.screeningDeadlineSec * 1000, done: false };
-        store.data.signals[mint] = signal;
-        store.save();
-        onSignal(signal);
-      } else store.save();
+      const signal = !shuttingDown && registerDiscoverySignal(store, mint, screened.pool.pool_address, sources,
+        config.standalone.screeningDeadlineSec * 1000);
+      store.save();
+      if (signal) onSignal(signal);
     },
     stats: discoveryStats,
   });

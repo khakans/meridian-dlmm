@@ -52,6 +52,7 @@ export function isRetryableEntryError(error) {
     error === '50/50 buy quote moved too far or could not fill at the required price' ||
     error === 'Insufficient liquidity in binArrays for swapQuote' ||
     error === 'Entry stopped or expired before broadcast' ||
+    /^Pre-submit recheck failed: wallet exposure gone \(\d+\/\d+ remain\)$/.test(error) ||
     error === 'Pre-submit recheck failed: entry stopped or expired'
   );
 }

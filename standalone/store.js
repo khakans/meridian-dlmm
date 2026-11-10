@@ -66,19 +66,23 @@ export function recentSignalCounts(store, now = Date.now()) {
   const archived = store.database?.db.prepare(`
     SELECT json_extract(value, '$.mint') AS mint,
            json_extract(value, '$.createdAt') AS createdAt,
-           json_extract(value, '$.source') AS source
+           json_extract(value, '$.source') AS source,
+           json_extract(value, '$.discovery.at') AS discoveryAt,
+           json_extract(value, '$.convergence.at') AS convergenceAt
       FROM history
      WHERE kind = 'signal' AND at >= ?
   `).all(from) ?? [];
   // Finished signals can still be present in the per-mint monitor snapshot.
-  const unique = new Map();
+  const unique = { discovery: new Set(), convergence: new Set() };
   for (const signal of [...archived, ...Object.values(store.data.signals)]) {
-    if (!signal.mint || !Number.isSafeInteger(signal.createdAt) || signal.createdAt <= from || signal.createdAt > now) continue;
-    unique.set(`${signal.mint}:${signal.createdAt}`, signal.source === 'discovery' ? 'discovery' : 'convergence');
+    if (!signal.mint) continue;
+    const discovery = signal.source === 'discovery' ? signal.createdAt : signal.discoveryAt ?? signal.discovery?.at;
+    const convergence = signal.source === 'discovery' ? signal.convergenceAt ?? signal.convergence?.at : signal.createdAt;
+    for (const [source, at] of [['discovery', discovery], ['convergence', convergence]]) {
+      if (Number.isSafeInteger(at) && at > from && at <= now) unique[source].add(`${signal.mint}:${at}`);
+    }
   }
-  const counts = { discovery: 0, convergence: 0 };
-  for (const source of unique.values()) counts[source]++;
-  return counts;
+  return { discovery: unique.discovery.size, convergence: unique.convergence.size };
 }
 
 export function qualifyingEvents(events, mint, options, now = Date.now()) {
@@ -89,6 +93,33 @@ export function qualifyingEvents(events, mint, options, now = Date.now()) {
     if (!latest.has(group) || latest.get(group).at < e.at) latest.set(group, e);
   }
   return [...latest.values()];
+}
+
+export function entrySignalRoute(signal, wallets, options, now = Date.now()) {
+  const discovery = signal.source === 'discovery' ? signal : signal.discovery;
+  const proof = signal.convergence ?? (signal.source !== 'discovery' ? { events: signal.events, updatedAt: signal.createdAt } : null);
+  const events = proof && proof.updatedAt !== signal.rejectedConfirmationAt
+    ? qualifyingEvents(proof.events.filter(e => wallets[e.wallet]), signal.mint, options, now) : [];
+  if (events.length < options.walletThreshold && discovery) {
+    return { source: 'discovery', pool: discovery.pool, events: [] };
+  }
+  return { source: 'convergence', pool: signal.pool, events,
+    confirmationAt: proof?.updatedAt, corroborated: Boolean(discovery) };
+}
+
+export function registerDiscoverySignal(store, mint, pool, sources, deadlineMs, now = Date.now()) {
+  if (store.data.paused) return null;
+  const prior = store.data.signals[mint];
+  if (prior && !prior.done) {
+    if (prior.source !== 'discovery' && prior.deadline > now) prior.discovery ??= { at: now, pool, sources };
+    return null;
+  }
+  const cooldownUntil = prior?.cooldownUntil ?? ((prior?.closedAt ?? prior?.deadline ?? now) + 300_000);
+  if (prior && now < cooldownUntil) return null;
+  const signal = { mint, pool, source: 'discovery', sources, events: [],
+    createdAt: now, deadline: now + deadlineMs, done: false };
+  store.data.signals[mint] = signal;
+  return signal;
 }
 export function acceptEvents(store, events, options, now = Date.now()) {
   for (const e of events) {
@@ -107,11 +138,21 @@ export function acceptEvents(store, events, options, now = Date.now()) {
       reason: existing && (!existing.done || now < existing.cooldownUntil) ? 'active or cooldown' :
         recent.length >= options.walletThreshold ? 'threshold reached' : 'waiting for distinct wallets',
     };
-    if (existing && (!existing.done || now < existing.cooldownUntil)) continue;
-    // A completed signal cannot be reused after its cooldown.
     if (store.data.paused) continue;
-    const fresh = recent.filter(e => e.at > (store.data.entryResumedAt ?? 0) && (!existing || e.at > existing.closedAt));
+    const minAt = Math.max(store.data.entryResumedAt ?? 0, existing?.done ? existing.closedAt : 0);
+    const fresh = recent.filter(e => e.at > minAt);
     if (fresh.length < options.walletThreshold) continue;
+    if (existing && !existing.done) {
+      const previous = existing.convergence?.events ?? existing.events ?? [];
+      if (existing.deadline > now && fresh.some(event => !previous.some(e => e.id === event.id))) {
+        const at = existing.convergence?.at ?? (existing.source === 'discovery' ? now : existing.createdAt);
+        const updatedAt = Math.max(now, (existing.convergence?.updatedAt ?? existing.createdAt) + 1);
+        existing.convergence = { at, updatedAt, events: fresh };
+        store.data.convergenceDiagnostics[mint].reason = existing.source === 'discovery' ? 'Discovery + Convergence' : 'Convergence wallets updated';
+      }
+      continue;
+    }
+    if (existing && now < existing.cooldownUntil) continue;
     const signal = { mint, createdAt: now, deadline: now + options.screeningDeadlineSec * 1000, nextCheck: now, events: fresh, done: false };
     store.data.signals[mint] = signal;
     triggered.push(signal);

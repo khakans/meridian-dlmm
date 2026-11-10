@@ -19,7 +19,7 @@ import { meetsSettlementMinimum } from '../tools/wallet.js';
 import { positionsPage, readLiveReportBook } from '../standalone/positions-view.js';
 import { canRetryUnsignedEntry, estimateNetExitPct, isRetryableEntryError, netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
 import { DLMM_PROGRAM, recoverablePositionRent } from '../standalone/events.js';
-import { MonitorStore, recentSignalCounts } from '../standalone/store.js';
+import { MonitorStore, acceptEvents, entrySignalRoute, finishSignal, recentSignalCounts, registerDiscoverySignal } from '../standalone/store.js';
 import { selectNarrowPool } from '../standalone/screening.js';
 import { narrowCurveEvidence, startNarrowCurveTrial } from '../standalone/narrow-curve.js';
 import { evaluateLiveHold } from '../standalone/live-hold.js';
@@ -186,6 +186,9 @@ test('temporary entry failures are separated from unrelated and post-submit fail
   assert.equal(canRetryUnsignedEntry({ ...failed, txs: ['signature'] }, []), false);
   assert.equal(canRetryUnsignedEntry(failed, [{ status: 'pending' }]), false);
   assert.equal(canRetryUnsignedEntry(failed, [{ status: 'expired' }]), false);
+  const expiredWallets = { txs: [], error: 'Pre-submit recheck failed: wallet exposure gone (1/2 remain)' };
+  assert.equal(canRetryUnsignedEntry(expiredWallets, []), true);
+  assert.equal(canRetryUnsignedEntry(expiredWallets, [{ status: 'confirmed' }]), false);
 });
 
 test('entry expiry retains the last check, reopens after cooldown and leaves a submission to reconciliation', () => {
@@ -834,6 +837,49 @@ test('rolling signal counts include prior same-mint signals and live queue witho
     assert.deepEqual(recentSignalCounts({ database, data: saved }, now + day - 2500), { discovery: 0, convergence: 1 });
   } finally {
     if (database?.db.isOpen) database.db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Discovery and Convergence share one pending entry in either order and keep each signal timestamp', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-overlap-'));
+  const database = openModeDatabase('live', dir);
+  try {
+    const now = 1_800_000_000_000;
+    const options = { walletThreshold: 2, windowSec: 180, screeningDeadlineSec: 120, minDepositSol: 0.1, walletGroups: {} };
+    const data = emptyMonitor();
+    data.wallets = { a: {}, b: {}, c: {} };
+    const store = { data, database, save: () => database.saveMonitor(data), prune() {} };
+    const event = (mint, wallet, at) => ({ id: `${mint}:${wallet}:${at}`, mint, wallet, at, depositSol: 1 });
+    const discovery = registerDiscoverySignal(store, 'first', 'screened-pool', ['Meteora'], 120_000, now);
+    const alreadyRunning = entrySignalRoute(discovery, data.wallets, options, now);
+    assert.equal(alreadyRunning.source, 'discovery');
+    assert.equal(acceptEvents(store, [event('first', 'a', now + 1000), event('first', 'b', now + 2000)], options, now + 2000).length, 0);
+    assert.equal(discovery.deadline, now + 120_000);
+    const shared = entrySignalRoute(discovery, data.wallets, options, now + 2000);
+    assert.equal(shared.source, 'convergence');
+    assert.equal(shared.corroborated, true);
+    assert.equal(shared.pool, 'screened-pool');
+    assert.deepEqual(shared.events.map(e => e.wallet), ['a', 'b']);
+    assert.equal(alreadyRunning.events.length, 0);
+    discovery.rejectedConfirmationAt = shared.confirmationAt;
+    assert.equal(entrySignalRoute(discovery, data.wallets, options, now + 3000).source, 'discovery');
+    acceptEvents(store, [event('first', 'c', now + 4000)], options, now + 4000);
+    assert.equal(entrySignalRoute(discovery, data.wallets, options, now + 4000).events.length, 3);
+
+    const [convergence] = acceptEvents(store, [event('second', 'a', now + 4000), event('second', 'b', now + 4500)], options, now + 4500);
+    assert.equal(registerDiscoverySignal(store, 'second', 'alternative-pool', ['Meteora'], 120_000, now + 5000), null);
+    assert.equal(entrySignalRoute(convergence, data.wallets, options, now + 5000).source, 'convergence');
+    assert.equal(entrySignalRoute(convergence, { a: {} }, options, now + 5000).pool, 'alternative-pool');
+    assert.equal(convergence.deadline, now + 124_500);
+    finishSignal(store, discovery, 'entered', options, now + 6000);
+    finishSignal(store, convergence, 'entered', options, now + 6000);
+    assert.equal(registerDiscoverySignal(store, 'second', 'alternative-pool', ['Meteora'], 120_000, now + 7000), null);
+    assert.deepEqual(recentSignalCounts(store, now + 7000), { discovery: 2, convergence: 2 });
+    assert.deepEqual(recentSignalCounts({ database, data: emptyMonitor() }, now + 7000), { discovery: 2, convergence: 2 });
+    assert.deepEqual(recentSignalCounts({ database, data: emptyMonitor() }, now + 86_401_000), { discovery: 1, convergence: 2 });
+  } finally {
+    database.db.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
