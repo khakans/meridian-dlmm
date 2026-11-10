@@ -16,7 +16,7 @@ import { WalletMonitor } from "./monitor.js";
 import { screenMint, poolDetail } from "./screening.js";
 import { startDiscovery } from "./discovery.js";
 import { chooseEntryPair, entryCandles, isActivePaperVariant, pairModeLabel, resolveEntryShape, scoreShadowScreen, shapeLabel } from "./entry-plans.js";
-import { entryRange, mirrorExitReason, prepareMirrorPosition, prepareShapeTrials, startPaper, validateExitQuote } from "./paper.js";
+import { entryRange, mirrorExitReason, prepareMirrorPosition, prepareNarrowRangeTrial, prepareShapeTrials, startPaper, validateExitQuote } from "./paper.js";
 import { prepareRebalanceTrial } from "./paper-rebalance.js";
 import { canEnrollLongRun, longRunSpotReady, longRunState, prepareLongHold } from "./paper-long-run.js";
 import { prepareEntrySpot } from "./paper-token-runner.js";
@@ -25,7 +25,7 @@ import { canRetryUnsignedEntry, estimateEntryOverheadSol, estimateNetExitPct, po
 import { readRpc } from "./rpc.js";
 import { withWalletLock } from "./transactions.js";
 import { paperDay } from "./paper-accounting.js";
-import { longRunLines, paperPnlLines, paperRealizedLine, rebalanceTrialLines, shapeTrialLines, signed, summarizePaper, tokenRunnerLines } from "./pnl-summary.js";
+import { longRunLines, narrowRangeLines, paperPnlLines, paperRealizedLine, rebalanceTrialLines, shapeTrialLines, signed, summarizePaper, tokenRunnerLines } from "./pnl-summary.js";
 import { openPositions, positionsPage, positionTarget, readLiveReportBook } from "./positions-view.js";
 import { exposureStillPresent, recoverablePositionRent } from "./events.js";
 import { getActiveBin, getMyPositions, getPositionExitInventory, quoteDualSideEntry, simulateEntryPosition } from "../tools/dlmm.js";
@@ -478,6 +478,10 @@ async function attemptEntry(signal, stage) {
           }
         }
       }
+      if (Object.values(paper.open).filter(p => p.rangeTrial).length < 6) {
+        const narrow = prepareNarrowRangeTrial(modelInput, model, candles, candleTime);
+        if (narrow) trials.push(narrow);
+      }
     } catch { return "entry range unavailable for selected shape"; }
   }
   stage("final market recheck");
@@ -830,10 +834,11 @@ async function lifecycleStatusLines(detailed = false) {
     }
     const trialFrom = Math.max(now - 30 * 86_400_000, resetAt);
     if (detailed) lines.push(...shapeTrialLines(paper?.closed, trialFrom));
+    lines.push(...narrowRangeLines(paper, trialFrom, detailed));
     lines.push(...rebalanceTrialLines(paper, trialFrom, detailed));
     lines.push(...tokenRunnerLines(paper, from, now, detailed));
     lines.push(...longRunLines(paper, trialFrom, detailed));
-    const legacy = Object.values(paper?.open ?? {}).filter(p => !p.mirror && !p.shapeTrial && !p.rebalanceTrial && !p.longRunArm).length;
+    const legacy = Object.values(paper?.open ?? {}).filter(p => !p.mirror && !p.shapeTrial && !p.rangeTrial && !p.rebalanceTrial && !p.longRunArm).length;
     if (legacy) lines.push(`Eksperimen lama · ${legacy} posisi terbuka di riwayat paper`);
   }
   if (resetAt > now - 86_400_000) lines.push(`Periode PnL sejak reset ${new Date(resetAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })} WIB`);

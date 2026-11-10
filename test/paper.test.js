@@ -5,9 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { Keypair, SystemProgram, Transaction } from '@solana/web3.js';
 import { config } from '../config.js';
-import { entryRange, mirrorExitReason, paperBins, paperCloseRule, paperInventory, prepareMirrorPosition, prepareShapeTrials, startPaper } from '../standalone/paper.js';
+import { entryRange, mirrorExitReason, narrowLossExit, paperBins, paperCloseRule, paperInventory, paperLowerExit, prepareMirrorPosition, prepareNarrowRangeTrial, prepareShapeTrials, startPaper } from '../standalone/paper.js';
 import { markPaperBins, recommendPaperVariant, seedPaperBins } from '../standalone/paper-accounting.js';
-import { longRunLines, paperPnlLines, paperRealizedLine, shapeTrialLines, summarizePaper, tokenRunnerLines } from '../standalone/pnl-summary.js';
+import { longRunLines, narrowRangeLines, paperPnlLines, paperRealizedLine, shapeTrialLines, summarizePaper, tokenRunnerLines } from '../standalone/pnl-summary.js';
 import { chooseEntryPair, chooseEntryShape, pairModeLabel, resolveEntryShape, scoreShadowScreen, shapeLabel } from '../standalone/entry-plans.js';
 import { assessRebalance, prepareRebalanceTrial, rebalanceDue, REBALANCE_CHECK_MS } from '../standalone/paper-rebalance.js';
 import { prepareEntrySpot, prepareTokenRunner, sampleTokenRunner } from '../standalone/paper-token-runner.js';
@@ -233,6 +233,69 @@ test('Pair Mode picks each funded side, rejects unsafe Auto signals and preserve
   }
   assert.deepEqual(chooseEntryPair('single'), { side: 'single', reason: 'manual' });
   assert.deepEqual(chooseEntryPair('dual'), { side: 'dual', reason: 'manual' });
+});
+
+test('narrow Shadow range keeps a support buffer and exits before the baseline lower stop', () => {
+  const now = 1_794_200_400;
+  const candles = low => Array.from({ length: 6 }, (_, i) => ({
+    timestamp: now - (6 - i) * 300, open: 1, close: 1, low, high: 1.01, volume: 1000,
+  }));
+  const bin = { supply: 0n, xAmount: 0n, yAmount: 0n, pricePerToken: 1,
+    feeAmountXPerTokenStored: 0n, feeAmountYPerTokenStored: 0n };
+  const input = { source: 'discovery', mint: 'mint', pool: 'pool', decimals: 6, binStep: 100, binsBelow: 69,
+    capital: 0.15, shape: 'spot', pairEntry: { mode: 'auto', side: 'single' },
+    entry: { binId: 0, price: 1, bins: new Map(Array.from({ length: 70 }, (_, i) => [-i, bin])) } };
+  const mirror = prepareMirrorPosition(input, now * 1000);
+  const narrow = prepareNarrowRangeTrial(input, mirror, candles(0.85), now);
+  assert.deepEqual([narrow.lower, narrow.upper, narrow.openedAt, narrow.capital, narrow.rangeTrial],
+    [-35, 0, mirror.openedAt, mirror.capital, mirror.id]);
+  assert.equal(prepareNarrowRangeTrial(input, mirror, candles(0.68), now).lower, -45);
+  assert.equal(prepareNarrowRangeTrial(input, mirror, candles(0.5), now), null);
+  assert.equal(prepareNarrowRangeTrial(input, mirror, candles(0.85).slice(1), now), null);
+  assert.equal(prepareNarrowRangeTrial({ ...input, binsBelow: 35 }, mirror, candles(0.85), now), null);
+  assert.equal(prepareNarrowRangeTrial({ ...input, pairEntry: { side: 'dual' } }, mirror, candles(0.85), now), null);
+  assert.equal(paperLowerExit(narrow, { binId: -35, binStep: 100 }), null);
+  assert.match(paperLowerExit(narrow, { binId: -36, binStep: 100 }), /lower bound breached/);
+  assert.equal(paperLowerExit(mirror, { binId: -36, binStep: 100 }), null);
+  assert.equal(narrowLossExit(narrow, -0.0046, false), null);
+  assert.equal(narrowLossExit(narrow, null, true), null);
+  assert.equal(narrowLossExit(mirror, -0.0046, true), null);
+  assert.match(narrowLossExit(narrow, -0.0046, true), /3%/);
+  const closed = [{ ...mirror, pnl: 0.014, closedAt: 1 }, { ...narrow, pnl: -0.0046, wasBelowRange: true, closedAt: 1 }];
+  const report = narrowRangeLines({ closed }, 0, true).join('\n');
+  assert.match(report, /1 pasangan selesai.*-0\.0186 SOL/);
+  assert.match(report, /Sempit.*≥9% 0\/1.*OOR bawah 1/);
+  assert.match(report, /Standar.*≥9% 1\/1.*OOR bawah 0/);
+});
+
+test('narrow Shadow lower exit waits for a real quote and records the full simulated loss', async t => {
+  const before = config.standalone.shadow;
+  config.standalone.shadow = true;
+  t.after(() => { config.standalone.shadow = before; });
+  const q = 1n << 64n;
+  const position = { id: 'narrow', mint: 'mint', pool: 'pool', range: 'volatility',
+    variant: 'range-comparison/narrow', rangeTrial: 'baseline', capital: 0.15, decimals: 6, ratio: 1.01,
+    lower: 0, upper: 0, filledAt: Date.now(), openedAt: Date.now(), costSol: 0.001,
+    binSeed: [{ id: 0, y: '150000000', share: String(q), feeX: '0', feeY: '0' }] };
+  const store = { data: { paper: { open: { narrow: position }, closed: [], realized: { [position.variant]: 0 } } }, save() {} };
+  let proceeds = null, tick;
+  const stop = startPaper(store, async () => {}, {
+    getBin: async () => ({ binId: -1, price: 0.99, binStep: 100 }),
+    snapshot: async () => new Map([[0, { supply: q, xAmount: 150_000n, yAmount: 0n,
+      feeAmountXPerTokenStored: 0n, feeAmountYPerTokenStored: 0n }]]),
+    quote: async () => proceeds,
+    schedule: (run, ms) => { if (ms === 60_000) tick = run; },
+    admitResearch: false,
+  });
+  t.after(stop);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(position.exit.reason, /lower bound breached/);
+  assert.equal(store.data.paper.closed.length, 0);
+  proceeds = 0.12;
+  await tick();
+  assert.equal(store.data.paper.closed.length, 1);
+  assert.equal(store.data.paper.closed[0].wasBelowRange, true);
+  assert.ok(Math.abs(store.data.paper.closed[0].pnl - (-0.031)) < 1e-9);
 });
 
 test('auto rebalance needs three checks, sufficient observed fees and a 30 minute cooldown', () => {

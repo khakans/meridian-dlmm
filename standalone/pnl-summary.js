@@ -3,6 +3,29 @@ import { longRunSpotReady } from './paper-long-run.js';
 
 export const signed = value => `${value >= 0 ? "+" : ""}${value.toFixed(4)}`;
 
+export function narrowRangeLines(paper, from, detailed) {
+  const open = Object.values(paper?.open ?? {}).filter(p => p.rangeTrial).length;
+  const rows = (paper?.closed ?? []).filter(p => p.closedAt >= from && Number.isFinite(p.pnl) && p.capital > 0);
+  const baseline = new Map(rows.filter(p => p.mirror).map(p => [p.id, p]));
+  const closed = rows.filter(p => p.rangeTrial);
+  const matched = closed.filter(p => baseline.has(p.rangeTrial));
+  if (!open && !closed.length) return [];
+  const lines = [`Range sempit Shadow · ${open} aktif · ${matched.length} pasangan selesai${closed.length > matched.length ? ` · ${closed.length - matched.length} menunggu pembanding` : ''}`];
+  if (!matched.length) return lines;
+  const controls = matched.map(p => baseline.get(p.rangeTrial));
+  const delta = matched.reduce((sum, p, i) => sum + p.pnl - controls[i].pnl, 0);
+  lines[0] += ` · Δ net ${signed(delta)} SOL vs range standar`;
+  if (detailed) {
+    for (const [label, group] of [['Sempit', matched], ['Standar', controls]]) {
+      const returns = group.map(p => 100 * p.pnl / p.capital).sort((a, b) => a - b);
+      const mid = Math.floor(returns.length / 2);
+      const median = returns.length % 2 ? returns[mid] : (returns[mid - 1] + returns[mid]) / 2;
+      lines.push(`• ${label} · median ${median.toFixed(2)}% · terburuk ${returns[0].toFixed(2)}% · ≥9% ${returns.filter(v => v >= 9).length}/${group.length} · OOR bawah ${group.filter(p => p.wasBelowRange).length}`);
+    }
+  }
+  return lines;
+}
+
 export function shapeTrialLines(closed = [], from) {
   const cohorts = new Map();
   for (const p of closed) {

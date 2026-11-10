@@ -4,7 +4,7 @@ import { log } from '../logger.js';
 import { getActiveBin, getPaperBinSnapshot } from '../tools/dlmm.js';
 import { quoteTokenToSol } from '../tools/wallet.js';
 import { markPaperBins, paperRiskBlocked, recordPaperNav, seedPaperBins } from './paper-accounting.js';
-import { ENTRY_SHAPES, entryCandles, isActivePaperVariant } from './entry-plans.js';
+import { ENTRY_SHAPES, entryCandles, isActivePaperVariant, narrowEntryRange } from './entry-plans.js';
 import { assessRebalance, rebalanceDue, REBALANCE_CHECK_MS } from './paper-rebalance.js';
 import { prepareTokenRunner, RUNNER_POLL_MS, sampleTokenRunner } from './paper-token-runner.js';
 import { applyHoldCheck, holdEvidence, observeHold, updateLongRun } from './paper-long-run.js';
@@ -84,6 +84,32 @@ export function prepareShapeTrials(input, mirror) {
     return { ...trial, id: `${mirror.id}:${shape}`, mirror: false, shapeTrial: mirror.id,
       variant: `shape-comparison/${shape}` };
   });
+}
+
+export function prepareNarrowRangeTrial(input, mirror, candles, now) {
+  if (input.pairEntry?.side !== 'single' || input.shape !== 'spot' || input.binsAbove > 0) return null;
+  const binsBelow = narrowEntryRange(candles, { now, price: Number(input.entry.price), binStep: input.binStep },
+    input.binsBelow, config.strategy.minBinsBelow);
+  if (!binsBelow) return null;
+  const trial = prepareMirrorPosition({ ...input, binsBelow }, mirror.openedAt);
+  mirror.rangeComparison = true;
+  return { ...trial, id: `${mirror.id}:narrow`, variant: 'range-comparison/narrow', mirror: false,
+    rangeTrial: mirror.id, shapeMode: mirror.shapeMode, shapeReason: mirror.shapeReason };
+}
+
+function tracksRange(p) {
+  return p.shapeTrial || p.shapeComparison || p.rangeTrial || p.rangeComparison;
+}
+
+export function paperLowerExit(p, active) {
+  if (p.rangeTrial && Number.isSafeInteger(active.binId) && active.binId < p.lower) return 'narrow range lower bound breached';
+  return lowerRangeStop(active.binId, p.lower, active.binStep ?? (p.ratio - 1) * 10_000,
+    config.management.outOfRangeBelowStopPct);
+}
+
+export function narrowLossExit(p, pnl, fresh) {
+  return p.rangeTrial && fresh && Number.isFinite(pnl) && p.capital > 0 && pnl <= -0.03 * p.capital
+    ? 'narrow range net loss stop (3%)' : null;
 }
 
 export function paperCloseRule(p, active, pnlPct, now) {
@@ -203,7 +229,7 @@ export function startPaper(store, notify, {
             markUnavailable(p, 'Bin aktif belum tersedia');
             continue;
           }
-          if ((p.shapeTrial || p.shapeComparison) && !p.exit) {
+          if (tracksRange(p) && !p.exit) {
             const elapsed = now - (p.lastRangeMarkAt ?? now);
             if (elapsed > 0 && elapsed <= 180_000) {
               p.observedMs = (p.observedMs ?? 0) + elapsed;
@@ -211,9 +237,9 @@ export function startPaper(store, notify, {
             }
             p.lastRangeMarkAt = now;
             p.wasInRange = active.binId >= p.lower && active.binId <= p.upper;
+            if (active.binId < p.lower) p.wasBelowRange = true;
           }
-          if (!p.exit) p.hardLowerExit ??= lowerRangeStop(active.binId, p.lower,
-            active.binStep ?? (p.ratio - 1) * 10_000, config.management.outOfRangeBelowStopPct);
+          if (!p.exit) p.hardLowerExit ??= paperLowerExit(p, active);
           const bins = p.exit ? null : await readSnapshot(p.pool, p.lower, p.upper);
           const inventory = p.exit?.inventory ?? (bins && markPaperBins(p, active.binId, bins));
           if (inventory && !p.exit && p.rebalanceTrial) {
@@ -243,7 +269,7 @@ export function startPaper(store, notify, {
             p.mark = { at: Date.now(), pnl };
             p.markIssue = null;
             p.indicativeMark = null;
-            if (p.shapeTrial || p.shapeComparison) {
+            if (tracksRange(p)) {
               p.trialPeakPnl = Math.max(p.trialPeakPnl ?? 0, pnl);
               p.trialDrawdownPct = Math.max(p.trialDrawdownPct ?? 0, 100 * (p.trialPeakPnl - pnl) / p.capital);
             }
@@ -270,7 +296,8 @@ export function startPaper(store, notify, {
           }
           if (!p.exit && (p.hardLowerExit || p.manualExit)) p.exit = { at: now, reason: p.hardLowerExit ?? p.manualExit, inventory };
           if (!p.exit) {
-            const reason = mirrorExitReason(p, active, pnl == null ? null : pnl / p.capital * 100, now);
+            const reason = narrowLossExit(p, pnl, quotedAt - now <= 30_000) ??
+              mirrorExitReason(p, active, pnl == null ? null : pnl / p.capital * 100, now);
             if (reason) p.exit = { at: now, reason, inventory };
           }
           if (p.rebalanceTrial && config.strategy.autoRebalance && !store.data.paused && rebalancePlan && pnl != null &&
@@ -312,13 +339,14 @@ export function startPaper(store, notify, {
               exitRunnerId: runners.open[p.id]?.id, longRunExtensions: p.longHold?.extensions,
               source: p.source, mirror: p.mirror, shapeMode: p.shapeMode, shapeReason: p.shapeReason, pairEntry: p.pairEntry,
               rebalancePair: p.rebalancePair, rebalanceTrial: p.rebalanceTrial, rebalances: p.rebalances, screenTrial: p.screenTrial,
-              ...(p.shapeTrial || p.shapeComparison ? { shapeTrial: p.shapeTrial, observedMs: p.observedMs ?? 0,
-                inRangeMs: p.inRangeMs ?? 0, drawdownPct: p.trialDrawdownPct ?? 0 } : {}),
+              ...(tracksRange(p) ? { shapeTrial: p.shapeTrial, rangeTrial: p.rangeTrial, wasBelowRange: Boolean(p.wasBelowRange),
+                observedMs: p.observedMs ?? 0, inRangeMs: p.inRangeMs ?? 0, drawdownPct: p.trialDrawdownPct ?? 0,
+                exitQuoteDelayMs: Math.max(0, quotedAt - p.exit.at) } : {}),
               outcome: 'settled', accountingVersion: 1 });
             paper.realized[p.variant] += pnl;
             if (p.mirror) paper.mirrorRealized = (paper.mirrorRealized ?? 0) + pnl;
             delete paper.open[p.id];
-            if (!p.shapeTrial && !p.rebalanceTrial && (!p.longRunArm || p.mirror)) {
+            if (!p.shapeTrial && !p.rangeTrial && !p.rebalanceTrial && (!p.longRunArm || p.mirror)) {
               const runner = runners.open[p.id];
               closed.push(`• ${p.mint.slice(0, 8)} · ${p.variant ?? `${p.range}/${p.shape}`} · ${pnl.toFixed(4)} SOL · ${p.exit.reason}${runner ? ` · sisa token ${runner.initialQuote.toFixed(5)} SOL` : ''}`);
             }
@@ -463,21 +491,27 @@ export function startPaper(store, notify, {
     void tickRunners();
     if (watching) return;
     if (Object.values(paper.open).some(p => p.manualExit && !p.exit && !p.manualExitCheckedAt)) void tick();
-    if (!(config.management.outOfRangeBelowStopPct > 0)) return;
+    if (!(config.management.outOfRangeBelowStopPct > 0) && !Object.values(paper.open).some(p => p.rangeTrial)) return;
     watching = true;
     try {
       const reads = new Map();
-      let breached = false;
+      let breached = false, observedBelow = false;
       await Promise.all(Object.values(paper.open).map(async p => {
-        if (p.exit || p.hardLowerExit) return;
+        if (p.exit || p.hardLowerExit || (!p.rangeTrial && !(config.management.outOfRangeBelowStopPct > 0))) return;
         if (!reads.has(p.pool)) reads.set(p.pool, getBin({ pool_address: p.pool }).catch(() => null));
         const active = await reads.get(p.pool);
         if (!active || stopped || !config.standalone.shadow || paper.open[p.id] !== p || p.exit) return;
-        const reason = lowerRangeStop(active.binId, p.lower, active.binStep ?? (p.ratio - 1) * 10_000,
-          config.management.outOfRangeBelowStopPct);
-        if (reason) { p.hardLowerExit = reason; breached = true; }
+        if (tracksRange(p) && !p.wasBelowRange && Number.isSafeInteger(active.binId) && active.binId < p.lower) {
+          p.wasBelowRange = true;
+          observedBelow = true;
+        }
+        const reason = paperLowerExit(p, active);
+        if (reason) {
+          p.hardLowerExit = reason;
+          breached = true;
+        }
       }));
-      if (breached) store.save();
+      if (breached || observedBelow) store.save();
       if (breached || Object.values(paper.open).some(p => p.hardLowerExit && !p.exit)) void tick();
     } catch { log('paper_warn', 'Fast lower-range check unavailable'); }
     finally { watching = false; }
