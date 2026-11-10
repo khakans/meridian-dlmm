@@ -21,6 +21,57 @@ import { canRetryUnsignedEntry, estimateNetExitPct, isRetryableEntryError, netWa
 import { DLMM_PROGRAM, recoverablePositionRent } from '../standalone/events.js';
 import { MonitorStore, recentSignalCounts } from '../standalone/store.js';
 import { selectNarrowPool } from '../standalone/screening.js';
+import { narrowCurveEvidence, startNarrowCurveTrial } from '../standalone/narrow-curve.js';
+
+test('Curve research samples matching Spot arms only for fresh, calm, liquid single-sided candidates', () => {
+  const at = Date.now(), now = Math.floor(at / 1000), end = Math.floor(now / 300) * 300;
+  const candles = [2, 0, 2, 0, 2, 0].map((closeBin, i) => {
+    const open = i % 2 ? 1.008 ** 2 : 1;
+    const close = 1.008 ** closeBin;
+    return { timestamp: end - (6 - i) * 300, open, close, high: Math.max(open, close) * 1.001,
+      low: Math.min(open, close) / 1.001, volume: 1000 };
+  });
+  const empty = { supply: 0n, xAmount: 0n, yAmount: 0n, pricePerToken: 1,
+    feeAmountXPerTokenStored: 0n, feeAmountYPerTokenStored: 0n };
+  const input = { source: 'discovery', mint: 'mint', pool: 'pool', decimals: 6, binStep: 80, binsBelow: 35,
+    binsAbove: 0, capital: 0.15, feeRatio: config.screening.minFeeActiveTvlRatio, shape: 'spot',
+    pairEntry: { side: 'single' }, entry: { binId: 0, price: 1, exitRatio: 0.99,
+      bins: new Map(Array.from({ length: 36 }, (_, i) => [-i, empty])) } };
+  let persisted;
+  const trial = startNarrowCurveTrial({ get: (_, fallback) => fallback, put: (_, data) => { persisted = structuredClone(data); } });
+  try {
+    trial.offer(input, candles, now, at - 16_000);
+    trial.offer({ ...input, pairEntry: { side: 'dual' } }, candles, now, at);
+    trial.offer({ ...input, entry: { ...input.entry, exitRatio: 0.97 } }, candles, now, at);
+    assert.equal(persisted, undefined);
+    trial.offer(input, candles, now, at);
+    trial.offer(input, candles, now, at + 1);
+    const [spot, curve] = Object.values(persisted.open);
+    assert.deepEqual(Object.values(persisted.open).map(p => p.shape), ['spot', 'curve']);
+    for (const field of ['rangeTrial', 'mint', 'pool', 'openedAt', 'capital', 'lower', 'upper', 'costSol']) {
+      assert.equal(curve[field], spot[field]);
+    }
+    assert.notDeepEqual(spot.binSeed, curve.binSeed);
+  } finally { trial.stop(); }
+});
+
+test('Curve evidence requires matched samples, a better positive net and bounded downside', () => {
+  const now = Date.now(), day = 86_400_000;
+  const closed = Array.from({ length: 20 }, (_, i) => {
+    const openedAt = now - (i % 3 + 1) * day;
+    const common = { rangeTrial: `trial-${i}`, pool: 'pool', mint: `mint-${i}`, openedAt,
+      closedAt: openedAt + 60_000, outcome: 'settled', lower: -35, upper: 0, capital: 0.15,
+      exitQuoteDelayMs: 2000, wasBelowRange: false };
+    return [{ ...common, shape: 'spot', pnl: 0.002, drawdownPct: 2.5 },
+      { ...common, shape: 'curve', pnl: 0.003, drawdownPct: 2 }];
+  }).flat();
+  assert.equal(narrowCurveEvidence({ closed: closed.slice(1) }, now).eligibleForReview, false);
+  assert.equal(narrowCurveEvidence({ closed }, now).eligibleForReview, true);
+  for (const change of [{ drawdownPct: 4 }, { wasBelowRange: true }, { lower: -45 }, { exitQuoteDelayMs: 61_000 }]) {
+    assert.equal(narrowCurveEvidence({ closed: [closed[0], { ...closed[1], ...change }, ...closed.slice(2)] }, now).eligibleForReview, false);
+  }
+  assert.equal(narrowCurveEvidence({ closed: closed.map(p => ({ ...p, pnl: -p.pnl })) }, now).eligibleForReview, false);
+});
 
 test('settlement only attributes the closed mint balance change to the specified wallet', () => {
   const token = (owner, mint, amount) => ({ owner, mint, uiTokenAmount: { amount } });

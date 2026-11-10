@@ -151,7 +151,7 @@ export function mirrorExitReason(p, active, pnlPct, now) {
 
 export function startPaper(store, notify, {
   getBin = getActiveBin, snapshot = getPaperBinSnapshot, quote = quoteTokenToSol, schedule = setInterval, admitResearch = true,
-  rebalancePlan, candles = entryCandles,
+  rebalancePlan, candles = entryCandles, comparisonOnly = false,
 } = {}) {
   const paper = store.data.paper ??= { open: {}, closed: [], skipped: 0 };
   paper.realized ??= {};
@@ -164,8 +164,9 @@ export function startPaper(store, notify, {
     delete paper.open[p.id];
   }
   let stopped = false, busy = false;
+  const inactive = () => stopped || (!comparisonOnly && !config.standalone.shadow);
   async function tick() {
-    if (busy || stopped || !config.standalone.shadow) return;
+    if (busy || inactive() || (comparisonOnly && !Object.keys(paper.open).length)) return;
     busy = true;
     try {
       const now = Date.now();
@@ -217,7 +218,13 @@ export function startPaper(store, notify, {
         p.indicativeMark = indicativeMark;
       };
       for (const p of Object.values(paper.open)) {
-        if (stopped || !config.standalone.shadow) return;
+        if (inactive()) return;
+        if (comparisonOnly && now - p.openedAt > 24 * 60 * MINUTE) {
+          paper.cancelled.push({ id: p.id, rangeTrial: p.rangeTrial, mint: p.mint, openedAt: p.openedAt,
+            at: now, reason: 'no valid close within trial window' });
+          delete paper.open[p.id];
+          continue;
+        }
         try {
           const costSol = p.costSol ?? COST_SOL;
           if (p.manualExit && !p.exit) p.manualExitCheckedAt = now;
@@ -258,7 +265,7 @@ export function startPaper(store, notify, {
           const raw = rawTokens(tokenAmount, p.decimals);
           const proceeds = await sellQuote(p.mint, raw);
           const quotedAt = Date.now();
-          if (stopped || !config.standalone.shadow) return;
+          if (inactive()) return;
           const net = inventory.sol + inventory.feeSol + proceeds - p.capital - costSol;
           const pnl = proceeds != null && Number.isFinite(net) ? net : null;
           const feeTokenPrice = tokenAmount > 0 && proceeds != null ? proceeds / tokenAmount : 0;
@@ -285,7 +292,7 @@ export function startPaper(store, notify, {
               if (!ordinaryExit && !p.exitSignal) {
                 const evidence = valued ? holdEvidence(p, now, Math.min(feeTokenPrice, Number(active.price)), pnl) : null;
                 const ratio = evidence ? await downsideQuoteRatio(p, active).catch(() => 0) : 0;
-                if (stopped || !config.standalone.shadow) return;
+                if (inactive()) return;
                 const eligible = evidence && ratio >= config.research.paperMinExitRatio && Date.now() - now <= 30_000 &&
                   !p.hardLowerExit && !p.manualExit;
                 applyHoldCheck(p, now, eligible ? { ...evidence, exitRatio: ratio } : null);
@@ -294,8 +301,11 @@ export function startPaper(store, notify, {
           }
           if (!p.exit && (p.hardLowerExit || p.manualExit)) p.exit = { at: now, reason: p.hardLowerExit ?? p.manualExit, inventory };
           if (!p.exit) {
-            const reason = narrowLossExit(p, pnl, quotedAt - now <= 30_000) ??
-              mirrorExitReason(p, active, pnl == null ? null : pnl / p.capital * 100, now);
+            let reason = narrowLossExit(p, pnl, quotedAt - now <= (comparisonOnly ? 15_000 : 30_000));
+            if (!reason && (!comparisonOnly || now - (p.lastRoutineExitAt ?? 0) >= MINUTE)) {
+              if (comparisonOnly) p.lastRoutineExitAt = now;
+              reason = mirrorExitReason(p, active, pnl == null ? null : pnl / p.capital * 100, now);
+            }
             if (reason) p.exit = { at: now, reason, inventory };
           }
           if (p.rebalanceTrial && config.strategy.autoRebalance && !store.data.paused && rebalancePlan && pnl != null &&
@@ -306,7 +316,7 @@ export function startPaper(store, notify, {
               const fresh = await getBin({ pool_address: p.pool }).catch(() => null);
               if (fresh?.binId !== active.binId) plan = null;
             }
-            if (stopped || !config.standalone.shadow) return;
+            if (inactive()) return;
             if (!store.data.paused && config.strategy.autoRebalance && Date.now() - now < REBALANCE_CHECK_MS / 3 &&
                 assessRebalance(p, { now, active, bins, plan, quotePrice: Number(active.price) * Math.min(1, exitRatio) })) {
               p.mark.pnl -= p.costSol - costSol;
@@ -321,11 +331,11 @@ export function startPaper(store, notify, {
           } else if (p.exit && pnl != null) {
             const scope = p.longRunArm ?? 'baseline';
             const activeRunners = Object.values(runners.open).filter(runner => (runner.longRunArm ?? 'baseline') === scope);
-            if (config.research.paperTokenRunner && (p.mirror || p.longRunArm) && activeRunners.length < 4 &&
+            if (!comparisonOnly && config.research.paperTokenRunner && (p.mirror || p.longRunArm) && activeRunners.length < 4 &&
                 !activeRunners.some(runner => runner.mint === p.mint)) {
               const runner = await prepareTokenRunner(p, { raw, sol: inventory.sol + inventory.feeSol,
                 fullQuote: proceeds, pnl, now: quotedAt, quote: sellQuote, candles: readCandles }).catch(() => null);
-              if (stopped || !config.standalone.shadow) return;
+              if (inactive()) return;
               if (runner && config.research.paperTokenRunner && Date.now() - quotedAt <= RUNNER_POLL_MS) {
                 runners.open[p.id] = runner;
               }
@@ -362,8 +372,8 @@ export function startPaper(store, notify, {
         now - c.at <= 5 * MINUTE && c.at <= now && c.paperAt == null &&
         !openMints.has(candidateKey(c)) && !recentClosed.has(candidateKey(c)))
         .sort((a, b) => Number(b.source === 'convergence') - Number(a.source === 'convergence') || a.at - b.at);
-      for (const c of admitResearch ? candidates.slice(0, 4) : []) {
-        if (stopped || !config.standalone.shadow) return;
+      for (const c of admitResearch && !comparisonOnly ? candidates.slice(0, 4) : []) {
+        if (inactive()) return;
         const source = c.source ?? 'discovery';
         if ([...openMints].filter(key => key.startsWith(`${source}:`)).length >= config.risk.maxPositions) continue;
         if (!Number.isInteger(c.decimals) || c.decimals < 0 || c.decimals > 18 || !(c.binStep > 0)) continue;
@@ -390,7 +400,7 @@ export function startPaper(store, notify, {
           const worstPrice = Math.min(...plans.map(plan => price * plan.ratio ** (plan.lower - active.binId)));
           const expectedQuote = capital * price / worstPrice;
           const exitQuote = await sellQuote(c.mint, rawTokens(capital / worstPrice, c.decimals));
-          if (stopped || !config.standalone.shadow) return;
+          if (inactive()) return;
           const normalQuoteOk = exitQuote != null && exitQuote >= expectedQuote * config.research.paperMinExitRatio;
           if (!normalQuoteOk) {
             if (c.paperRejectedAt == null) paper.skipped++;
@@ -398,7 +408,7 @@ export function startPaper(store, notify, {
             if (!plans.some(plan => plan.bankroll)) continue;
           }
           const entryBins = await readSnapshot(c.pool, Math.min(...plans.map(p => p.lower)), Math.max(...plans.map(p => p.upper)));
-          if (!entryBins || stopped || !config.standalone.shadow) continue;
+          if (!entryBins || inactive()) continue;
           let admitted = 0;
           for (const [index, plan] of plans.entries()) {
             const positionCapital = plan.capital ?? capital;
@@ -409,7 +419,7 @@ export function startPaper(store, notify, {
               const floor = price * plan.ratio ** (plan.lower - active.binId);
               const raw = rawTokens(positionCapital / floor, c.decimals);
               const quoteSol = await sellQuote(c.mint, raw);
-              if (stopped || !config.standalone.shadow) return;
+              if (inactive()) return;
               if (quoteSol == null || quoteSol < positionCapital * price / floor * config.research.paperMinExitRatio) continue;
             }
             const reserved = Object.values(paper.open).filter(p => p.variant === plan.variant).reduce((n, p) => n + p.capital + COST_SOL, 0);
@@ -433,7 +443,7 @@ export function startPaper(store, notify, {
       recordPaperNav(paper, Date.now(), config.research.paperBankrollSol);
       updateLongRun(paper, Date.now());
       store.save();
-      if (closed.length && !stopped) {
+      if (!comparisonOnly && closed.length && !stopped) {
         const limit = config.research.paperCloseListLimit;
         const lines = [`🧪 Meridian paper close · ${closed.length} varian (estimasi net)`, '', ...closed.slice(0, limit)];
         if (closed.length > limit) lines.push(`+${closed.length - limit} close lainnya tersimpan.`);
@@ -442,12 +452,12 @@ export function startPaper(store, notify, {
     } catch { log('paper_warn', 'Paper lifecycle pass unavailable'); }
     finally { busy = false; }
   }
-  const timer = schedule(tick, MINUTE);
+  const timer = schedule(tick, comparisonOnly ? 15_000 : MINUTE);
   let samplingRunners = false, nextRunnerAt = 0;
   async function tickRunners() {
     const now = Date.now();
     const open = Object.values(runners.open);
-    if (samplingRunners || stopped || !config.standalone.shadow || !open.length || now < nextRunnerAt) return;
+    if (samplingRunners || inactive() || !open.length || now < nextRunnerAt) return;
     samplingRunners = true;
     nextRunnerAt = now + RUNNER_POLL_MS;
     try {
@@ -463,7 +473,7 @@ export function startPaper(store, notify, {
       };
       const notices = await Promise.all(open.map(async row => {
         const result = await sampleTokenRunner(row, { now, candles: sharedCandles, quote: sharedQuote });
-        if (stopped || !config.standalone.shadow || runners.open[row.id] !== row) return null;
+        if (inactive() || runners.open[row.id] !== row) return null;
         const name = row.pair ?? row.mint.slice(0, 8);
         if (result.closed) {
           runners.closed.push(result.closed);
@@ -475,7 +485,7 @@ export function startPaper(store, notify, {
         runners.open[row.id] = result.next;
         return result.alert ? `${name} · quote jual belum tersedia, posisi simulasi masih terbuka` : null;
       }));
-      if (stopped || !config.standalone.shadow) return;
+      if (inactive()) return;
       updateLongRun(paper, Date.now());
       store.save();
       const lines = notices.filter(Boolean);
@@ -485,8 +495,8 @@ export function startPaper(store, notify, {
   }
   let watching = false;
   const fastTimer = setInterval(async () => {
-    if (stopped || !config.standalone.shadow) return;
-    void tickRunners();
+    if (inactive()) return;
+    if (!comparisonOnly) void tickRunners();
     if (watching) return;
     if (Object.values(paper.open).some(p => p.manualExit && !p.exit && !p.manualExitCheckedAt)) void tick();
     if (!(config.management.outOfRangeBelowStopPct > 0) && !Object.values(paper.open).some(p => p.rangeTrial)) return;
@@ -498,7 +508,7 @@ export function startPaper(store, notify, {
         if (p.exit || p.hardLowerExit || (!p.rangeTrial && !(config.management.outOfRangeBelowStopPct > 0))) return;
         if (!reads.has(p.pool)) reads.set(p.pool, getBin({ pool_address: p.pool }).catch(() => null));
         const active = await reads.get(p.pool);
-        if (!active || stopped || !config.standalone.shadow || paper.open[p.id] !== p || p.exit) return;
+        if (!active || inactive() || paper.open[p.id] !== p || p.exit) return;
         if (tracksRange(p) && !p.wasBelowRange && Number.isSafeInteger(active.binId) && active.binId < p.lower) {
           p.wasBelowRange = true;
           observedBelow = true;

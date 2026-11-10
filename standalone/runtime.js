@@ -20,6 +20,8 @@ import { entryRange, mirrorExitReason, prepareMirrorPosition, prepareNarrowRange
 import { prepareRebalanceTrial } from "./paper-rebalance.js";
 import { canEnrollLongRun, longRunSpotReady, longRunState, prepareLongHold } from "./paper-long-run.js";
 import { prepareEntrySpot } from "./paper-token-runner.js";
+import { openModeDatabase } from "./database.js";
+import { NARROW_CURVE_KEY, narrowCurveStatus, startNarrowCurveTrial } from "./narrow-curve.js";
 import { advanceSettlement, dueSettlements, SETTLEMENT_DUST_SOL, settlementComplete, settlementRows } from "./settlement.js";
 import { canRetryUnsignedEntry, estimateEntryOverheadSol, estimateNetExitPct, positionWrites, reconcilePositionWrites } from "./position-journal.js";
 import { readRpc } from "./rpc.js";
@@ -47,6 +49,7 @@ let lockPath = null;
 let stopAdmin = null;
 let stopDiscovery = null;
 let stopPaper = null;
+let curveTrial = null;
 let slackAdmin = null;
 let shuttingDown = false;
 let manageBusy = false;
@@ -455,6 +458,7 @@ async function attemptEntry(signal, stage) {
       binStep: Number(pool.dlmm_params?.bin_step), binsBelow, binsAbove, capital: amountY, verifyRange: true,
     });
   } catch { return "exit quote or entry range unavailable"; }
+  const entrySampleAt = Date.now();
   if (narrowRange && narrowWidth(candles, entry) !== binsBelow) return "Range sempit berubah saat validasi";
   const currentPair = chooseEntryPair(pairMode, candles, { now: candleTime, price: Number(entry.price), binStep: entry.binStep });
   if (currentPair.side !== pairEntry.side) return `Pair Mode berubah saat validasi: ${currentPair.reason}`;
@@ -583,6 +587,10 @@ async function attemptEntry(signal, stage) {
       const active = await getActiveBin({ pool_address: pool.pool_address });
       if (active.binId !== entry.binId) throw new Error("Active bin changed before entry");
       if (narrowRange && narrowWidth(candles, active) !== binsBelow) throw new Error("Narrow range changed before entry");
+      if (step === "lp" && curveTrial) {
+        try { curveTrial.offer({ ...modelInput, feeRatio: Number(pool.fee_active_tvl_ratio) }, candles, candleTime, entrySampleAt); }
+        catch { log("paper_warn", "Curve comparison sample unavailable"); }
+      }
       stage("transaction simulation and submit");
     },
     on_prepared: position => {
@@ -883,6 +891,8 @@ async function lifecycleStatusLines(detailed = false) {
     }
     const trialFrom = Math.max(now - 30 * 86_400_000, resetAt);
     if (detailed) lines.push(...shapeTrialLines(paper?.closed, trialFrom));
+    const curveResearch = detailed ? store.database.get(NARROW_CURVE_KEY) : null;
+    if (curveResearch) lines.push(narrowCurveStatus(curveResearch, now));
     if (detailed) lines.push(`Uji range sempit · Single SOL + Spot · bin step ≤${config.strategy.narrowRangeMaxBinStep} bps`);
     lines.push(...narrowRangeLines(paper, trialFrom, detailed));
     lines.push(...rebalanceTrialLines(paper, trialFrom, detailed));
@@ -1024,6 +1034,17 @@ export async function startStandalone() {
       return resolveEntryShape("auto", pool, active.binId - p.lower, active);
     },
   });
+  else if (config.strategy.liveNarrowRange) {
+    let shadowDb;
+    try {
+      shadowDb = openModeDatabase("shadow");
+      curveTrial = startNarrowCurveTrial(shadowDb);
+      stopPaper = () => { curveTrial.stop(); shadowDb.db.close(); };
+    } catch {
+      shadowDb?.db.close();
+      log("paper_warn", "Curve comparison unavailable; Live Spot stays active");
+    }
+  }
 
   // Entries come only from signals; exits run on their own cadences.
   if (!config.standalone.shadow) {
