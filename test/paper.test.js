@@ -21,6 +21,7 @@ import { canRetryUnsignedEntry, estimateNetExitPct, isRetryableEntryError, netWa
 import { DLMM_PROGRAM, recoverablePositionRent } from '../standalone/events.js';
 import { MonitorStore, acceptEvents, entrySignalRoute, finishSignal, recentSignalCounts, registerDiscoverySignal } from '../standalone/store.js';
 import { selectNarrowPool } from '../standalone/screening.js';
+import { startDiscovery } from '../standalone/discovery.js';
 import { narrowCurveEvidence, startNarrowCurveTrial } from '../standalone/narrow-curve.js';
 import { evaluateLiveHold } from '../standalone/live-hold.js';
 
@@ -890,6 +891,49 @@ test('Discovery and Convergence share one pending entry with one wallet in eithe
     database.db.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('wallet-priority screening runs while the public feed is waiting and deduplicates deposits', async t => {
+  t.mock.method(globalThis, 'fetch', async () => ({ ok: true, json: async () => ({ data: [] }) }));
+  const now = Date.now();
+  const stats = { received: 0, dropped: 0, passed: 0, retries: 0, reasons: {} };
+  const checked = [];
+  const matched = [];
+  const discovery = startDiscovery({ stats, pumpFeed: () => () => {}, notify: async () => {},
+    screen: async (mint, { preferredPool }) => {
+      checked.push([mint, preferredPool]);
+      return { pass: true, pool: { pool_address: preferredPool } };
+    },
+    onMatch: (mint, _result, sources, walletOnly) => { matched.push([mint, sources, walletOnly]); },
+  });
+  try {
+    const deposit = { mint: 'fresh', at: now, pool: 'wallet-pool' };
+    discovery.watchDeposit({ ...deposit, mint: 'expired', at: now - 3_600_000 });
+    discovery.watchDeposit(deposit);
+    discovery.watchDeposit(deposit);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(checked, [['fresh', 'wallet-pool']]);
+    assert.deepEqual(matched, [['fresh', ['Smart wallet deposit'], true]]);
+    assert.equal(stats.passed, 1);
+  } finally { discovery.stop(); }
+});
+
+test('wallet-only Discovery requires a current wallet until an independent feed corroborates it', () => {
+  const now = 1_800_000_000_000;
+  const data = emptyMonitor();
+  const store = { data };
+  const options = { walletThreshold: 2, windowSec: 180, screeningDeadlineSec: 120, minDepositSol: 0.1, walletGroups: {} };
+  const register = (sources, walletOnly) => registerDiscoverySignal(store, 'mint', 'pool', sources, options, now, walletOnly);
+  assert.equal(register(['Smart wallet deposit'], true), null);
+  data.wallets.w = {};
+  data.events.push({ mint: 'mint', wallet: 'w', at: now - 1000, depositSol: 1 });
+  const signal = register(['Smart wallet deposit'], true);
+  assert.equal(entrySignalRoute(signal, data.wallets, options, now).events.length, 1);
+  const removed = entrySignalRoute(signal, {}, options, now);
+  assert.equal(removed.source, 'convergence');
+  assert.equal(removed.events.length, 0);
+  assert.equal(register(['Meteora'], false), null);
+  assert.equal(entrySignalRoute(signal, {}, options, now).source, 'discovery');
 });
 
 test('paper status separates variants, ignores stale marks and applies the realized reset cutoff', () => {

@@ -6,8 +6,8 @@ import { acceptEvents } from './store.js';
 import { log } from '../logger.js';
 
 export class WalletMonitor {
-  constructor(store, options, { rpc = readRpc, wallets = listSmartWallets, entries = transactionEntries, onSignal = () => {} } = {}) {
-    Object.assign(this, { store, options, rpc, wallets, entries, onSignal });
+  constructor(store, options, { rpc = readRpc, wallets = listSmartWallets, entries = transactionEntries, onSignal = () => {}, onEntries = () => {} } = {}) {
+    Object.assign(this, { store, options, rpc, wallets, entries, onSignal, onEntries });
     this.subscriptions = new Map(); this.running = false; this.reconciling = false; this.draining = false;
     this.retry = new Map();
     this.stats = { transactions: 0, entries: 0, lastLagMs: null, errors: 0 };
@@ -138,6 +138,7 @@ export class WalletMonitor {
           delete this.store.data.pending[key];
           const signals = acceptEvents(this.store, events, this.options);
           for (const signal of signals) this.onSignal(signal);
+          if (events.length) this.onEntries(events);
         } catch {
           pending.failures++;
           pending.retryAt = Date.now() + Math.min(15_000, 1000 * 2 ** Math.min(pending.failures, 4));

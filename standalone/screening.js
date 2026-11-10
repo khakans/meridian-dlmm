@@ -93,7 +93,7 @@ export async function selectNarrowPool(candidates, now, sample = async pool => {
   return plans.find(Boolean) ?? null;
 }
 
-export async function screenMint(mint, { poolAddress = null, thresholds = config.screening } = {}) {
+export async function screenMint(mint, { poolAddress = null, preferredPool, thresholds = config.screening } = {}) {
   if (isBlacklisted(mint) || isBaseMintOnCooldown(mint)) return { pass: false, terminal: true, reason: 'Token is blocked or on cooldown' };
   const assets = await fetchJson(`https://datapi.jup.ag/v1/assets/search?query=${mint}`);
   const token = (Array.isArray(assets) ? assets : []).find(t => t.id === mint);
@@ -116,20 +116,30 @@ export async function screenMint(mint, { poolAddress = null, thresholds = config
       if (p.token_x?.address !== mint || p.token_y?.address !== config.tokens.SOL) return false;
       const step = number(p.bin_step ?? p.dlmm_params?.bin_step);
       return !narrow || step == null || (step >= thresholds.minBinStep && step <= thresholds.maxBinStep);
-    }).map(p => p.address).slice(0, 10);
+    }).map(p => p.address);
+    addresses = [...new Set([preferredPool, ...addresses].filter(Boolean))].slice(0, 10);
   }
   const candidates = [], rejected = [];
-  for (const address of addresses) {
-    if (isPoolOnCooldown(address)) { rejected.push('Pool cooldown'); continue; }
+  async function inspectPool(address) {
+    if (isPoolOnCooldown(address)) return { reason: 'Pool cooldown' };
     try {
-      const p = await poolDetail(address);
+      const detail = timeframe => poolDetail(address, timeframe, { signal: AbortSignal.timeout(6_000) });
+      const p = await detail();
+      const early = rejectPool(p, mint, thresholds);
+      if (early && (early !== 'Volatility or price unavailable' || !(number(p.pool_price) > 0))) return { reason: early };
       const minutes = { '5m': 5, '30m': 30, '1h': 60, '2h': 120, '4h': 240, '12h': 720, '24h': 1440 };
-      if ((minutes[config.screening.timeframe] || 5) < 30) p.volatility = (await poolDetail(address, '30m')).volatility;
-      if (!(number(p.volatility) > 0)) p.volatility = (await poolDetail(address, '1h')).volatility;
+      if ((minutes[config.screening.timeframe] || 5) < 30) p.volatility = (await detail('30m')).volatility;
+      if (!(number(p.volatility) > 0)) p.volatility = (await detail('1h')).volatility;
       const why = rejectPool(p, mint, thresholds);
-      if (why) { rejected.push(why); continue; }
-      candidates.push(p);
-    } catch (e) { rejected.push(e.message); }
+      return why ? { reason: why } : { pool: p };
+    } catch (e) { return { reason: e.message }; }
+  }
+  for (let i = 0; i < addresses.length; i += 3) {
+    const checks = await Promise.all(addresses.slice(i, i + 3).map(inspectPool));
+    for (const { pool, reason } of checks) {
+      if (pool) candidates.push(pool);
+      else rejected.push(reason);
+    }
   }
   candidates.sort((a, b) => b.fee_active_tvl_ratio - a.fee_active_tvl_ratio || b.active_tvl - a.active_tvl || a.pool_address.localeCompare(b.pool_address));
   if (candidates.length > 1 && !narrow) {
@@ -149,7 +159,8 @@ export async function screenMint(mint, { poolAddress = null, thresholds = config
   if (narrow && candidates.length) {
     const selected = await selectNarrowPool(candidates, Math.floor(Date.now() / 1000));
     return selected ? { pass: true, ...selected, token, decimals, fetchedAt: Date.now() }
-      : { pass: false, reason: 'Range sempit: support, candle, atau bin step tidak memenuhi syarat' };
+      : { pass: false, poolSpecific: Boolean(poolAddress), reason: 'Range sempit: support, candle, atau bin step tidak memenuhi syarat' };
   }
-  return candidates.length ? { pass: true, pool: candidates[0], token, decimals, fetchedAt: Date.now() } : { pass: false, reason: rejected.slice(0, 3).join('; ') || 'No eligible token/SOL pool' };
+  return candidates.length ? { pass: true, pool: candidates[0], token, decimals, fetchedAt: Date.now() } :
+    { pass: false, poolSpecific: Boolean(poolAddress), reason: rejected.slice(0, 3).join('; ') || 'No eligible token/SOL pool' };
 }

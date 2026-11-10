@@ -10,6 +10,7 @@ const PUMP = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const CREATE = '1b72a94ddeeb6376';
 const MIGRATION = 'bde95db95c94ea94';
 const MINUTE = 60_000;
+const WALLET_SOURCE = 'Smart wallet deposit';
 
 // Borsh layouts from pump-public-docs/idl/pump.json. Only accept data emitted
 // by Pump itself, including when Pump is invoked by another program.
@@ -92,11 +93,16 @@ export async function meteoraCandidates(minTvl, minVolume) {
   return results.flatMap(result => result.status === 'fulfilled' ? result.value : []);
 }
 
-export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config.screening, onMatch, stats }) {
+export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config.screening, onMatch, stats,
+  screen = screenMint, pumpFeed = startPumpFeed }) {
   const queue = new Map();
   const screened = new Map();
+  const walletQueue = new Map();
+  const walletSeen = new Map();
+  const screening = new Set();
   let stopped = false;
   let busy = false;
+  let walletBusy = false;
   let gmgnRetryAt = 0;
 
   function enqueue(mint, source, priority) {
@@ -118,6 +124,87 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config
       queue.delete(lowest.mint);
       stats.dropped++;
     }
+  }
+
+  async function inspect(mint, sources, walletOnly = false) {
+    if (stopped || screening.has(mint)) return null;
+    screening.add(mint);
+    try {
+      const result = await screen(mint, { thresholds, preferredPool: walletQueue.get(mint)?.pool })
+        .catch(() => ({ pass: false, reason: 'Screening data unavailable' }));
+      if (stopped) return null;
+      if (!result.pass) {
+        log('discovery', `${mint} [${sources.join(', ')}] ${result.reason}`);
+        const reason = result.reason.split(/ \(|;/)[0];
+        stats.reasons[reason] = (stats.reasons[reason] ?? 0) + 1;
+        if (result.terminal) walletQueue.delete(mint);
+        return result;
+      }
+      const wallet = walletQueue.get(mint);
+      if (walletOnly && !(wallet?.until > Date.now())) return null;
+      const shown = wallet?.until > Date.now() && !sources.includes(WALLET_SOURCE) ? [...sources, WALLET_SOURCE] : sources;
+      try {
+        if (await onMatch?.(mint, result, shown, walletOnly) === false || stopped) return null;
+      } catch {
+        log('discovery_warn', `${mint} post-screen processing unavailable`);
+        return null;
+      }
+      log('discovery', `${mint} [${shown.join(', ')}] passed`);
+      stats.passed++;
+      walletQueue.delete(mint);
+      void Promise.resolve().then(() => notify(`🔎 Meridian watchlist\nMint ${mint}\nPool ${result.pool.pool_address}\nSource ${shown.join(', ')}`))
+        .catch(() => log('discovery_warn', 'Watchlist notification unavailable'));
+      return result;
+    } finally {
+      screening.delete(mint);
+    }
+  }
+
+  async function scanWallet() {
+    if (stopped || walletBusy) return;
+    const now = Date.now();
+    for (const [mint, until] of walletSeen) if (until <= now) walletSeen.delete(mint);
+    for (const [mint, row] of walletQueue) if (row.until <= now) walletQueue.delete(mint);
+    const item = [...walletQueue.values()].find(row => row.retryAt <= now && !screening.has(row.mint));
+    if (!item) return;
+    walletBusy = true;
+    try {
+      item.tries++;
+      const publicItem = queue.get(item.mint);
+      const sources = publicItem ? [...publicItem.sources, WALLET_SOURCE] : [WALLET_SOURCE];
+      const result = await inspect(item.mint, sources, !publicItem);
+      if (result?.pass || result?.terminal || item.tries >= 4 || item.until <= Date.now()) {
+        walletQueue.delete(item.mint);
+        if ((result?.pass && publicItem) || result?.terminal) {
+          queue.delete(item.mint);
+          screened.set(item.mint, { priority: 3, announced: true, retryAt: Date.now() + 60 * MINUTE });
+        }
+      } else {
+        item.retryAt = Date.now() + [10, 20, 35][item.tries - 1] * 1000;
+        stats.retries++;
+      }
+    } finally {
+      stats.waiting = new Set([...queue.keys(), ...walletQueue.keys()]).size;
+      walletBusy = false;
+    }
+  }
+
+  function watchDeposit({ mint, at, pool }) {
+    const until = at + config.standalone.windowSec * 1000;
+    if (stopped || until <= Date.now() || (walletSeen.get(mint) ?? 0) >= until) return;
+    walletSeen.set(mint, until);
+    const queued = walletQueue.get(mint);
+    if (queued) Object.assign(queued, { until, pool });
+    else {
+      walletQueue.set(mint, { mint, pool, until, retryAt: 0, tries: 0 });
+      stats.received++;
+    }
+    if (walletQueue.size > 32) {
+      const oldest = [...walletQueue.values()].reduce((a, b) => a.until <= b.until ? a : b);
+      walletQueue.delete(oldest.mint);
+      stats.dropped++;
+    }
+    void scanWallet();
   }
 
   async function tick() {
@@ -142,51 +229,37 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config
         stats.dropped++;
       }
       for (const [mint, item] of screened) if (now >= item.retryAt) screened.delete(mint);
-      const ranked = [...queue.values()].filter(item => item.retryAt <= now).sort((a, b) => b.priority - a.priority || a.addedAt - b.addedAt);
-    const reserved = [
-      ranked.find(item => item.tries > 0 && [...item.sources].some(source => source.startsWith('Meteora'))),
-      ranked.find(item => item.tries > 0),
-      ranked.find(item => item.priority === 1),
-    ].filter(Boolean);
+      const ranked = [...queue.values()].filter(item => item.retryAt <= now && !screening.has(item.mint))
+        .sort((a, b) => b.priority - a.priority || a.addedAt - b.addedAt);
+      const reserved = [
+        ranked.find(item => item.tries > 0 && [...item.sources].some(source => source.startsWith('Meteora'))),
+        ranked.find(item => item.tries > 0),
+        ranked.find(item => item.priority === 1),
+      ].filter(Boolean);
       const batch = [...new Set([...reserved, ...ranked])].slice(0, 6);
-      for (const item of batch) {
-        if (stopped) break;
-        const { mint, sources } = item;
+      async function scan(item) {
+        const { mint } = item;
+        if (stopped || queue.get(mint) !== item || screening.has(mint)) return;
         item.tries++;
-        let result;
-        try {
-          result = await screenMint(mint, { thresholds });
-        } catch {
-          result = { pass: false, reason: 'Screening data unavailable' };
-        }
-        if (stopped) break;
-        log('discovery', `${mint} [${[...sources].join(', ')}] ${result.pass ? 'passed' : result.reason}`);
-        if (!result.pass) {
-          const reason = result.reason.split(/ \(|;/)[0];
-          stats.reasons[reason] = (stats.reasons[reason] ?? 0) + 1;
-        }
+        const result = await inspect(mint, [...item.sources]);
+        if (stopped || !result) return;
         if (result.pass || result.terminal || item.tries >= 4) {
           queue.delete(mint);
           screened.set(mint, { priority: item.priority, announced: result.pass || result.terminal, retryAt: Date.now() + (result.pass || result.terminal ? 60 : 10) * MINUTE });
         } else {
-          item.retryAt = Date.now() + [2, 5, 10][item.tries - 1] * MINUTE;
+          const delays = /^(Token data is stale|Screening data unavailable)/.test(result.reason) ? [1, 2, 4] : [2, 5, 10];
+          item.retryAt = Date.now() + delays[item.tries - 1] * MINUTE;
           stats.retries++;
         }
-        if (result.pass) {
-          stats.passed++;
-          try {
-            const research = await onMatch?.(mint, result, [...sources]);
-            if (!stopped) await notify(`🔎 Meridian watchlist\nMint ${mint}\nPool ${result.pool.pool_address}\nSource ${[...sources].join(', ')}${research ? `\n${research}` : ''}`);
-          } catch { log('discovery_warn', `${mint} post-screen processing unavailable`); }
-        }
       }
+      for (let i = 0; i < batch.length && !stopped; i += 3) await Promise.all(batch.slice(i, i + 3).map(scan));
     } finally {
-      stats.waiting = queue.size;
+      stats.waiting = new Set([...queue.keys(), ...walletQueue.keys()]).size;
       busy = false;
     }
   }
 
-  const stopPump = startPumpFeed(heliusKey, logs => {
+  const stopPump = pumpFeed(heliusKey, logs => {
     for (const { mint, source } of pumpCandidates(logs)) {
       enqueue(mint, source, source === 'Pump.fun migration' ? 3 : 1);
     }
@@ -194,10 +267,15 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config
 
   log('discovery', `Watchlist started (GMGN=${Boolean(gmgnKey)}, Helius=${Boolean(heliusKey)})`);
   const timer = setInterval(() => void tick(), MINUTE);
+  const walletTimer = setInterval(() => void scanWallet(), 5_000);
   void tick();
-  return async () => {
-    stopped = true;
-    clearInterval(timer);
-    stopPump();
+  return {
+    watchDeposit,
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+      clearInterval(walletTimer);
+      stopPump();
+    },
   };
 }

@@ -101,26 +101,33 @@ export function entrySignalRoute(signal, wallets, options, now = Date.now()) {
   const proof = signal.convergence ?? (signal.source !== 'discovery' ? { events: signal.events, updatedAt: signal.createdAt } : null);
   const events = proof && proof.updatedAt !== signal.rejectedConfirmationAt
     ? qualifyingEvents(proof.events.filter(e => wallets[e.wallet]), signal.mint, options, now) : [];
-  if (events.length < requiredWallets && discovery) {
+  if (events.length < requiredWallets && discovery && !discovery.requiresWallet) {
     return { source: 'discovery', pool: discovery.pool, events: [] };
   }
   return { source: 'convergence', pool: signal.pool, events, requiredWallets,
     confirmationAt: proof?.updatedAt, corroborated: Boolean(discovery) };
 }
 
-export function registerDiscoverySignal(store, mint, pool, sources, options, now = Date.now()) {
+export function registerDiscoverySignal(store, mint, pool, sources, options, now = Date.now(), requireWallet = false) {
   if (store.data.paused) return null;
   const prior = store.data.signals[mint];
+  const minAt = Math.max(store.data.entryResumedAt ?? 0, prior?.closedAt ?? 0);
+  const fresh = qualifyingEvents(store.data.events.filter(e => e.at > minAt && store.data.wallets[e.wallet]), mint, options, now);
+  if (requireWallet && !fresh.length) return null;
   if (prior && !prior.done) {
-    if (prior.source !== 'discovery' && prior.deadline > now) prior.discovery ??= { at: now, pool, sources };
+    if (prior.deadline <= now) return null;
+    if (prior.source !== 'discovery' && (!prior.discovery || prior.discovery.requiresWallet && !requireWallet)) {
+      prior.discovery = { at: prior.discovery?.at ?? now, pool, sources, requiresWallet: requireWallet };
+    }
+    if (prior.source === 'discovery' && prior.requiresWallet && !requireWallet) {
+      Object.assign(prior, { pool, sources, requiresWallet: false });
+    }
     return null;
   }
   const cooldownUntil = prior?.cooldownUntil ?? ((prior?.closedAt ?? prior?.deadline ?? now) + 300_000);
   if (prior && now < cooldownUntil) return null;
   const signal = { mint, pool, source: 'discovery', sources, events: [],
-    createdAt: now, deadline: now + options.screeningDeadlineSec * 1000, done: false };
-  const minAt = Math.max(store.data.entryResumedAt ?? 0, prior?.closedAt ?? 0);
-  const fresh = qualifyingEvents(store.data.events.filter(e => e.at > minAt && store.data.wallets[e.wallet]), mint, options, now);
+    createdAt: now, deadline: now + options.screeningDeadlineSec * 1000, done: false, requiresWallet: requireWallet };
   if (fresh.length) signal.convergence = { at: now, updatedAt: now, events: fresh };
   store.data.signals[mint] = signal;
   return signal;

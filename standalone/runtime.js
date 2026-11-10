@@ -48,7 +48,7 @@ let store = null;
 let monitor = null;
 let lockPath = null;
 let stopAdmin = null;
-let stopDiscovery = null;
+let discovery = null;
 let stopPaper = null;
 let curveTrial = null;
 let slackAdmin = null;
@@ -376,6 +376,9 @@ async function attemptEntry(signal, stage, route) {
   let screened;
   try {
     screened = await screenMint(mint, { poolAddress: route.pool });
+    if (screened.poolSpecific && Date.now() < signal.deadline && !shuttingDown && !store.data.paused) {
+      screened = await screenMint(mint);
+    }
   } catch (e) {
     return `screening error: ${e.message}`;
   }
@@ -1053,7 +1056,7 @@ async function shutdown(signalName, exitCode = 0) {
   for (const timer of signalRetryTimers.values()) clearTimeout(timer);
   signalRetryTimers.clear();
   stopPaper?.();
-  await Promise.race([stopDiscovery?.(), sleep(3000)]);
+  discovery?.stop();
   try { stopAdmin?.(); } catch { /* best-effort */ }
   try { await monitor?.stop(); } catch { /* best-effort */ }
   // Bound best-effort stop notices so either transport can be unavailable.
@@ -1076,7 +1079,15 @@ export async function startStandalone() {
     }
   }
 
-  monitor = new WalletMonitor(store, config.standalone, { onSignal });
+  const prioritizeDeposits = events => {
+    if (shuttingDown || store.data.paused) return;
+    for (const event of events) {
+      const existing = store.data.signals[event.mint];
+      if (!existing?.done && existing?.source === "discovery") continue;
+      if (store.data.wallets[event.wallet] && event.at > (store.data.entryResumedAt ?? 0)) discovery?.watchDeposit(event);
+    }
+  };
+  monitor = new WalletMonitor(store, config.standalone, { onSignal, onEntries: prioritizeDeposits });
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   log("runtime", `Standalone starting — ${config.standalone.shadow ? "SHADOW MODE (proposals recorded, nothing submitted)" : "LIVE MODE"} | threshold=${config.standalone.walletThreshold} wallets / ${config.standalone.windowSec}s window | screening deadline=${config.standalone.screeningDeadlineSec}s`);
@@ -1202,19 +1213,22 @@ export async function startStandalone() {
   for (const s of Object.values(store.data.signals)) {
     if (!s.done && s.deadline > Date.now()) onSignal(s);
   }
-  stopDiscovery = startDiscovery({
+  discovery = startDiscovery({
     gmgnKey: process.env.GMGN_API_KEY?.trim(),
     heliusKey: process.env.HELIUS_API_KEY?.trim(),
     notify,
-    onMatch: (mint, screened, sources) => {
+    onMatch: (mint, screened, sources, walletOnly) => {
+      if (shuttingDown) return false;
+      const signal = registerDiscoverySignal(store, mint, screened.pool.pool_address, sources,
+        config.standalone, Date.now(), walletOnly);
+      if (walletOnly && !signal && !store.data.signals[mint]?.discovery) return false;
       store.data.preflightCandidate = { mint, pool: screened.pool.pool_address, at: Date.now() };
-      const signal = !shuttingDown && registerDiscoverySignal(store, mint, screened.pool.pool_address, sources,
-        config.standalone);
       store.save();
       if (signal) onSignal(signal);
     },
     stats: discoveryStats,
   });
+  prioritizeDeposits(store.data.events);
   startLifecycleReports();
 
   const trackedWallets = Object.keys(store.data.wallets).length;
