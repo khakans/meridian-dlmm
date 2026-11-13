@@ -51,7 +51,7 @@ export function pumpCandidates(logs) {
   return stack.length ? found.slice(0, stack[0].firstEvent) : found;
 }
 
-export async function gmgnTrending(key) {
+export async function gmgnTrending(key, signal) {
   const params = new URLSearchParams({
     chain: 'sol', interval: '5m', limit: '20', order_by: 'volume', direction: 'desc',
     timestamp: String(Math.floor(Date.now() / 1000)), client_id: randomUUID(),
@@ -59,6 +59,7 @@ export async function gmgnTrending(key) {
   const result = await fetchJson(`https://openapi.gmgn.ai/v1/market/rank?${params}`, {
     headers: { 'X-APIKEY': key },
     redirect: 'error',
+    ...(signal ? { signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]) } : {}),
   });
   if (result.code !== 0 || !Array.isArray(result.data?.rank)) {
     throw new Error('GMGN rejected the request or returned an invalid rank');
@@ -70,7 +71,7 @@ export async function gmgnTrending(key) {
   });
 }
 
-export async function meteoraCandidates(minTvl, minVolume) {
+export async function meteoraCandidates(minTvl, minVolume, signal) {
   const filter = `token_y=${config.tokens.SOL} && tvl>=${minTvl} && is_blacklisted=false`;
   const feeds = [
     ['Meteora new pool', 'pool_created_at:desc', filter],
@@ -78,7 +79,7 @@ export async function meteoraCandidates(minTvl, minVolume) {
   ];
   const results = await Promise.allSettled(feeds.map(async ([source, sort, filters]) => {
     const params = new URLSearchParams({ page_size: '20', sort_by: sort, filter_by: filters });
-    const data = (await fetchJson(`https://dlmm.datapi.meteora.ag/pools?${params}`)).data;
+    const data = (await fetchJson(`https://dlmm.datapi.meteora.ag/pools?${params}`, signal ? { signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]) } : {})).data;
     if (!Array.isArray(data)) throw Error('Invalid Meteora pool list');
     return data.flatMap(pool => {
       const mint = pool.token_x?.address;
@@ -87,19 +88,25 @@ export async function meteoraCandidates(minTvl, minVolume) {
       try { return [{ mint: new PublicKey(mint).toBase58(), source }]; } catch { return []; }
     });
   }));
+  if (signal?.aborted) return [];
   for (const result of results) if (result.status === 'rejected') log('discovery_warn', 'Meteora discovery feed unavailable');
   return results.flatMap(result => result.status === 'fulfilled' ? result.value : []);
 }
 
-export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config.screening, onMatch, stats }) {
+export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config.screening, onMatch, stats,
+  paused: initialPaused = false, screen = screenMint, getCandidates = meteoraCandidates }) {
   const queue = new Map();
   const screened = new Map();
   let stopped = false;
+  let paused = Boolean(initialPaused);
+  let pauseGeneration = 0;
+  let scanController = null;
   let busy = false;
   let gmgnRetryAt = 0;
   let ws, subscription;
 
   function enqueue(mint, source, priority) {
+    if (stopped || paused) return;
     const item = queue.get(mint);
     if (item) {
       item.sources.add(source);
@@ -111,7 +118,6 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config
         (previous.announced || priority <= previous.priority)) return;
     queue.set(mint, { mint, sources: new Set([source]), priority, addedAt: Date.now(), tries: 0, retryAt: 0 });
     stats.received++;
-    // Keep higher-value signals when the launch feed is busy.
     if (queue.size > 120) {
       const score = item => item.priority + Number(item.tries > 0);
       const lowest = [...queue.values()].reduce((a, b) => score(a) <= score(b) ? a : b);
@@ -121,45 +127,55 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config
   }
 
   async function tick() {
-    if (stopped || busy) return;
+    if (stopped || paused || busy) return;
     busy = true;
+    const generation = pauseGeneration;
+    const controller = new AbortController();
+    scanController = controller;
     try {
       if (gmgnKey && Date.now() >= gmgnRetryAt) {
         try {
-          for (const mint of await gmgnTrending(gmgnKey)) enqueue(mint, 'GMGN trending', 2);
+          const trending = await gmgnTrending(gmgnKey, controller.signal);
+          if (stopped || paused || generation !== pauseGeneration || controller.signal.aborted) return;
+          for (const mint of trending) enqueue(mint, 'GMGN trending', 2);
         } catch (error) {
+          if (controller.signal.aborted) return;
           gmgnRetryAt = Date.now() + 5 * MINUTE;
           log('discovery_warn', error.message.startsWith('Data request failed (HTTP')
             ? `GMGN ${error.message}` : 'GMGN ranking unavailable');
         }
       }
-      for (const { mint, source } of await meteoraCandidates(thresholds.minTvl, thresholds.minVolume)) {
-        enqueue(mint, source, source === 'Meteora new pool' ? 3 : 2);
-      }
+      if (stopped || paused || generation !== pauseGeneration) return;
+      const candidates = await getCandidates(thresholds.minTvl, thresholds.minVolume, controller.signal);
+      if (stopped || paused || generation !== pauseGeneration || controller.signal.aborted) return;
+      for (const { mint, source } of candidates) enqueue(mint, source, source === 'Meteora new pool' ? 3 : 2);
+      if (stopped || paused || generation !== pauseGeneration) return;
       const now = Date.now();
       for (const [mint, item] of queue) if (now - item.addedAt > 30 * MINUTE) {
         queue.delete(mint);
         stats.dropped++;
       }
       for (const [mint, item] of screened) if (now >= item.retryAt) screened.delete(mint);
-      const ranked = [...queue.values()].filter(item => item.retryAt <= now).sort((a, b) => b.priority - a.priority || a.addedAt - b.addedAt);
-    const reserved = [
-      ranked.find(item => item.tries > 0 && [...item.sources].some(source => source.startsWith('Meteora'))),
-      ranked.find(item => item.tries > 0),
-      ranked.find(item => item.priority === 1),
-    ].filter(Boolean);
+      const ranked = [...queue.values()].filter(item => item.retryAt <= now)
+        .sort((a, b) => b.priority - a.priority || a.addedAt - b.addedAt);
+      const reserved = [
+        ranked.find(item => item.tries > 0 && [...item.sources].some(source => source.startsWith('Meteora'))),
+        ranked.find(item => item.tries > 0),
+        ranked.find(item => item.priority === 1),
+      ].filter(Boolean);
       const batch = [...new Set([...reserved, ...ranked])].slice(0, 6);
       for (const item of batch) {
-        if (stopped) break;
+        if (stopped || paused || generation !== pauseGeneration || controller.signal.aborted) break;
         const { mint, sources } = item;
         item.tries++;
         let result;
         try {
-          result = await screenMint(mint, { thresholds });
+          result = await screen(mint, { thresholds, signal: controller.signal });
         } catch {
+          if (controller.signal.aborted) break;
           result = { pass: false, reason: 'Screening data unavailable' };
         }
-        if (stopped) break;
+        if (stopped || paused || generation !== pauseGeneration || controller.signal.aborted) break;
         log('discovery', `${mint} [${[...sources].join(', ')}] ${result.pass ? 'passed' : result.reason}`);
         if (!result.pass) {
           const reason = result.reason.split(/ \(|;/)[0];
@@ -175,14 +191,19 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config
         if (result.pass) {
           stats.passed++;
           try {
+            if (paused || generation !== pauseGeneration) break;
             const research = await onMatch?.(mint, result, [...sources]);
-            if (!stopped) await notify(`🔎 Meridian watchlist\nMint ${mint}\nPool ${result.pool.pool_address}\nSource ${[...sources].join(', ')}${research ? `\n${research}` : ''}`);
-          } catch { log('discovery_warn', `${mint} post-screen processing unavailable`); }
+            if (!stopped && !paused && generation === pauseGeneration) {
+              await notify(`🔎 Meridian watchlist\nMint ${mint}\nPool ${result.pool.pool_address}\nSource ${[...sources].join(', ')}${research ? `\n${research}` : ''}`);
+            }
+          } catch { if (!paused) log('discovery_warn', `${mint} post-screen processing unavailable`); }
         }
       }
     } finally {
       stats.waiting = queue.size;
       busy = false;
+      if (scanController === controller) scanController = null;
+      if (!stopped && !paused && generation !== pauseGeneration) void tick();
     }
   }
 
@@ -191,7 +212,7 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config
     url.searchParams.set('api-key', heliusKey);
     ws = connection(url.toString(), url.toString().replace(/^https:/, 'wss:'));
     subscription = ws.onLogs(PUMP, event => {
-      if (stopped || event.err) return;
+      if (stopped || paused || event.err) return;
       for (const { mint, source } of pumpCandidates(event.logs)) {
         enqueue(mint, source, source === 'Pump.fun migration' ? 3 : 1);
       }
@@ -201,9 +222,23 @@ export function startDiscovery({ gmgnKey, heliusKey, notify, thresholds = config
   log('discovery', `Watchlist started (GMGN=${Boolean(gmgnKey)}, Helius=${Boolean(heliusKey)})`);
   const timer = setInterval(() => void tick(), MINUTE);
   void tick();
-  return async () => {
+  const stop = async () => {
     stopped = true;
+    scanController?.abort();
     clearInterval(timer);
     if (ws) await ws.removeOnLogsListener(subscription).catch(() => {});
   };
+  stop.setPaused = value => {
+    const next = Boolean(value);
+    if (next === paused) return;
+    paused = next;
+    pauseGeneration++;
+    if (paused) {
+      scanController?.abort();
+      queue.clear();
+      screened.clear();
+      stats.waiting = 0;
+    } else if (!busy) void tick();
+  };
+  return stop;
 }

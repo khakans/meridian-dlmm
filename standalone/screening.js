@@ -9,6 +9,7 @@ import { analyzePoolWithChronos } from './chronos.js';
 
 const number = value => value == null || value === '' ? null : Number.isFinite(Number(value)) ? Number(value) : null;
 const discovery = 'https://pool-discovery-api.datapi.meteora.ag/pools';
+const requestSignal = (signal, ms) => signal ? AbortSignal.any([signal, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
 export async function poolDetail(address, timeframe = config.screening.timeframe, options) {
   const params = new URLSearchParams({ page_size: '1', filter_by: `pool_address=${address}`, timeframe });
   const result = await fetchJson(`${discovery}?${params}`, options);
@@ -57,8 +58,10 @@ export function rejectPool(p, mint, s) {
   if (!(number(p.volatility) > 0) || !(number(p.pool_price) > 0)) return 'Volatility or price unavailable';
   return null;
 }
-export async function checkMintOnChain(mint) {
+export async function checkMintOnChain(mint, signal) {
+  signal?.throwIfAborted();
   const result = await readRpc('monitor', c => c.getParsedAccountInfo(new PublicKey(mint), 'confirmed'));
+  signal?.throwIfAborted();
   const account = result.value;
   const info = account?.data?.parsed?.info;
   if (!account || !info) throw new Error('On-chain mint data unavailable');
@@ -72,15 +75,17 @@ export async function checkMintOnChain(mint) {
   }
   return info.decimals;
 }
-export async function screenMint(mint, { poolAddress = null, thresholds = config.screening } = {}) {
+export async function screenMint(mint, { poolAddress = null, thresholds = config.screening, signal } = {}) {
+  signal?.throwIfAborted();
   if (isBlacklisted(mint) || isBaseMintOnCooldown(mint)) return { pass: false, terminal: true, reason: 'Token is blocked or on cooldown' };
-  const assets = await fetchJson(`https://datapi.jup.ag/v1/assets/search?query=${mint}`);
+  const assets = await fetchJson(`https://datapi.jup.ag/v1/assets/search?query=${mint}`, { signal: requestSignal(signal, 10_000) });
+  signal?.throwIfAborted();
   const token = (Array.isArray(assets) ? assets : []).find(t => t.id === mint);
   const reason = rejectToken(token, mint, thresholds);
   if (reason) return { pass: false, reason };
   if (token.dev ? isDevBlocked(token.dev) : Object.keys(getBlockedDevs()).length > 0) return { pass: false, terminal: true, reason: 'Deployer blocked or unavailable' };
   let decimals;
-  try { decimals = await checkMintOnChain(mint); }
+  try { decimals = await checkMintOnChain(mint, signal); }
   catch (error) {
     if (!error.terminal) throw error;
     return { pass: false, terminal: true, reason: error.message };
@@ -88,7 +93,8 @@ export async function screenMint(mint, { poolAddress = null, thresholds = config
   let addresses;
   if (poolAddress) addresses = [poolAddress];
   else {
-    const pools = await fetchJson(`https://dlmm.datapi.meteora.ag/pools?${new URLSearchParams({ query: mint, page_size: '50', sort_by: 'tvl:desc' })}`);
+    const pools = await fetchJson(`https://dlmm.datapi.meteora.ag/pools?${new URLSearchParams({ query: mint, page_size: '50', sort_by: 'tvl:desc' })}`, { signal: requestSignal(signal, 10_000) });
+    signal?.throwIfAborted();
     if (!Array.isArray(pools.data)) throw new Error('Invalid pool search response');
     addresses = pools.data.filter(p => p.token_x?.address === mint && p.token_y?.address === config.tokens.SOL).map(p => p.address).slice(0, 10);
   }
@@ -96,21 +102,28 @@ export async function screenMint(mint, { poolAddress = null, thresholds = config
   for (const address of addresses) {
     if (isPoolOnCooldown(address)) { rejected.push('Pool cooldown'); continue; }
     try {
-      const p = await poolDetail(address);
+      signal?.throwIfAborted();
+      const p = await poolDetail(address, config.screening.timeframe, { signal: requestSignal(signal, 6_000) });
+      signal?.throwIfAborted();
       const minutes = { '5m': 5, '30m': 30, '1h': 60, '2h': 120, '4h': 240, '12h': 720, '24h': 1440 };
-      if ((minutes[config.screening.timeframe] || 5) < 30) p.volatility = (await poolDetail(address, '30m')).volatility;
-      if (!(number(p.volatility) > 0)) p.volatility = (await poolDetail(address, '1h')).volatility;
+      if ((minutes[config.screening.timeframe] || 5) < 30) p.volatility = (await poolDetail(address, '30m', { signal: requestSignal(signal, 6_000) })).volatility;
+      if (!(number(p.volatility) > 0)) p.volatility = (await poolDetail(address, '1h', { signal: requestSignal(signal, 6_000) })).volatility;
       const why = rejectPool(p, mint, thresholds);
       if (why) { rejected.push(why); continue; }
       candidates.push(p);
-    } catch (e) { rejected.push(e.message); }
+    } catch (e) {
+      if (signal?.aborted) throw e;
+      rejected.push(e.message);
+    }
   }
   candidates.sort((a, b) => b.fee_active_tvl_ratio - a.fee_active_tvl_ratio || b.active_tvl - a.active_tvl || a.pool_address.localeCompare(b.pool_address));
   if (candidates.length > 1) {
     const chronos = await analyzePoolWithChronos(candidates[0].pool_address, {
+      signal,
       binStep: candidates[0].dlmm_params?.bin_step ?? 100,
       activePrice: candidates[0].pool_price,
     }).catch(() => null);
+    signal?.throwIfAborted();
     const spreadPct = Number(chronos?.tactical_signals?.spread_pct ?? 20);
     const scoreCandidate = p => {
       const base = Number(p.fee_active_tvl_ratio ?? 0);

@@ -39,6 +39,19 @@ import { startAdmin } from "./telegram-admin.js";
 import { startSlackAdmin } from "./slack-admin.js";
 import { analyzePoolWithChronos, startChronosKeepalive, stopChronosKeepalive } from "./chronos.js";
 
+export function persistLifecyclePause(store, paused, afterPersist = () => {}, now = Date.now()) {
+  const previous = store.data;
+  if (previous.paused === paused) return false;
+  const signals = paused ? Object.fromEntries(Object.entries(previous.signals).map(([mint, signal]) =>
+    [mint, signal.done ? signal : { ...signal, done: true, reason: "lifecycle entry stopped", closedAt: now, cooldownUntil: now }])) : previous.signals;
+  store.database.saveMonitor({ ...previous, signals, paused, entryResumedAt: paused ? previous.entryResumedAt : now }, store.historyIds);
+  for (const [mint, signal] of Object.entries(signals)) Object.assign(previous.signals[mint], signal);
+  previous.paused = paused;
+  if (!paused) previous.entryResumedAt = now;
+  afterPersist(paused);
+  return true;
+}
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 let store = null;
@@ -58,6 +71,8 @@ const discoveryStats = { received: 0, retries: 0, waiting: 0, passed: 0, dropped
 let preflight = null;
 let settlementBusy = false;
 let entryInFlight = false;
+let activeEntryScreenController = null;
+let lifecyclePauseGeneration = 0;
 
 async function reconcileEntries() {
   if (entryInFlight) return;
@@ -211,7 +226,13 @@ async function drainSignals() {
       const signal = signalQueue.shift();
       if (signal.done || store.data.paused) continue;
       try {
-        await pursueSignal(signal);
+        const controller = new AbortController();
+        activeEntryScreenController = controller;
+        try {
+          await pursueSignal(signal, controller.signal);
+        } finally {
+          if (activeEntryScreenController === controller) activeEntryScreenController = null;
+        }
       } catch (e) {
         finishSignal(store, signal, `error: ${e.message}`);
         log("signal_error", `Signal ${signal.mint.slice(0, 8)} aborted: ${e.message}`);
@@ -224,13 +245,13 @@ async function drainSignals() {
 
 // Screen and enter within the signal deadline. Terminal outcomes finish the
 // signal; temporary failures retry every retrySec until the deadline expires.
-async function pursueSignal(signal) {
+async function pursueSignal(signal, screenSignal) {
   const wallets = signal.events.map(e => `${e.wallet.slice(0, 6)}(◎${e.depositSol.toFixed(1)})`).join(", ");
   log("signal", `${signal.source ?? "convergence"} on ${signal.mint.slice(0, 8)}: ${signal.events.length} wallets [${wallets}] — screening with ${config.standalone.screeningDeadlineSec}s deadline`);
   let lastReason = "no attempt";
   while (!shuttingDown && !signal.done && Date.now() < signal.deadline) {
-    const reason = await attemptEntry(signal);
-    if (reason == null) return;
+    const reason = await attemptEntry(signal, screenSignal);
+    if (reason == null || signal.done || shuttingDown || store.data.paused) return;
     lastReason = reason;
     const wait = Math.min(config.standalone.retrySec * 1000, signal.deadline - Date.now());
     if (wait > 0) await sleep(wait);
@@ -243,7 +264,7 @@ async function pursueSignal(signal) {
 
 // One entry attempt. Returns null when the signal is finished (entered,
 // terminal rejection, or fatal condition), or a reason string to retry.
-async function attemptEntry(signal) {
+async function attemptEntry(signal, screenSignal) {
   if (store.data.paused || signal.done) return null;
   const mint = signal.mint;
   if (!config.standalone.shadow && Object.values(store.data.attempts).some(a => a.status === "submitting" || a.status === "review_required")) {
@@ -293,10 +314,12 @@ async function attemptEntry(signal) {
   // Focused screening: this mint and its eligible pools only.
   let screened;
   try {
-    screened = await screenMint(mint, { poolAddress: signal.pool });
+    screened = await screenMint(mint, { poolAddress: signal.pool, signal: screenSignal });
   } catch (e) {
+    if (screenSignal?.aborted || store.data.paused || signal.done) return "entry stopped or expired";
     return `screening error: ${e.message}`;
   }
+  if (shuttingDown || store.data.paused || signal.done || screenSignal?.aborted) return "entry stopped or expired";
   if (!screened.pass) {
     if (screened.terminal) {
       finishSignal(store, signal, `blocked: ${screened.reason}`);
@@ -323,12 +346,14 @@ async function attemptEntry(signal) {
 
   // Chronos AI Pre-Deploy Gate & Dynamic Bin Calibration (InstaBox 5-Node Cluster + Fallback)
   const chronos = await analyzePoolWithChronos(pool.pool_address, {
+    signal: screenSignal,
     binStep: pool.dlmm_params?.bin_step ?? 100,
     activePrice: pool.pool_price,
     defaultBinsAbove: binsAbove,
     defaultBinsBelow: binsBelow,
     minBinsBelow: MIN_SAFE_BINS_BELOW,
   }).catch(() => null);
+  if (screenSignal?.aborted || shuttingDown || store.data.paused || signal.done) return "entry stopped or expired";
 
   let convictionMult = 1.0;
   if (chronos) {
@@ -370,8 +395,11 @@ async function attemptEntry(signal) {
   const shapeMode = config.strategy.strategy;
   const compareShapes = shadow && shapeMode === "auto" && Object.values(paper.open).filter(p => p.shapeTrial).length < 24;
   const candleTime = Math.floor(Date.now() / 1000);
-  const candles = shadow ? await entryCandles(pool.pool_address, candleTime) : undefined;
-  const plan = await resolveEntryShape(shapeMode, pool, binsBelow, entry, { candles: shadow ? candles ?? [] : undefined, now: candleTime });
+  const candles = shadow ? await entryCandles(pool.pool_address, candleTime, screenSignal) : undefined;
+  const plan = await resolveEntryShape(shapeMode, pool, binsBelow, entry, {
+    candles: shadow ? candles ?? [] : undefined, now: candleTime, signal: screenSignal,
+  });
+  if (screenSignal?.aborted || store.data.paused || signal.done) return "entry stopped or expired";
   if (!plan.shape) return `Auto Shape: ${plan.reason}`;
   const modelInput = { source, mint, pool: pool.pool_address, pair: pool.name,
     decimals: screened.decimals, binStep: entry.binStep, binsBelow, binsAbove, capital: amountY, shape: plan.shape, entry };
@@ -818,21 +846,33 @@ async function lifecycleStatusLines(detailed = false) {
   return lines;
 }
 
+export async function sendLifecycleReport({ isPaused, isStopping, getGeneration, getLines, notify }) {
+  const generation = getGeneration();
+  if (isPaused() || isStopping()) return false;
+  const lines = await getLines();
+  if (isPaused() || isStopping() || getGeneration() !== generation) return false;
+  await notify(lines.join("\n"));
+  return true;
+}
+
 function startLifecycleReports() {
   const minutes = config.lifecycleReportMinutes;
   if (!(minutes >= 1 && minutes <= 1440)) return;
   let busy = false;
   const report = async () => {
-    if (busy || shuttingDown) return;
+    if (busy || store.data.paused || shuttingDown) return;
     busy = true;
     try {
-      const lines = [`📊 Meridian • ${config.standalone.shadow ? "SHADOW" : "LIVE"}`, ...await lifecycleStatusLines()];
-      if (!shuttingDown) {
-        await notify(lines.join("\n"));
-        log("lifecycle", "Wallet, position and PnL report generated");
-      }
+      const sent = await sendLifecycleReport({
+        isPaused: () => store.data.paused,
+        isStopping: () => shuttingDown,
+        getGeneration: () => lifecyclePauseGeneration,
+        getLines: async () => [`📊 Meridian • ${config.standalone.shadow ? "SHADOW" : "LIVE"}`, ...await lifecycleStatusLines()],
+        notify,
+      });
+      if (sent) log("lifecycle", "Wallet, position and PnL report generated");
     } catch {
-      log("lifecycle_warn", "Wallet report unavailable");
+      if (!store.data.paused && !shuttingDown) log("lifecycle_warn", "Wallet report unavailable");
     } finally {
       busy = false;
     }
@@ -954,17 +994,12 @@ export async function startStandalone() {
     monitor,
     lifecyclePaused: () => Boolean(store.data.paused),
     setLifecyclePaused(paused) {
-      if (store.data.paused === paused) return;
-      const now = Date.now();
-      const previous = store.data;
-      const signals = paused ? Object.fromEntries(Object.entries(previous.signals).map(([mint, signal]) =>
-        [mint, signal.done ? signal : { ...signal, done: true, reason: "lifecycle entry stopped", closedAt: now, cooldownUntil: now }])) : previous.signals;
-      // Persist the control and cancelled signals together, then invalidate in-memory work.
-      store.database.saveMonitor({ ...previous, signals, paused, entryResumedAt: paused ? previous.entryResumedAt : now }, store.historyIds);
-      for (const [mint, signal] of Object.entries(signals)) Object.assign(previous.signals[mint], signal);
-      previous.paused = paused;
-      if (paused) signalQueue.length = 0;
-      else previous.entryResumedAt = now;
+      persistLifecyclePause(store, paused, nextPaused => {
+        lifecyclePauseGeneration++;
+        if (nextPaused) activeEntryScreenController?.abort();
+        stopDiscovery?.setPaused?.(nextPaused);
+        if (nextPaused) signalQueue.length = 0;
+      });
     },
     statusDetails: () => lifecycleStatusLines(true),
     positionDetails: (tab, page) => positionsPage({
@@ -997,10 +1032,12 @@ export async function startStandalone() {
     if (!s.done && s.deadline > Date.now()) onSignal(s);
   }
   stopDiscovery = startDiscovery({
+    paused: store.data.paused,
     gmgnKey: process.env.GMGN_API_KEY?.trim(),
     heliusKey: process.env.HELIUS_API_KEY?.trim(),
     notify,
     onMatch: (mint, screened, sources) => {
+      if (shuttingDown || store.data.paused) return false;
       store.data.preflightCandidate = { mint, pool: screened.pool.pool_address, at: Date.now() };
       const now = Date.now();
       const prior = store.data.signals[mint];

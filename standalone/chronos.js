@@ -424,20 +424,22 @@ export function stopChronosKeepalive() {
   }
 }
 
-async function fetchGeckoCandles(poolAddress, aggregate, limit = 1000) {
+async function fetchGeckoCandles(poolAddress, aggregate, limit = 1000, signal) {
   try {
     const params = new URLSearchParams({ aggregate, limit });
     const url = `https://api.geckoterminal.com/api/v2/networks/solana/pools/${poolAddress}/ohlcv/minute?${params}`;
-    const res = await fetch(url, {
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(4500),
-    });
+    const timeout = AbortSignal.timeout(4500);
+    const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const res = await fetch(url, { headers: { Accept: "application/json" }, signal: requestSignal });
+    signal?.throwIfAborted();
     if (!res.ok) return null;
     const body = await res.json();
+    signal?.throwIfAborted();
     const list = body?.data?.attributes?.ohlcv_list;
     if (!Array.isArray(list) || list.length < 16) return null;
     return list.slice().reverse();
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return null;
   }
 }
@@ -463,7 +465,9 @@ export async function analyzePoolWithChronos(poolAddress, {
   defaultBinsBelow = config.strategy?.defaultBinsBelow ?? 55,
   minBinsBelow = MIN_SAFE_BINS_BELOW,
   candles5m = null,
+  signal,
 } = {}) {
+  signal?.throwIfAborted();
   if (!config.chronos?.enabled) return null;
 
   const cached = localCache.get(poolAddress);
@@ -477,10 +481,11 @@ export async function analyzePoolWithChronos(poolAddress, {
 
   if (!c5m) {
     [c1m, c5m, c15m] = await Promise.all([
-      fetchGeckoCandles(poolAddress, 1, 512),
-      fetchGeckoCandles(poolAddress, 5, 1000),
-      fetchGeckoCandles(poolAddress, 15, 350),
+      fetchGeckoCandles(poolAddress, 1, 512, signal),
+      fetchGeckoCandles(poolAddress, 5, 1000, signal),
+      fetchGeckoCandles(poolAddress, 15, 350, signal),
     ]);
+    signal?.throwIfAborted();
   }
 
   const nodes = getClusterNodes();
@@ -498,6 +503,7 @@ export async function analyzePoolWithChronos(poolAddress, {
     });
 
     for (let offset = 0; offset < nodes.length; offset++) {
+      signal?.throwIfAborted();
       const idx = (activeNodeIndex + offset) % nodes.length;
       const node = nodes[idx];
       if (!node?.endpointUrl) continue;
@@ -506,10 +512,13 @@ export async function analyzePoolWithChronos(poolAddress, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: payload,
-          signal: AbortSignal.timeout(config.chronos?.timeoutMs ?? 6500),
+          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(config.chronos?.timeoutMs ?? 6500)])
+            : AbortSignal.timeout(config.chronos?.timeoutMs ?? 6500),
         });
+        signal?.throwIfAborted();
         if (res.ok) {
           const data = await res.json();
+          signal?.throwIfAborted();
           if (!data.tactical_signals && data.summary) {
             data.tactical_signals = buildTacticalSignals({
               p10Pct: data.summary.p10_pct,
@@ -537,13 +546,15 @@ export async function analyzePoolWithChronos(poolAddress, {
         void wakeInstaBoxIfNeeded(node.machineId);
         const nextReserve = nodes[(idx + 1) % nodes.length];
         if (nextReserve?.machineId) void wakeInstaBoxIfNeeded(nextReserve.machineId);
-      } catch {
+      } catch (error) {
+        if (signal?.aborted) throw error;
         void wakeInstaBoxIfNeeded(node.machineId);
       }
     }
   }
 
   // Fallback: run local quantized engine on the fetched 5m (or 1m) candles
+  signal?.throwIfAborted();
   const rawCandles = c5m || c1m;
   if (Array.isArray(rawCandles) && rawCandles.length >= 16) {
     const fallback = localQuantizedForecast(rawCandles, {

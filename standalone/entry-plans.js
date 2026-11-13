@@ -57,17 +57,24 @@ export function chooseEntryShape(candles, { now, binStep, binsBelow, price, feeR
   return { shape: 'spot', reason: 'kondisi campuran' };
 }
 
-export async function entryCandles(address, now = Math.floor(Date.now() / 1000)) {
+export async function entryCandles(address, now = Math.floor(Date.now() / 1000), signal) {
+  signal?.throwIfAborted();
   const query = new URLSearchParams({ timeframe: '5m', start_time: String(now - 9 * CANDLE_SECONDS), end_time: String(now) });
+  const timeout = AbortSignal.timeout(4500);
+  const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
   const result = await fetchJson(`https://dlmm.datapi.meteora.ag/pools/${address}/ohlcv?${query}`,
-    { signal: AbortSignal.timeout(4500) }).catch(() => null);
+    { signal: requestSignal }).catch(error => {
+      if (signal?.aborted) throw error;
+      return null;
+    });
+  signal?.throwIfAborted();
   return result?.data;
 }
 
-export async function resolveEntryShape(mode, pool, binsBelow, entry, { candles, now = Math.floor(Date.now() / 1000) } = {}) {
+export async function resolveEntryShape(mode, pool, binsBelow, entry, { candles, now = Math.floor(Date.now() / 1000), signal } = {}) {
   if (ENTRY_SHAPES.includes(mode)) return { shape: mode, reason: 'manual' };
   if (mode !== 'auto') return { shape: null, reason: 'pengaturan shape tidak valid' };
-  return chooseEntryShape(candles ?? await entryCandles(pool.pool_address, now), {
+  return chooseEntryShape(candles ?? await entryCandles(pool.pool_address, now, signal), {
     now, binsBelow, binStep: entry.binStep, price: Number(entry.price),
     feeRatio: Number(pool.fee_active_tvl_ratio), minFeeRatio: config.screening.minFeeActiveTvlRatio,
     exitRatio: entry.exitRatio, minExitRatio: config.research.paperMinExitRatio,

@@ -20,6 +20,117 @@ import { positionsPage, readLiveReportBook } from '../standalone/positions-view.
 import { estimateNetExitPct, isRetryableEntryError, netWalletSol, positionWrites, reconcilePositionWrites, sendPositionWrite, simulateLegacy } from '../standalone/position-journal.js';
 import { DLMM_PROGRAM, recoverablePositionRent } from '../standalone/events.js';
 import { recentSignalCounts } from '../standalone/store.js';
+import { startDiscovery } from '../standalone/discovery.js';
+import { persistLifecyclePause } from '../standalone/runtime.js';
+
+test('failed lifecycle persistence does not resume Discovery', () => {
+  let discoveryCalls = 0;
+  const store = {
+    data: { paused: true, signals: { mint: { done: false } }, entryResumedAt: 10 },
+    historyIds: new Set(),
+    database: { saveMonitor() { throw new Error('disk full'); } },
+  };
+  assert.throws(() => persistLifecyclePause(store, false, () => discoveryCalls++), /disk full/);
+  assert.equal(store.data.paused, true);
+  assert.deepEqual(store.data.signals, { mint: { done: false } });
+  assert.equal(discoveryCalls, 0);
+});
+
+test('paused Discovery cancels candidate scanning and in-flight screening', async t => {
+  t.mock.method(globalThis, 'fetch', async () => ({ ok: true, json: async () => ({ data: [] }) }));
+  const stats = { received: 0, retries: 0, waiting: 0, passed: 0, dropped: 0, reasons: {} };
+  let finishCandidates, candidateSignal, finishScreen, screenSignal, candidateCalls = 0;
+  let markCandidates, markScreen;
+  const candidatesStarted = new Promise(resolve => { markCandidates = resolve; });
+  const screenStarted = new Promise(resolve => { markScreen = resolve; });
+  const screens = [], matches = [], notifications = [];
+  const discovery = startDiscovery({ stats, heliusKey: null, gmgnKey: null, notify: async text => notifications.push(text),
+    pumpFeed: () => () => {},
+    getCandidates: async (_tvl, _volume, signal) => {
+      candidateCalls++;
+      if (candidateCalls === 1) {
+        candidateSignal = signal;
+        markCandidates();
+        return new Promise(resolve => { finishCandidates = resolve; });
+      }
+      return [{ mint: 'resumed-candidate', source: 'Meteora new pool' }];
+    },
+    screen: async (mint, { signal }) => {
+      screens.push(mint);
+      screenSignal = signal;
+      markScreen();
+      return new Promise(resolve => { finishScreen = resolve; });
+    },
+    onMatch: mint => { matches.push(mint); },
+  });
+  try {
+    assert.equal(typeof discovery.setPaused, 'function');
+    await candidatesStarted;
+    discovery.setPaused(true);
+    assert.equal(candidateSignal.aborted, true);
+    finishCandidates([{ mint: 'candidate', source: 'Meteora new pool' }]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(screens, []);
+
+    discovery.setPaused(false);
+    // Resume starts a fresh scan; pause after screenMint begins.
+    await screenStarted;
+    discovery.setPaused(true);
+    assert.equal(screenSignal.aborted, true);
+    discovery.setPaused(false);
+    finishScreen({ pass: true, pool: { pool_address: 'pool' } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(matches, []);
+    assert.deepEqual(notifications, []);
+  } finally { await discovery(); }
+});
+
+test('resumed Discovery discards candidates from a stale in-flight scan', async () => {
+  const stats = { received: 0, retries: 0, waiting: 0, passed: 0, dropped: 0, reasons: {} };
+  let finishFirst, markFirst, markSecond, calls = 0;
+  const firstStarted = new Promise(resolve => { markFirst = resolve; });
+  const secondStarted = new Promise(resolve => { markSecond = resolve; });
+  const screens = [];
+  const discovery = startDiscovery({ stats, heliusKey: null, gmgnKey: null, notify: async () => {},
+    pumpFeed: () => () => {},
+    getCandidates: async () => {
+      calls++;
+      if (calls === 1) { markFirst(); return new Promise(resolve => { finishFirst = resolve; }); }
+      if (calls === 2) markSecond();
+      return [];
+    },
+    screen: async mint => { screens.push(mint); return { pass: false, reason: 'fixture' }; },
+    onMatch: () => {},
+  });
+  try {
+    await firstStarted;
+    discovery.setPaused(true);
+    discovery.setPaused(false);
+    finishFirst([{ mint: 'stale-candidate', source: 'Meteora new pool' }]);
+    await secondStarted;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(screens, []);
+  } finally { await discovery(); }
+});
+
+test('periodic lifecycle report is suppressed across pause and resume during status collection', async () => {
+  const { sendLifecycleReport } = await import('../standalone/runtime.js');
+  let paused = false, generation = 0, notified = 0, resolveLines, markStarted;
+  const started = new Promise(resolve => { markStarted = resolve; });
+  const sending = sendLifecycleReport({
+    isPaused: () => paused,
+    isStopping: () => false,
+    getGeneration: () => generation,
+    getLines: async () => { markStarted(); return new Promise(resolve => { resolveLines = resolve; }); },
+    notify: async () => { notified++; },
+  });
+  await started;
+  paused = true; generation++;
+  paused = false; generation++;
+  resolveLines(['status']);
+  assert.equal(await sending, false);
+  assert.equal(notified, 0);
+});
 
 test('settlement only attributes the closed mint balance change to the specified wallet', () => {
   const token = (owner, mint, amount) => ({ owner, mint, uiTokenAmount: { amount } });
